@@ -110,6 +110,10 @@ class DatabaseProcessor:
                 subset_columns = concatenated_entries.columns.difference(
                     ["ThumbnailFilePath"]
                 )
+            elif "FilePath" in concatenated_entries.columns:
+                subset_columns = concatenated_entries.columns.difference(
+                    ["FilePath"]
+                )
             else:
                 subset_columns = concatenated_entries.columns
 
@@ -425,11 +429,16 @@ class DatabaseProcessor:
         with open(manifest_file_path, "w") as file:
             json.dump(manifest_data, file, indent=2)
 
-        shutil.make_archive(os.path.join(".", merged_file_name), "zip", merged_dir)
+        output_folder = os.path.join(".", "merged")
+
+        if not os.path.exists(output_folder):
+            os.mkdir(output_folder)
+
+        shutil.make_archive(os.path.join(".", output_folder, merged_file_name), "zip", merged_dir)
 
         os.rename(
-            os.path.join(".", merged_file_name + ".zip"),
-            os.path.join(".", merged_file_name),
+            os.path.join(".", output_folder, merged_file_name + ".zip"),
+            os.path.join(".", output_folder, merged_file_name),
         )
 
         print("Created JWL file! Full path:", os.path.join(".", merged_file_name))
