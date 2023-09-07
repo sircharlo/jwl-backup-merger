@@ -5,24 +5,19 @@ import glob
 import hashlib
 import json
 import os
-import re
+import pandas as pd
 import shutil
 import sqlite3
-import time
 import tkinter as tk
-import numpy as np
-from tqdm import tqdm
 from tkinter import filedialog
+from tqdm import tqdm
 from zipfile import ZipFile
-
-import pandas as pd
 
 
 class DatabaseProcessor:
     def __init__(self):
         self.all_id_fields = []
         self.comparison_ignore_fields = ["LastModified", "Created"]
-        # self.tables = {}
 
     def get_primary_keys(self, source_cursor):
         self.primary_keys = {}
@@ -70,7 +65,7 @@ class DatabaseProcessor:
                     self.db[dataframe_letter], table, dataframe_letter
                 )
 
-        # Reorder tables to facilitate processing later
+        # Reorder tables to facilitate processing, since some tables depend on others
         table_order = [
             "Location",
             "IndependentMedia",
@@ -140,55 +135,14 @@ class DatabaseProcessor:
                 self.dataframes["merged"] = {}
             self.dataframes["merged"][table] = common_entries.copy()
 
-            # print("Total common_entries in table", table, ":", common_entries.shape[0])
-
-            # total_conflicting_entries = sum(
-            #     len(df)
-            #     for inner_dict in conflicting_entries_by_dataset.values()
-            #     for df in inner_dict.values()
-            # )
-
-            # print("Total conflicting_entries", total_conflicting_entries)
-
-            # if total_conflicting_entries == 0:
-            #     continue
-            # else:
-            # for dataframe_letter in conflicting_entries_by_dataset:
-            # print("Conflicting entries in dataset", dataframe_letter)
-            # print(conflicting_entries_by_dataset[dataframe_letter][table])
-
-        # print("START MERGING")
-        # print(conflicting_entries_by_dataset)
-        # print()
         for dataframe_letter in conflicting_entries_by_dataset:
             for table in tqdm(
                 conflicting_entries_by_dataset[dataframe_letter],
                 desc="Merging tables from " + dataframe_letter,
             ):
-                # print(
-                #     conflicting_entries_by_dataset[dataframe_letter][table].shape[0],
-                #     "changes in dataset '",
-                #     dataframe_letter,
-                #     "' in table",
-                #     table,
-                # )
-                # print(conflicting_entries_by_dataset[dataframe_letter][table])
-                # print(
-                #     "Number of PKs in table ", table, ":", len(self.primary_keys[table])
-                # )
                 highest_pks = self.get_highest_pks_from_merged_table(table)
-                # print("Highest PKs in table", table, ":", highest_pks)
                 for primary_key in self.primary_keys[table]:
-                    # print(primary_key)
                     dict_of_new_values = {}
-                    # print(
-                    #     "Highest PK for",
-                    #     primary_key,
-                    #     " in table",
-                    #     table,
-                    #     ":",
-                    #     highest_pks[primary_key],
-                    # )
                     if highest_pks[primary_key] is not None:
                         for index, value in enumerate(
                             conflicting_entries_by_dataset[dataframe_letter][table][
@@ -199,15 +153,10 @@ class DatabaseProcessor:
                             if str(value).replace(".", "").isnumeric():
                                 dict_of_new_values[value] = index
 
-                    # print(dict_of_new_values)
-
                     if len(dict_of_new_values) == 0:
                         continue
 
-                    # print()
-                    # print("Temp table before")
-                    # print(conflicting_entries_by_dataset[dataframe_letter][table])
-                    # Update primary key
+                    # Update primary keys
                     conflicting_entries_by_dataset[dataframe_letter][table][
                         primary_key
                     ] = conflicting_entries_by_dataset[dataframe_letter][table][
@@ -216,8 +165,6 @@ class DatabaseProcessor:
                         dict_of_new_values
                     )
 
-                    # print("Temp table after")
-                    # print(conflicting_entries_by_dataset[dataframe_letter][table])
                     # Update foreign keys
                     if table in self.fk_constraints:
                         for rel_table, fk in self.fk_constraints[table][primary_key]:
@@ -225,25 +172,6 @@ class DatabaseProcessor:
                                 rel_table
                                 in conflicting_entries_by_dataset[dataframe_letter]
                             ):
-                                # print(
-                                #     "Related table",
-                                #     rel_table,
-                                #     "before (foreign key:",
-                                #     fk,
-                                #     ", linked to primary key:",
-                                #     primary_key,
-                                #     ")",
-                                # )
-                                # print(
-                                #     conflicting_entries_by_dataset[dataframe_letter][
-                                #         rel_table
-                                #     ][
-                                #         conflicting_entries_by_dataset[
-                                #             dataframe_letter
-                                #         ][rel_table][fk]
-                                #         != ""
-                                #     ]
-                                # )
                                 conflicting_entries_by_dataset[dataframe_letter][
                                     rel_table
                                 ][fk] = (
@@ -258,23 +186,6 @@ class DatabaseProcessor:
                                     )
                                 )
 
-                                # print(
-                                #     "Related table",
-                                #     rel_table,
-                                #     "after:",
-                                # )
-                                # print(
-                                #     conflicting_entries_by_dataset[dataframe_letter][
-                                #         rel_table
-                                #     ][
-                                #         conflicting_entries_by_dataset[
-                                #             dataframe_letter
-                                #         ][rel_table][fk]
-                                #         != ""
-                                #     ]
-                                # )
-
-                # print("Merging into merged table", table)
                 self.dataframes["merged"][table] = pd.concat(
                     [
                         self.dataframes["merged"][table],
@@ -282,7 +193,6 @@ class DatabaseProcessor:
                     ],
                     ignore_index=True,
                 )
-                # print(self.dataframes["merged"][table])
 
         source_cursor.execute(
             "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index';"
@@ -298,11 +208,9 @@ class DatabaseProcessor:
         triggers = []
         for index_info in indices_fetcher:
             index_name, table_name, index_sql = index_info
-            # dest_cursor.execute(index_sql)
             indices.append(index_sql)
         for trigger_info in triggers_fetcher:
             trigger_name, table_name, trigger_sql = trigger_info
-            # dest_cursor.execute(trigger_sql)
             triggers.append(trigger_sql)
         indices = [x for x in list(set(indices)) if x]
         triggers = [x for x in list(set(triggers)) if x]
@@ -310,12 +218,16 @@ class DatabaseProcessor:
         self.files_to_include_in_archive = []
 
         source_cursor.execute("SELECT FilePath FROM IndependentMedia;")
-        self.files_to_include_in_archive.extend([file[0] for file in source_cursor.fetchall()])
+        self.files_to_include_in_archive.extend(
+            [file[0] for file in source_cursor.fetchall()]
+        )
         source_cursor.execute("SELECT ThumbnailFilePath FROM PlaylistItem;")
-        self.files_to_include_in_archive.extend([file[0] for file in source_cursor.fetchall()])
+        self.files_to_include_in_archive.extend(
+            [file[0] for file in source_cursor.fetchall()]
+        )
         self.files_to_include_in_archive = list(set(self.files_to_include_in_archive))
-        
-        self.save_merged_tables2(indices, triggers)
+
+        self.save_merged_tables(indices, triggers)
 
         for dataframe in self.db.values():
             dataframe.close()
@@ -326,7 +238,6 @@ class DatabaseProcessor:
         highest_pks = None
         for key in self.primary_keys[table_name]:
             highest_pk = None
-            # for dataframe_letter in ["a"]:
             if not self.dataframes["merged"][table_name][key].empty:
                 highest_pk_lookup = max(self.dataframes["merged"][table_name][key])
                 if str(highest_pk_lookup).replace(".", "").isnumeric() and (
@@ -348,10 +259,8 @@ class DatabaseProcessor:
         return [table[0] for table in cursor.fetchall()]
 
     def load_table_into_df(self, db, table_name, destination_letter):
-        # if "dataframes_" + destination_letter not in self:
         if not hasattr(self, "dataframes"):
             self.dataframes = {}
-            # " + destination_letter] = {}
         if not destination_letter in self.dataframes:
             self.dataframes[destination_letter] = {}
         self.dataframes[destination_letter][table_name] = pd.read_sql_query(
@@ -359,35 +268,30 @@ class DatabaseProcessor:
         )
         self.dataframes[destination_letter][table_name].fillna("", inplace=True)
 
-    def save_merged_tables2(self, indices, triggers):
+    def save_merged_tables(self, indices, triggers):
         output_folder = os.path.join(".", "working")
         os.makedirs(output_folder, exist_ok=True)
 
         conn_merged = sqlite3.connect(os.path.join(output_folder, "merged.db"))
         dest_cursor = conn_merged.cursor()
 
-        # Get a list of trigger names in the database
         dest_cursor.execute("SELECT name FROM sqlite_master WHERE type='trigger';")
         trigger_names = dest_cursor.fetchall()
 
-        # Loop through each trigger and drop it
         for trigger_name in trigger_names:
             trigger_name = trigger_name[0]
             dest_cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name};")
         conn_merged.commit()
 
-        # Get a list of index names in the database
         dest_cursor.execute("SELECT name FROM sqlite_master WHERE type='index';")
         index_names = dest_cursor.fetchall()
 
-        # Loop through each index and drop it
         for index_name in index_names:
             index_name = index_name[0]
             if not index_name.startswith("sqlite_"):
                 dest_cursor.execute(f"DROP INDEX IF EXISTS {index_name};")
         conn_merged.commit()
 
-        # Loop through each table and delete all data
         for table_name in self.dataframes["merged"].keys():
             dest_cursor.execute(f"DELETE FROM {table_name};")
             conn_merged.commit()
@@ -432,18 +336,14 @@ class DatabaseProcessor:
                     try:
                         dest_cursor.execute(insert_sql, row)
                     except Exception as e:
-                        # print(insert_sql, row)
-                        # # print type of everything in rows_to_insert
-                        # for elem in row:
-                        #     print(elem, ":", type(elem))
-                        # print(rows_to_insert[index])
-                        # print(e)
-                        errors.append((table_name, insert_sql, rows_to_insert[index], e))
+                        errors.append(
+                            (table_name, insert_sql, rows_to_insert[index], e)
+                        )
             conn_merged.commit()
         print()
 
         if len(errors) > 0:
-            print("Errors encoutered:")
+            print("Errors encountered:")
             for error in errors:
                 print(error)
             print()
@@ -452,7 +352,7 @@ class DatabaseProcessor:
         conn_merged.commit()
 
         conn_merged.close()
-    
+
     def createJwlFile(self):
         print("Creating JWL file...")
         working_dir = os.path.join(".", "working")
@@ -461,10 +361,13 @@ class DatabaseProcessor:
         all_unzip_folder_names = list(
             directory
             for directory in os.listdir(working_dir)
-            if directory != "merged" and os.path.isdir(os.path.join(working_dir, directory))
+            if directory != "merged"
+            and os.path.isdir(os.path.join(working_dir, directory))
         )
         first_jwl_unzip_folder_name = all_unzip_folder_names[0]
-        first_jwl_unzip_folder_path = os.path.join(working_dir, first_jwl_unzip_folder_name)
+        first_jwl_unzip_folder_path = os.path.join(
+            working_dir, first_jwl_unzip_folder_name
+        )
 
         if not os.path.exists(merged_dir):
             os.mkdir(merged_dir)
@@ -479,21 +382,16 @@ class DatabaseProcessor:
 
         for folder in all_unzip_folder_names:
             full_path = os.path.join(working_dir, folder)
-            for filename in tqdm(os.listdir(full_path), desc=f"Copying files from {folder}"):
+            for filename in tqdm(
+                os.listdir(full_path), desc=f"Copying files from {folder}"
+            ):
                 file_path = os.path.join(full_path, filename)
                 # Find files referenced in DB and include them in resulting archive...
-                if os.path.isfile(file_path) and filename in self.files_to_include_in_archive:
-                    # Copy files to the destination directory
+                if (
+                    os.path.isfile(file_path)
+                    and filename in self.files_to_include_in_archive
+                ):
                     shutil.copy2(file_path, merged_dir)
-
-        # # Use glob to find files with no extensions in all subdirectories, these are probably thumbnails...
-        # files_without_extension = glob.glob(
-        #     os.path.join(working_dir, "**/*."), recursive=True
-        # )
-        # # Copy the files to the destination directory
-        # for file_path in tqdm(files_without_extension, desc="Copying thumbnail files"):
-        #     shutil.copy2(file_path, merged_dir)
-            # TODO: only copy thumbnail files referenced in the db, drop the rest
 
         with open(manifest_file_path, "r") as file:
             manifest_data = json.load(file)
@@ -506,7 +404,6 @@ class DatabaseProcessor:
             database_file_path,
         )
 
-        # Update the 'creationDate' key with the current date and time
         current_datetime = datetime.now()
         formatted_date = current_datetime.strftime("%Y-%m-%dT%H:%M:%S%z")
         manifest_data["creationDate"] = formatted_date
@@ -514,10 +411,8 @@ class DatabaseProcessor:
         name_timestamp = current_datetime.strftime("%Y%m%d-%H%M%S")
         merged_file_name = f"UserdataBackup_{name_timestamp}_Merged.jwlibrary"
 
-        # Generate the 'name' key value based on the current time
         manifest_data["name"] = merged_file_name
 
-        # Update the 'userDataBackup' sub-object
         userDataBackup = {
             "lastModifiedDate": formatted_date,
             "hash": calculate_md5(database_file_path),
@@ -527,11 +422,9 @@ class DatabaseProcessor:
         }
         manifest_data["userDataBackup"] = userDataBackup
 
-        # Write the modified JSON back to the file
         with open(manifest_file_path, "w") as file:
             json.dump(manifest_data, file, indent=2)
 
-        # zip merged dir into a .jwlibrary file
         shutil.make_archive(os.path.join(".", merged_file_name), "zip", merged_dir)
 
         os.rename(
@@ -555,7 +448,6 @@ def unzipFile(file_path):
     unzipPath = os.path.join(".", "working", basename)
     with ZipFile(file_path, "r") as zip:
         zip.extractall(path=unzipPath)
-    # return dir list of unzipped files
     return unzipPath
 
 
@@ -572,19 +464,21 @@ def getJwlFiles():
     root.withdraw()
 
     file_path_a = filedialog.askopenfilename(
-        filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")]
+        filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")],
+        title="Select your first backup file",
     )
     if not file_path_a:
         exit()
-    print("File selected:", file_path_a)
+    print("First file selected:", file_path_a)
 
     file_path_b = filedialog.askopenfilename(
-        filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")]
+        filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")],
+        title="Select your second backup file",
     )
     if not file_path_b:
         exit()
 
-    print("File selected:", file_path_b)
+    print("Second file selected:", file_path_b)
 
     unzip_path_a = unzipFile(file_path_a)
     unzip_path_b = unzipFile(file_path_b)
@@ -611,4 +505,4 @@ if __name__ == "__main__":
     processor = DatabaseProcessor()
     processor.process_databases(*getJwlFiles())
     processor.createJwlFile()
-    # cleanTempFiles()
+    cleanTempFiles()
