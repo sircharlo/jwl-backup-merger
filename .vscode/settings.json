@@ -3,6 +3,7 @@
         "dataframe",
         "dataframes",
         "fillna",
+        "iterrows",
         "jwlibrary",
         "JWLIBRARY",
         "tqdm",
