@@ -1,18 +1,18 @@
 #!/usr/bin/python
 
 from datetime import datetime
+import random
+from dateutil import tz
 import difflib
 import glob
 import hashlib
 import json
 import os
-import time
 import pandas as pd
 import shutil
 import sqlite3
 import tkinter as tk
 from tkinter import filedialog
-from dateutil import tz
 from tqdm import tqdm
 from zipfile import ZipFile
 
@@ -133,56 +133,39 @@ class DatabaseProcessor:
             if "merged" not in self.dataframes:
                 self.dataframes["merged"] = {}
             self.dataframes["merged"][table] = common_entries.copy()
-
-        # Perform the initial merge
+        # Perform the initial concatenation
         for dataframe_letter in conflicting_entries_by_dataset:
             for table in tqdm(
                 conflicting_entries_by_dataset[dataframe_letter],
-                desc="Merging tables from " + dataframe_letter,
+                desc="Concatenating tables from " + dataframe_letter,
             ):
-                highest_pks = self.get_highest_pks_from_merged_table(table)
-                for primary_key in self.primary_keys[table]:
-                    dict_of_new_values = {}
-                    if highest_pks[primary_key] is not None:
-                        for index, value in enumerate(
-                            conflicting_entries_by_dataset[dataframe_letter][table][
-                                primary_key
-                            ],
-                            start=highest_pks[primary_key] + 1,
-                        ):
-                            if str(value).replace(".", "").isnumeric():
-                                dict_of_new_values[value] = index
-
-                    if len(dict_of_new_values) == 0:
-                        continue
-
-                    # Update primary keys
-                    conflicting_entries_by_dataset[dataframe_letter][table][
-                        primary_key
-                    ] = conflicting_entries_by_dataset[dataframe_letter][table][
-                        primary_key
-                    ].replace(
-                        dict_of_new_values
-                    )
-
-                    # Update foreign keys
-                    if table in self.fk_constraints:
-                        for rel_table, fk in self.fk_constraints[table][primary_key]:
-                            if (
-                                rel_table
-                                in conflicting_entries_by_dataset[dataframe_letter]
+                starting_pks = self.get_safe_pk_starting_point_from_merged_table(table)
+                if len(self.primary_keys[table]) == 1:
+                    for primary_key in self.primary_keys[table]:
+                        dict_of_new_values = {}
+                        if starting_pks[primary_key] is not None:
+                            for index, value in enumerate(
+                                conflicting_entries_by_dataset[dataframe_letter][table][
+                                    primary_key
+                                ],
+                                start=starting_pks[primary_key],
                             ):
-                                conflicting_entries_by_dataset[dataframe_letter][
-                                    rel_table
-                                ][fk] = conflicting_entries_by_dataset[
-                                    dataframe_letter
-                                ][
-                                    rel_table
-                                ][
-                                    fk
-                                ].replace(
-                                    dict_of_new_values
-                                )
+                                if str(value).replace(".", "").isnumeric():
+                                    dict_of_new_values[value] = index
+                        dict_of_new_values = {
+                            key: value
+                            for key, value in dict_of_new_values.items()
+                            if key != value
+                        }
+                        if len(dict_of_new_values) == 0:
+                            continue
+
+                        self.update_primary_and_foreign_keys(
+                            table,
+                            primary_key,
+                            dict_of_new_values,
+                            dataframe_letter,
+                        )
 
                 self.dataframes["merged"][table] = pd.concat(
                     [
@@ -211,7 +194,6 @@ class DatabaseProcessor:
             "Bookmark": [["PublicationLocationId", "Slot", "Title", "Snippet"]],
             "UserMark": [
                 ["ColorIndex", "LocationId", "StyleIndex", "UserMarkGuid", "Version"],
-                # ["ColorIndex", "LocationId", "StyleIndex", "Version"] # eventually, manually dedupe colors here
             ],
             "BlockRange": [
                 ["BlockType", "Identifier", "StartToken", "EndToken", "UserMarkId"]
@@ -226,20 +208,14 @@ class DatabaseProcessor:
                     "BlockType",
                     "BlockIdentifier",
                 ],
-                [
-                    "LocationId",
-                    "Title",
-                    "Content",
-                    "BlockType",
-                    "BlockIdentifier",
-                ],
             ],
             "PlaylistItemAccuracy": [["Description"]],
             "PlaylistItemMarker": [["PlaylistItemId", "StartTimeTick"]],
             "Tag": [["Type", "Name"]],
-            "TagMap": [["TagId", "Position", "NoteId", "PlaylistItemId", "LocationId"]],
         }
-        for table, subsets in unique_constraints.items():
+        for table, subsets in tqdm(
+            unique_constraints.items(), desc="Reworking data in line with constraints"
+        ):
             if table in self.dataframes["merged"]:
                 for subset in subsets:
                     duplicate_values_mask = self.dataframes["merged"][table].duplicated(
@@ -263,53 +239,46 @@ class DatabaseProcessor:
                     for key, values in collision_replacement_dict.items():
                         for value in values:
                             collision_pair_replacement_dict[value] = key
-                    print(
-                        "Table:", table, "Subset:", subset, "Primary key:", primary_key
-                    )
-                    print(collision_pair_replacement_dict)
-                    self.dataframes["merged"][table][primary_key].replace(
-                        collision_pair_replacement_dict, inplace=True
-                    )
-                    self.dataframes["merged"][table].drop_duplicates(
-                        subset=subset, ignore_index=True, inplace=True
+                    if len(collision_pair_replacement_dict.keys()) == 0:
+                        continue
+
+                    self.update_primary_and_foreign_keys(
+                        table, primary_key, collision_pair_replacement_dict
                     )
 
-                    # Update foreign keys
-                    if table in self.fk_constraints:
-                        print("table:", table)
-                        for rel_table, fk in self.fk_constraints[table][primary_key]:
-                            if rel_table in self.dataframes["merged"]:
-                                print("rel_table:", rel_table)
-                                print("fk:", fk)
-                                self.dataframes["merged"][rel_table][fk].replace(
-                                    collision_pair_replacement_dict, inplace=True
-                                )
-                    # if duplicates.shape[0] > 0:
-                    #     self.dataframes["merged"][table].sort_values(subset).to_excel(
-                    #         table + "_final" + ".xlsx", index=False
-                    #     )
-                    #     duplicates.sort_values(subset).to_excel(
-                    #         table + "_duplicates" + ".xlsx", index=False
-                    #     )
-        for table in self.dataframes["merged"]:
+        for table in tqdm(
+            self.dataframes["merged"],
+            desc="Removing duplicates we've identified so far",
+        ):
             self.dataframes["merged"][table].drop_duplicates(
                 ignore_index=True, inplace=True
             )
 
-        # Process duplicated entries, second pass: conflict is found, manual intervention is required
+        # Process duplicated entries, second pass: conflict is found, manual intervention might be required
         unique_constraints_requiring_attention = {
             "Bookmark": [["PublicationLocationId", "Slot"]],
-            "Note": [["Guid"]],
-            "InputField": [["TextTag"]],
+            "InputField": [["LocationId", "TextTag"]],
+            "Note": [
+                ["Guid"],
+                ["LocationId", "Title", "Content", "BlockType", "BlockIdentifier"],
+            ],
             "UserMark": [["UserMarkGuid"]],
             "TagMap": [
-                ["TagId", "Position"],
                 ["TagId", "NoteId"],
                 ["TagId", "LocationId"],
                 ["TagId", "PlaylistItemId"],
+                ["TagId", "Position"],
             ],
         }
-        for table, subsets in unique_constraints_requiring_attention.items():
+        text_values_to_merge = {
+            "Bookmark": ["Title", "Snippet"],
+            "InputField": ["Value"],
+            "Note": ["Title", "Content"],
+        }
+        for table, subsets in tqdm(
+            unique_constraints_requiring_attention.items(),
+            desc="Reworking data in line with even more constraints",
+        ):
             if table in self.dataframes["merged"]:
                 for subset in subsets:
                     if table == "Note":
@@ -330,8 +299,9 @@ class DatabaseProcessor:
                         duplicate_values_mask = self.dataframes["merged"][table][
                             mask
                         ].duplicated(subset=subset, keep=False)
-                        duplicates = self.dataframes["merged"][table][mask][duplicate_values_mask]
-
+                        duplicates = self.dataframes["merged"][table][mask][
+                            duplicate_values_mask
+                        ]
                     primary_key = self.primary_keys[table][0]
                     collision_replacement_dict = {}
                     for _, row in duplicates.iterrows():
@@ -349,11 +319,9 @@ class DatabaseProcessor:
                     for key, values in collision_replacement_dict.items():
                         for value in values:
                             collision_pair_replacement_dict[value] = key
-                    print(
-                        "Table:", table, "Subset:", subset, "Primary key:", primary_key
-                    )
-                    print(collision_pair_replacement_dict)
-                    if table == "Note":
+                    if len(collision_pair_replacement_dict.keys()) == 0:
+                        continue
+                    if table in text_values_to_merge.keys():
                         for (
                             old_primary_key,
                             new_primary_key,
@@ -363,81 +331,84 @@ class DatabaseProcessor:
                                 == old_primary_key
                             ]
                             old_row_index = old_row.index[0]
-                            old_row_title_value = old_row["Title"].values[0]
-                            old_row_content_value = old_row["Content"].values[0]
-
                             new_row = self.dataframes["merged"][table].loc[
                                 self.dataframes["merged"][table][primary_key]
                                 == new_primary_key
                             ]
                             new_row_index = new_row.index[0]
-                            new_row_title_value = new_row["Title"].values[0]
-                            new_row_content_value = new_row["Content"].values[0]
-
-                            if (
-                                len(old_row_content_value) > 0
-                                and not new_row_content_value.strip()
-                                == old_row_content_value.strip()
-                            ):
-                                differ = difflib.Differ()
-                                diff = differ.compare(
-                                    old_row_content_value.splitlines(),
-                                    new_row_content_value.splitlines(),
-                                )
-                                self.dataframes["merged"][table].at[
-                                    new_row_index, "Content"
-                                ] = "\n".join(diff)
-                            if (
-                                len(old_row_title_value) > 0
-                                and not new_row_title_value.strip()
-                                == old_row_title_value.strip()
-                            ):
-                                differ = difflib.Differ()
-                                diff = differ.compare(
-                                    old_row_title_value.splitlines(),
-                                    new_row_title_value.splitlines(),
-                                )
-                                self.dataframes["merged"][table].at[
-                                    new_row_index, "Title"
-                                ] = "\n".join(diff)
+                            for text_column in text_values_to_merge[table]:
+                                old_row_text_value = old_row[text_column].values[0]
+                                new_row_text_value = new_row[text_column].values[0]
+                                if (
+                                    len(old_row_text_value) > 0
+                                    and not new_row_text_value.strip()
+                                    == old_row_text_value.strip()
+                                ):
+                                    differ = difflib.Differ()
+                                    diff = differ.compare(
+                                        old_row_text_value.splitlines(),
+                                        new_row_text_value.splitlines(),
+                                    )
+                                    self.dataframes["merged"][table].at[
+                                        new_row_index, text_column
+                                    ] = "\n".join(diff)
                             self.dataframes["merged"][table].drop(
                                 index=old_row_index, inplace=True
                             )
                     else:
-                        print(
-                            "Table:",
-                            table,
-                            "Subset:",
-                            subset,
-                            "Primary key:",
-                            primary_key,
-                        )
-                        print(collision_pair_replacement_dict)
-                        print(duplicates)
-                        self.dataframes["merged"][table][primary_key].replace(
-                            collision_pair_replacement_dict, inplace=True
-                        )
-                        self.dataframes["merged"][table].drop_duplicates(
-                            subset=subset, ignore_index=True, inplace=True
+                        self.update_primary_key(
+                            table, primary_key, collision_pair_replacement_dict
                         )
 
-                    # # Update foreign keys
-                    if table in self.fk_constraints:
-                        print("table:", table)
-                        for rel_table, fk in self.fk_constraints[table][primary_key]:
-                            if rel_table in self.dataframes["merged"]:
-                                print("rel_table:", rel_table)
-                                print("fk:", fk)
-                                self.dataframes["merged"][rel_table][fk].replace(
-                                    collision_pair_replacement_dict, inplace=True
-                                )
-                    # if duplicates.shape[0] > 0:
-                    #     self.dataframes["merged"][table].to_excel(
-                    #         table + "_final" + ".xlsx", index=False
-                    #     )
-                    #     duplicates.to_excel(
-                    #         table + "_duplicates" + ".xlsx", index=False
-                    #     )
+                    self.update_foreign_keys(
+                        table, primary_key, collision_pair_replacement_dict
+                    )
+
+        # Now, final cleanup times!
+        # First, remove empty notes
+        empty_notes = self.dataframes["merged"]["Note"][
+            (
+                self.dataframes["merged"]["Note"]["Title"].isnull()
+                | (self.dataframes["merged"]["Note"]["Title"] == "")
+            )
+            & (
+                self.dataframes["merged"]["Note"]["Content"].isnull()
+                | (self.dataframes["merged"]["Note"]["Content"] == "")
+            )
+        ]
+        for index, row in tqdm(empty_notes.iterrows(), desc="Removing empty notes"):
+            self.dataframes["merged"]["Note"].drop(index, inplace=True)
+
+        # Remove empty playlists - maybe eventually?
+
+        # Remove special conflicting entries from TagMap and UserMark
+        ignore_list = ["ColorIndex", "Position"]
+        for table in tqdm(["TagMap", "UserMark"], desc="Removing conflicting entries"):
+            subset = [
+                elem
+                for elem in self.dataframes["merged"][table].columns
+                if elem not in ignore_list
+            ]
+            self.dataframes["merged"][table].drop_duplicates(
+                ignore_index=True, inplace=True, subset=subset
+            )
+
+        # Finally, reindex all tables
+        for table in tqdm(self.dataframes["merged"], desc="Re-indexing tables"):
+            if len(self.primary_keys[table]) > 1:
+                continue
+            self.dataframes["merged"][table].reset_index(drop=True, inplace=True)
+            new_pk_dict = {
+                row[self.primary_keys[table][0]]: index + 1
+                for index, row in self.dataframes["merged"][table].iterrows()
+                if row[self.primary_keys[table][0]] != index + 1
+                and str(row[self.primary_keys[table][0]]).replace(".", "").isnumeric()
+            }
+            self.update_primary_and_foreign_keys(
+                table,
+                self.primary_keys[table][0],
+                new_pk_dict,
+            )
 
         source_cursor.execute(
             "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index';"
@@ -475,7 +446,85 @@ class DatabaseProcessor:
         for dataframe in self.db.values():
             dataframe.close()
 
-    def get_highest_pks_from_merged_table(self, table_name):
+    def update_primary_key(
+        self,
+        origin_table,
+        origin_primary_key,
+        replacement_dict,
+        additional_dataframe_letter=None,
+    ):
+        # Update primary key
+        self.dataframes["merged"][origin_table][origin_primary_key].replace(
+            replacement_dict, inplace=True
+        )
+        # Drop duplicates resulting from primary key change
+        self.dataframes["merged"][origin_table].drop_duplicates(
+            ignore_index=True, inplace=True
+        )
+        if additional_dataframe_letter:
+            print("additional_dataframe_letter", additional_dataframe_letter)
+            self.dataframes[additional_dataframe_letter][origin_table][
+                origin_primary_key
+            ].replace(replacement_dict, inplace=True)
+            self.dataframes[additional_dataframe_letter][origin_table].drop_duplicates(
+                ignore_index=True, inplace=True
+            )
+
+    def update_primary_and_foreign_keys(
+        self,
+        origin_table,
+        origin_primary_key,
+        replacement_dict,
+        additional_dataframe_letter=None,
+    ):
+        self.update_primary_key(
+            origin_table,
+            origin_primary_key,
+            replacement_dict,
+            additional_dataframe_letter,
+        )
+        self.update_foreign_keys(
+            origin_table,
+            origin_primary_key,
+            replacement_dict,
+            additional_dataframe_letter,
+        )
+
+    def update_foreign_keys(
+        self,
+        origin_table,
+        origin_primary_key,
+        replacement_dict,
+        additional_dataframe_letter=None,
+    ):
+        if origin_table in self.fk_constraints:
+            for rel_table, fk in self.fk_constraints[origin_table][origin_primary_key]:
+                if rel_table in self.dataframes["merged"]:
+                    # Update foreign key
+                    self.dataframes["merged"][rel_table][fk].replace(
+                        replacement_dict, inplace=True
+                    )
+                    # Drop duplicates resulting from foreign key change
+                    self.dataframes["merged"][rel_table].drop_duplicates(
+                        ignore_index=True, inplace=True
+                    )
+                    if additional_dataframe_letter:
+                        print(
+                            "Update foreign key additional:",
+                            rel_table,
+                            fk,
+                            additional_dataframe_letter,
+                        )
+                        self.dataframes[additional_dataframe_letter][rel_table][
+                            fk
+                        ].replace(replacement_dict, inplace=True)
+                        # Drop duplicates resulting from foreign key change
+                        self.dataframes[additional_dataframe_letter][
+                            rel_table
+                        ].drop_duplicates(ignore_index=True, inplace=True)
+
+    def get_safe_pk_starting_point_from_merged_table(self, table_name):
+        randomizer = random.randint(100000, 1000000)
         if table_name not in self.primary_keys:
             return None
         highest_pks = None
@@ -486,13 +535,12 @@ class DatabaseProcessor:
                 if str(highest_pk_lookup).replace(".", "").isnumeric() and (
                     not str(highest_pk).isnumeric() or highest_pk_lookup > highest_pk
                 ):
-                    highest_pk = highest_pk_lookup
+                    highest_pk = max(highest_pk_lookup * randomizer, randomizer)
             if highest_pks is None:
                 highest_pks = {}
-            if highest_pk is not None:
-                highest_pks[key] = highest_pk
-            else:
-                highest_pks[key] = None
+            if highest_pk is None or highest_pk == 0:
+                highest_pk = randomizer
+            highest_pks[key] = highest_pk
         return highest_pks
 
     def get_tables(self, db):
@@ -532,7 +580,10 @@ class DatabaseProcessor:
                 dest_cursor.execute(f"DROP INDEX IF EXISTS {index_name};")
         conn_merged.commit()
 
-        for table_name in self.dataframes["merged"].keys():
+        for table_name in tqdm(
+            self.dataframes["merged"].keys(),
+            desc="Deleting all data from existing database",
+        ):
             dest_cursor.execute(f"DELETE FROM {table_name};")
             conn_merged.commit()
 
@@ -544,10 +595,12 @@ class DatabaseProcessor:
 
         conn_merged.commit()
         print()
-        print("Deleted all data from existing database to prepare for reinsertion...")
+        print("Preparing database for reinsertion...")
         dest_cursor.execute("VACUUM")
         conn_merged.commit()
-        for table_name, table_data in self.dataframes["merged"].items():
+        for table_name, table_data in tqdm(
+            self.dataframes["merged"].items(), desc="Inserting data into tables"
+        ):
             insert_sql = f"INSERT INTO {table_name} ({', '.join(table_data.columns)}) VALUES ({', '.join(['?'] * len(table_data.columns))})"
             rows_to_insert = [
                 tuple(
@@ -566,11 +619,7 @@ class DatabaseProcessor:
                 )
                 for row in table_data.values
             ]
-            for index, row in tqdm(
-                enumerate(rows_to_insert),
-                total=len(rows_to_insert),
-                desc=f"Inserting merged data into {table_name}",
-            ):
+            for index, row in enumerate(rows_to_insert):
                 if table_name != "LastModified":
                     try:
                         dest_cursor.execute(insert_sql, row)
@@ -587,14 +636,18 @@ class DatabaseProcessor:
         if len(self.output["info"]) > 0:
             print("Check the log file for debug info.")
             print()
-            with open(os.path.join(".", "info.txt"), "w", encoding="utf-8") as f:
+            with open(
+                os.path.join(self.working_folder, "info.txt"), "w", encoding="utf-8"
+            ) as f:
                 for error in self.output["info"]:
                     f.write(str(error) + "\n")
 
         if len(self.output["errors"]) > 0:
             print("Errors encountered! Check the log file.")
             print()
-            with open(os.path.join(".", "errors.txt"), "w", encoding="utf-8") as f:
+            with open(
+                os.path.join(self.working_folder, "errors.txt"), "w", encoding="utf-8"
+            ) as f:
                 for error in self.output["errors"]:
                     f.write(str(error) + "\n")
 
@@ -654,7 +707,9 @@ class DatabaseProcessor:
         )
 
         current_datetime = datetime.now()
-        formatted_date = current_datetime.astimezone(tz.gettz('US/Eastern')).strftime("%Y-%m-%dT%H:%M:%S%z")
+        formatted_date = current_datetime.astimezone(tz.gettz("US/Eastern")).strftime(
+            "%Y-%m-%dT%H:%M:%S%z"
+        )
         manifest_data["creationDate"] = formatted_date
 
         name_timestamp = current_datetime.strftime("%Y%m%d-%H%M%S")
@@ -755,4 +810,4 @@ if __name__ == "__main__":
     processor = DatabaseProcessor()
     processor.process_databases(*processor.getJwlFiles())
     processor.createJwlFile()
-    processor.cleanTempFiles()
+    # processor.cleanTempFiles()
