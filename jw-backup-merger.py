@@ -410,6 +410,13 @@ class DatabaseProcessor:
                 new_pk_dict,
             )
 
+        # Remove entries from TagMap that don't have a corresponding Note
+        notes_len = len(self.dataframes["merged"]["Note"])
+        tag_map_df = self.dataframes["merged"]["TagMap"]
+        filtered_rows = pd.to_numeric(tag_map_df["NoteId"], errors="coerce") > notes_len
+        tag_map_df = tag_map_df[~filtered_rows]
+        self.dataframes["merged"]["TagMap"] = tag_map_df
+       
         source_cursor.execute(
             "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index';"
         )
@@ -462,7 +469,6 @@ class DatabaseProcessor:
             ignore_index=True, inplace=True
         )
         if additional_dataframe_letter:
-            print("additional_dataframe_letter", additional_dataframe_letter)
             self.dataframes[additional_dataframe_letter][origin_table][
                 origin_primary_key
             ].replace(replacement_dict, inplace=True)
@@ -509,12 +515,6 @@ class DatabaseProcessor:
                         ignore_index=True, inplace=True
                     )
                     if additional_dataframe_letter:
-                        print(
-                            "Update foreign key additional:",
-                            rel_table,
-                            fk,
-                            additional_dataframe_letter,
-                        )
                         self.dataframes[additional_dataframe_letter][rel_table][
                             fk
                         ].replace(replacement_dict, inplace=True)
