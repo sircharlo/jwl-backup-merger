@@ -19,6 +19,7 @@ from zipfile import ZipFile
 
 class DatabaseProcessor:
     def __init__(self):
+        self.app_name = "jw-backup-merger"
         self.dataframes = {}
         self.primary_keys = {}
         self.fk_constraints = {}
@@ -30,7 +31,7 @@ class DatabaseProcessor:
 
         self.output = {"info": [], "errors": []}
 
-    def get_primary_keys(self, source_cursor):
+    def get_primary_key_names(self, source_cursor):
         for table_name in self.dataframes["a"].keys():
             source_cursor.execute(
                 f"SELECT l.name FROM pragma_table_info('{table_name}') as l WHERE l.pk <>0;"
@@ -44,7 +45,7 @@ class DatabaseProcessor:
                     if primary_key and primary_key not in self.primary_keys[table_name]:
                         self.primary_keys[table_name].append(primary_key)
 
-    def get_foreign_keys(self, source_cursor):
+    def get_foreign_key_names(self, source_cursor):
         for table_name in self.dataframes["a"].keys():
             source_cursor.execute(
                 f"SELECT * FROM pragma_foreign_key_list('{table_name}');"
@@ -93,9 +94,9 @@ class DatabaseProcessor:
 
         source_cursor = next(iter(self.db.values())).cursor()
 
-        self.get_primary_keys(source_cursor)
+        self.get_primary_key_names(source_cursor)
 
-        self.get_foreign_keys(source_cursor)
+        self.get_foreign_key_names(source_cursor)
 
         conflicting_entries_by_dataset = {}
         print()
@@ -378,6 +379,10 @@ class DatabaseProcessor:
         ]
         for index, row in tqdm(empty_notes.iterrows(), desc="Removing empty notes"):
             self.dataframes["merged"]["Note"].drop(index, inplace=True)
+            # Remove references in other tables to this note
+            self.remove_foreign_key_value(
+                "Note", self.primary_keys["Note"][0], row[self.primary_keys["Note"][0]]
+            )
 
         # Remove empty playlists - maybe eventually?
 
@@ -416,7 +421,7 @@ class DatabaseProcessor:
         filtered_rows = pd.to_numeric(tag_map_df["NoteId"], errors="coerce") > notes_len
         tag_map_df = tag_map_df[~filtered_rows]
         self.dataframes["merged"]["TagMap"] = tag_map_df
-       
+
         source_cursor.execute(
             "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index';"
         )
@@ -514,14 +519,29 @@ class DatabaseProcessor:
                     self.dataframes["merged"][rel_table].drop_duplicates(
                         ignore_index=True, inplace=True
                     )
-                    if additional_dataframe_letter:
-                        self.dataframes[additional_dataframe_letter][rel_table][
-                            fk
-                        ].replace(replacement_dict, inplace=True)
-                        # Drop duplicates resulting from foreign key change
-                        self.dataframes[additional_dataframe_letter][
-                            rel_table
-                        ].drop_duplicates(ignore_index=True, inplace=True)
+                if (
+                    additional_dataframe_letter
+                    and rel_table in self.dataframes[additional_dataframe_letter]
+                ):
+                    self.dataframes[additional_dataframe_letter][rel_table][fk].replace(
+                        replacement_dict, inplace=True
+                    )
+                    # Drop duplicates resulting from foreign key change
+                    self.dataframes[additional_dataframe_letter][
+                        rel_table
+                    ].drop_duplicates(ignore_index=True, inplace=True)
+
+    def remove_foreign_key_value(self, table, foreign_key, value):
+        if table in self.fk_constraints:
+            for rel_table, fk in self.fk_constraints[table][foreign_key]:
+                rows_to_remove = self.dataframes["merged"][rel_table][
+                    self.dataframes["merged"][rel_table][fk] == value
+                ]
+                if len(rows_to_remove) > 0:
+                    self.dataframes["merged"][rel_table].drop(
+                        rows_to_remove.index,
+                        inplace=True,
+                    )
 
     def get_safe_pk_starting_point_from_merged_table(self, table_name):
         randomizer = random.randint(100000, 1000000)
@@ -712,8 +732,8 @@ class DatabaseProcessor:
         )
         manifest_data["creationDate"] = formatted_date
 
-        name_timestamp = current_datetime.strftime("%Y%m%d-%H%M%S")
-        merged_file_name = f"UserdataBackup_{name_timestamp}_Merged.jwlibrary"
+        name_timestamp = current_datetime.strftime("%Y-%m-%d-%H%M%S")
+        merged_file_name = f"UserdataBackup_{name_timestamp}_{self.app_name}.jwlibrary"
 
         manifest_data["name"] = merged_file_name
 
@@ -722,7 +742,7 @@ class DatabaseProcessor:
             "hash": self.calculate_sha256(database_file_path),
             "databaseName": manifest_data["userDataBackup"]["databaseName"],
             "schemaVersion": manifest_data["userDataBackup"]["schemaVersion"],
-            "deviceName": "SuperMergerPro",
+            "deviceName": self.app_name,
         }
         manifest_data["userDataBackup"] = userDataBackup
 
