@@ -1,6 +1,7 @@
 {
     "cSpell.words": [
         "addstr",
+        "blockrange",
         "dataframe",
         "dataframes",
         "dateutil",
@@ -8,6 +9,7 @@
         "getch",
         "gettz",
         "iloc",
+        "isin",
         "iterrows",
         "jwlibrary",
         "JWLIBRARY",

@@ -1,5 +1,6 @@
 #!/usr/bin/python
 
+import argparse
 from datetime import datetime
 from dateutil import tz
 import difflib
@@ -16,10 +17,15 @@ from tkinter import filedialog
 from tqdm import tqdm
 from zipfile import ZipFile
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+args = parser.parse_args()
+
 
 class DatabaseProcessor:
     def __init__(self):
         self.app_name = "jw-backup-merger"
+        self.debug = args.debug
         self.dataframes = {}
         self.primary_keys = {}
         self.fk_constraints = {}
@@ -384,7 +390,7 @@ class DatabaseProcessor:
                 "Note", self.primary_keys["Note"][0], row[self.primary_keys["Note"][0]]
             )
 
-        # Remove IndependentMedia that isn't referenced by PlaylistItemIndependentMediaMap
+        # Remove entries from IndependentMedia that aren't referenced by PlaylistItemIndependentMediaMap table
         orphan_independent_media = self.dataframes["merged"]["IndependentMedia"][
             ~self.dataframes["merged"]["IndependentMedia"]["IndependentMediaId"].isin(
                 self.dataframes["merged"]["PlaylistItemIndependentMediaMap"][
@@ -399,7 +405,27 @@ class DatabaseProcessor:
             self.dataframes["merged"]["IndependentMedia"].drop(index, inplace=True)
             # Remove references in other tables to this note
             self.remove_foreign_key_value(
-                "IndependentMedia", self.primary_keys["IndependentMedia"][0], row[self.primary_keys["IndependentMedia"][0]]
+                "IndependentMedia",
+                self.primary_keys["IndependentMedia"][0],
+                row[self.primary_keys["IndependentMedia"][0]],
+            )
+
+        # Remove entries from BlockRange that aren't referenced by UserMark table
+        orphan_blockrange = self.dataframes["merged"]["BlockRange"][
+            ~self.dataframes["merged"]["BlockRange"]["UserMarkId"].isin(
+                self.dataframes["merged"]["UserMark"]["UserMarkId"]
+            )
+        ]
+        for index, row in tqdm(
+            orphan_blockrange.iterrows(),
+            desc="Removing references to obsolete highlights",
+        ):
+            self.dataframes["merged"]["BlockRange"].drop(index, inplace=True)
+            # Remove references in other tables to this
+            self.remove_foreign_key_value(
+                "BlockRange",
+                self.primary_keys["BlockRange"][0],
+                row[self.primary_keys["BlockRange"][0]],
             )
 
         # Remove special conflicting entries from TagMap and UserMark
@@ -431,13 +457,6 @@ class DatabaseProcessor:
                 new_pk_dict,
             )
 
-        # Remove entries from TagMap that don't have a corresponding Note
-        notes_len = len(self.dataframes["merged"]["Note"])
-        tag_map_df = self.dataframes["merged"]["TagMap"]
-        filtered_rows = pd.to_numeric(tag_map_df["NoteId"], errors="coerce") > notes_len
-        tag_map_df = tag_map_df[~filtered_rows]
-        self.dataframes["merged"]["TagMap"] = tag_map_df
-
         source_cursor.execute(
             "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index';"
         )
@@ -459,10 +478,15 @@ class DatabaseProcessor:
         indices = [x for x in list(set(indices)) if x]
         triggers = [x for x in list(set(triggers)) if x]
 
-
-        self.files_to_include_in_archive.extend(self.dataframes["merged"]["IndependentMedia"]["FilePath"])
-        self.files_to_include_in_archive.extend(self.dataframes["merged"]["PlaylistItem"]["ThumbnailFilePath"])
-        self.files_to_include_in_archive = list(set(self.files_to_include_in_archive))
+        independent_media_files = self.dataframes["merged"]["IndependentMedia"][
+            "FilePath"
+        ]
+        playlist_item_files = self.dataframes["merged"]["PlaylistItem"][
+            "ThumbnailFilePath"
+        ]
+        self.files_to_include_in_archive = list(
+            set(independent_media_files + playlist_item_files)
+        )
 
         self.save_merged_tables(indices, triggers)
 
@@ -654,9 +678,15 @@ class DatabaseProcessor:
                 if table_name != "LastModified":
                     try:
                         dest_cursor.execute(insert_sql, row)
-                        self.output["info"].append(
-                            (table_name, insert_sql, rows_to_insert[index], "NO ERROR!")
-                        )
+                        if self.debug:
+                            self.output["info"].append(
+                                (
+                                    table_name,
+                                    insert_sql,
+                                    rows_to_insert[index],
+                                    "NO ERROR!",
+                                )
+                            )
                     except Exception as e:
                         self.output["errors"].append(
                             (table_name, insert_sql, rows_to_insert[index], e)
@@ -664,7 +694,7 @@ class DatabaseProcessor:
             conn_merged.commit()
         print()
 
-        if len(self.output["info"]) > 0:
+        if self.debug and len(self.output["info"]) > 0:
             print("Check the log file for debug info.")
             print()
             with open(
@@ -674,13 +704,19 @@ class DatabaseProcessor:
                     f.write(str(error) + "\n")
 
         if len(self.output["errors"]) > 0:
-            print("Errors encountered! Check the log file.")
-            print()
-            with open(
-                os.path.join(self.working_folder, "errors.txt"), "w", encoding="utf-8"
-            ) as f:
-                for error in self.output["errors"]:
-                    f.write(str(error) + "\n")
+            print("Errors encountered!")
+            if self.debug:
+                print("Check the log file.")
+                print()
+                with open(
+                    os.path.join(self.working_folder, "errors.txt"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    for error in self.output["errors"]:
+                        f.write(str(error) + "\n")
+            else:
+                print(self.output["errors"])
 
         dest_cursor.execute("VACUUM")
         conn_merged.commit()
@@ -774,12 +810,14 @@ class DatabaseProcessor:
             os.path.join(".", self.jwl_output_folder, merged_file_name),
         )
 
+        print()
         print("Created JWL file! Full path:", os.path.join(".", merged_file_name))
 
     def cleanTempFiles(self):
-        if os.path.exists(self.working_folder):
-            shutil.rmtree(self.working_folder)
-        print("Cleaned up temporary files!")
+        if not self.debug:
+            if os.path.exists(self.working_folder):
+                shutil.rmtree(self.working_folder)
+            print("Cleaned up temporary files!")
 
     def unzipFile(self, file_path):
         basename = os.path.basename(file_path)
@@ -841,4 +879,4 @@ if __name__ == "__main__":
     processor = DatabaseProcessor()
     processor.process_databases(*processor.getJwlFiles())
     processor.createJwlFile()
-    # processor.cleanTempFiles()
+    processor.cleanTempFiles()
