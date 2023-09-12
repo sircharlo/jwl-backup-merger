@@ -1,7 +1,6 @@
 #!/usr/bin/python
 
 from datetime import datetime
-import random
 from dateutil import tz
 import difflib
 import glob
@@ -9,6 +8,7 @@ import hashlib
 import json
 import os
 import pandas as pd
+import random
 import shutil
 import sqlite3
 import tkinter as tk
@@ -384,7 +384,23 @@ class DatabaseProcessor:
                 "Note", self.primary_keys["Note"][0], row[self.primary_keys["Note"][0]]
             )
 
-        # Remove empty playlists - maybe eventually?
+        # Remove IndependentMedia that isn't referenced by PlaylistItemIndependentMediaMap
+        orphan_independent_media = self.dataframes["merged"]["IndependentMedia"][
+            ~self.dataframes["merged"]["IndependentMedia"]["IndependentMediaId"].isin(
+                self.dataframes["merged"]["PlaylistItemIndependentMediaMap"][
+                    "IndependentMediaId"
+                ]
+            )
+        ]
+        for index, row in tqdm(
+            orphan_independent_media.iterrows(),
+            desc="Removing references to unneeded media",
+        ):
+            self.dataframes["merged"]["IndependentMedia"].drop(index, inplace=True)
+            # Remove references in other tables to this note
+            self.remove_foreign_key_value(
+                "IndependentMedia", self.primary_keys["IndependentMedia"][0], row[self.primary_keys["IndependentMedia"][0]]
+            )
 
         # Remove special conflicting entries from TagMap and UserMark
         ignore_list = ["ColorIndex", "Position"]
@@ -443,14 +459,9 @@ class DatabaseProcessor:
         indices = [x for x in list(set(indices)) if x]
         triggers = [x for x in list(set(triggers)) if x]
 
-        source_cursor.execute("SELECT FilePath FROM IndependentMedia;")
-        self.files_to_include_in_archive.extend(
-            [file[0] for file in source_cursor.fetchall()]
-        )
-        source_cursor.execute("SELECT ThumbnailFilePath FROM PlaylistItem;")
-        self.files_to_include_in_archive.extend(
-            [file[0] for file in source_cursor.fetchall()]
-        )
+
+        self.files_to_include_in_archive.extend(self.dataframes["merged"]["IndependentMedia"]["FilePath"])
+        self.files_to_include_in_archive.extend(self.dataframes["merged"]["PlaylistItem"]["ThumbnailFilePath"])
         self.files_to_include_in_archive = list(set(self.files_to_include_in_archive))
 
         self.save_merged_tables(indices, triggers)
