@@ -391,53 +391,60 @@ class DatabaseProcessor:
             )
 
         # Remove entries from IndependentMedia that aren't referenced by PlaylistItemIndependentMediaMap table
-        orphan_independent_media = self.dataframes["merged"]["IndependentMedia"][
-            ~self.dataframes["merged"]["IndependentMedia"]["IndependentMediaId"].isin(
-                self.dataframes["merged"]["PlaylistItemIndependentMediaMap"][
+        if "IndependentMedia" in self.dataframes["merged"]:
+            orphan_independent_media = self.dataframes["merged"]["IndependentMedia"][
+                ~self.dataframes["merged"]["IndependentMedia"][
                     "IndependentMediaId"
-                ]
-            )
-        ]
-        for index, row in tqdm(
-            orphan_independent_media.iterrows(),
-            desc="Removing references to unneeded media",
-        ):
-            self.dataframes["merged"]["IndependentMedia"].drop(index, inplace=True)
-            # Remove references in other tables to this note
-            self.remove_foreign_key_value(
-                "IndependentMedia",
-                self.primary_keys["IndependentMedia"][0],
-                row[self.primary_keys["IndependentMedia"][0]],
-            )
+                ].isin(
+                    self.dataframes["merged"]["PlaylistItemIndependentMediaMap"][
+                        "IndependentMediaId"
+                    ]
+                )
+            ]
+            for index, row in tqdm(
+                orphan_independent_media.iterrows(),
+                desc="Removing references to unneeded media",
+            ):
+                self.dataframes["merged"]["IndependentMedia"].drop(index, inplace=True)
+                # Remove references in other tables to this note
+                self.remove_foreign_key_value(
+                    "IndependentMedia",
+                    self.primary_keys["IndependentMedia"][0],
+                    row[self.primary_keys["IndependentMedia"][0]],
+                )
 
         # Remove entries from BlockRange that aren't referenced by UserMark table
-        orphan_blockrange = self.dataframes["merged"]["BlockRange"][
-            ~self.dataframes["merged"]["BlockRange"]["UserMarkId"].isin(
-                self.dataframes["merged"]["UserMark"]["UserMarkId"]
-            )
-        ]
-        for index, row in tqdm(
-            orphan_blockrange.iterrows(),
-            desc="Removing references to obsolete highlights",
-        ):
-            self.dataframes["merged"]["BlockRange"].drop(index, inplace=True)
-            # Remove references in other tables to this
-            self.remove_foreign_key_value(
-                "BlockRange",
-                self.primary_keys["BlockRange"][0],
-                row[self.primary_keys["BlockRange"][0]],
-            )
+        if "BlockRange" in self.dataframes["merged"]:
+            orphan_blockrange = self.dataframes["merged"]["BlockRange"][
+                ~self.dataframes["merged"]["BlockRange"]["UserMarkId"].isin(
+                    self.dataframes["merged"]["UserMark"]["UserMarkId"]
+                )
+            ]
+            for index, row in tqdm(
+                orphan_blockrange.iterrows(),
+                desc="Removing references to obsolete highlights",
+            ):
+                self.dataframes["merged"]["BlockRange"].drop(index, inplace=True)
+                # Remove references in other tables to this
+                self.remove_foreign_key_value(
+                    "BlockRange",
+                    self.primary_keys["BlockRange"][0],
+                    row[self.primary_keys["BlockRange"][0]],
+                )
 
         # Remove special conflicting entries from TagMap and UserMark
-        ignore_list = ["ColorIndex", "Position"]
-        for table in tqdm(["TagMap", "UserMark"], desc="Removing conflicting entries"):
-            subset = [
-                elem
-                for elem in self.dataframes["merged"][table].columns
-                if elem not in ignore_list
-            ]
+        ignore_list = ["ColorIndex", "Position", "Title"]
+        for table in tqdm(
+            ["TagMap", "UserMark", "Location"], desc="Removing conflicting entries"
+        ):
             self.dataframes["merged"][table].drop_duplicates(
-                ignore_index=True, inplace=True, subset=subset
+                ignore_index=True,
+                inplace=True,
+                subset=[
+                    elem
+                    for elem in self.dataframes["merged"][table].columns
+                    if elem not in ignore_list
+                ],
             )
 
         # Finally, reindex all tables
@@ -478,12 +485,18 @@ class DatabaseProcessor:
         indices = [x for x in list(set(indices)) if x]
         triggers = [x for x in list(set(triggers)) if x]
 
-        independent_media_files = self.dataframes["merged"]["IndependentMedia"][
-            "FilePath"
-        ]
-        playlist_item_files = self.dataframes["merged"]["PlaylistItem"][
-            "ThumbnailFilePath"
-        ]
+        try:
+            independent_media_files = self.dataframes["merged"]["IndependentMedia"][
+                "FilePath"
+            ]
+        except KeyError:
+            independent_media_files = []
+        try:
+            playlist_item_files = self.dataframes["merged"]["PlaylistItem"][
+                "ThumbnailFilePath"
+            ]
+        except KeyError:
+            playlist_item_files = []
         self.files_to_include_in_archive = list(
             set(independent_media_files + playlist_item_files)
         )
@@ -656,6 +669,13 @@ class DatabaseProcessor:
         for table_name, table_data in tqdm(
             self.dataframes["merged"].items(), desc="Inserting data into tables"
         ):
+            if self.debug:
+                try:
+                    table_data.to_excel(
+                        os.path.join(self.working_folder, f"{table_name}.xlsx")
+                    )
+                except:
+                    print(f"Could not save {table_name}.xlsx; continuing...")
             insert_sql = f"INSERT INTO {table_name} ({', '.join(table_data.columns)}) VALUES ({', '.join(['?'] * len(table_data.columns))})"
             rows_to_insert = [
                 tuple(
