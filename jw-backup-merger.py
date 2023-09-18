@@ -1,5 +1,7 @@
 #!/usr/bin/python
 
+# Todo: delete intermediary JWL files if more than 2 files merged
+
 import argparse
 from datetime import datetime
 from dateutil import tz
@@ -7,9 +9,9 @@ import difflib
 import glob
 import hashlib
 import json
+import math
 import os
 import pandas as pd
-import random
 import shutil
 import sqlite3
 import tkinter as tk
@@ -19,15 +21,34 @@ from zipfile import ZipFile
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+parser.add_argument("--folder", type=str, help="Folder containing JWL files to merge")
+parser.add_argument("--file", type=str, help="JWL file to merge", action="append")
 args = parser.parse_args()
 
+
+if args.folder and not os.path.exists(args.folder):
+    print(f"Folder not found: {args.folder}\nPlease validate the path.")
+    exit()
+
+if args.file:
+    for file_path in args.file:
+        if not os.path.exists(file_path) or not os.path.isfile(file_path):
+            print(f"File not found: {file_path}\nPlease validate the path.")
+            exit()
+
+if args.file and len(args.file) == 1 and args.folder is None:
+    print(
+        "Error: --file cannot be used on its own without another --file or --folder; you can't merge a file with itself!"
+    )
+    exit()
 
 class DatabaseProcessor:
     def __init__(self):
         self.app_name = "jw-backup-merger"
         self.debug = args.debug
-        self.dataframes = {}
+        self.merged_tables = {}
         self.primary_keys = {}
+        self.foreign_keys = {}
         self.fk_constraints = {}
         self.db = {}
         self.files_to_include_in_archive = []
@@ -38,8 +59,8 @@ class DatabaseProcessor:
 
         self.output = {"info": [], "errors": []}
 
-    def get_primary_key_names(self, source_cursor):
-        for table_name in self.dataframes["a"].keys():
+    def get_primary_key_names(self, temp_db, source_cursor):
+        for table_name in self.get_tables(temp_db):
             source_cursor.execute(
                 f"SELECT l.name FROM pragma_table_info('{table_name}') as l WHERE l.pk <>0;"
             )
@@ -52,8 +73,8 @@ class DatabaseProcessor:
                     if primary_key and primary_key not in self.primary_keys[table_name]:
                         self.primary_keys[table_name].append(primary_key)
 
-    def get_foreign_key_names(self, source_cursor):
-        for table_name in self.dataframes["a"].keys():
+    def get_foreign_key_names(self, temp_db, source_cursor):
+        for table_name in self.get_tables(temp_db):
             source_cursor.execute(
                 f"SELECT * FROM pragma_foreign_key_list('{table_name}');"
             )
@@ -70,16 +91,21 @@ class DatabaseProcessor:
                         if pk not in self.fk_constraints[from_table]:
                             self.fk_constraints[from_table][pk] = []
                         self.fk_constraints[from_table][pk].append((to_table, fk))
+                        if to_table not in self.foreign_keys:
+                            self.foreign_keys[to_table] = []
+                        self.foreign_keys[to_table].append(fk)
 
-    def process_databases(self, file_a, file_b):
-        self.db["a"] = sqlite3.connect(file_a)
-        self.db["b"] = sqlite3.connect(file_b)
-
-        for dataframe_letter in ["a", "b"]:
-            for table in self.get_tables(self.db[dataframe_letter]):
-                self.load_table_into_df(
-                    self.db[dataframe_letter], table, dataframe_letter
-                )
+    def process_databases(self, database_files):
+        source_cursor = None
+        for file_path in database_files:
+            temp_db = sqlite3.connect(file_path)
+            if source_cursor is None:
+                source_cursor = temp_db.cursor()
+                self.get_primary_key_names(temp_db, source_cursor)
+                self.get_foreign_key_names(temp_db, source_cursor)
+            floor = self.get_primary_key_floor()
+            for table in tqdm(self.get_tables(temp_db), desc="Loading tables"):
+                self.load_table_into_df(temp_db, table, floor)
 
         # Reorder tables to facilitate processing, since some tables depend on others
         table_order = [
@@ -91,178 +117,57 @@ class DatabaseProcessor:
             "PlaylistItem",
             "Tag",
         ]
-        for dataframe in self.dataframes:
-            for table in table_order[::-1]:
-                popped_table = self.dataframes[dataframe].pop(table)
-                self.dataframes[dataframe] = {
+        for table in table_order[::-1]:
+            if table in self.merged_tables:
+                popped_table = self.merged_tables.pop(table)
+                self.merged_tables = {
                     table: popped_table,
-                    **self.dataframes[dataframe],
+                    **self.merged_tables,
                 }
 
-        source_cursor = next(iter(self.db.values())).cursor()
-
-        self.get_primary_key_names(source_cursor)
-
-        self.get_foreign_key_names(source_cursor)
-
-        conflicting_entries_by_dataset = {}
-        print()
-        for table in tqdm(self.dataframes["a"].keys(), desc=f"Analyzing tables"):
-            if table == "LastModified":
-                continue
-            concatenated_entries = pd.concat(
-                [self.dataframes["b"][table], self.dataframes["a"][table]],
-                ignore_index=True,
-            )
-
-            if concatenated_entries.shape[0] == 0:
-                continue
-
-            subset_columns = concatenated_entries.columns
-
-            common_entries = concatenated_entries[
-                concatenated_entries.duplicated(subset=subset_columns, keep="first")
-            ]
-
-            for dataframe_letter in ["a", "b"]:
-                if dataframe_letter not in conflicting_entries_by_dataset:
-                    conflicting_entries_by_dataset[dataframe_letter] = {}
-                dataset_comparer = pd.concat(
-                    [common_entries, self.dataframes[dataframe_letter][table]],
-                    ignore_index=True,
-                )
-                dataset_comparer.drop_duplicates(
-                    subset=subset_columns, inplace=True, ignore_index=True, keep=False
-                )
-                conflicting_entries_by_dataset[dataframe_letter][
-                    table
-                ] = dataset_comparer
-
-            if "merged" not in self.dataframes:
-                self.dataframes["merged"] = {}
-            self.dataframes["merged"][table] = common_entries.copy()
-        # Perform the initial concatenation
-        for dataframe_letter in conflicting_entries_by_dataset:
-            for table in tqdm(
-                conflicting_entries_by_dataset[dataframe_letter],
-                desc="Concatenating tables from " + dataframe_letter,
+        if self.debug:
+            for table_name in tqdm(
+                self.merged_tables.keys(),
+                desc="Outputting concatenated tables to Excel for debugging",
             ):
-                starting_pks = self.get_safe_pk_starting_point_from_merged_table(table)
-                if len(self.primary_keys[table]) == 1:
-                    for primary_key in self.primary_keys[table]:
-                        dict_of_new_values = {}
-                        if starting_pks[primary_key] is not None:
-                            for index, value in enumerate(
-                                conflicting_entries_by_dataset[dataframe_letter][table][
-                                    primary_key
-                                ],
-                                start=starting_pks[primary_key],
-                            ):
-                                if str(value).replace(".", "").isnumeric():
-                                    dict_of_new_values[value] = index
-                        dict_of_new_values = {
-                            key: value
-                            for key, value in dict_of_new_values.items()
-                            if key != value
-                        }
-                        if len(dict_of_new_values) == 0:
-                            continue
-
-                        self.update_primary_and_foreign_keys(
-                            table,
-                            primary_key,
-                            dict_of_new_values,
-                            dataframe_letter,
-                        )
-
-                self.dataframes["merged"][table] = pd.concat(
-                    [
-                        self.dataframes["merged"][table],
-                        conflicting_entries_by_dataset[dataframe_letter][table],
-                    ],
-                    ignore_index=True,
+                self.merged_tables[table_name].to_excel(
+                    os.path.join(self.working_folder, f"concat-{table_name}.xlsx"),
+                )
+        print()
+        for table_name in tqdm(self.merged_tables.keys(), desc=f"Analyzing tables"):
+            if len(list(self.merged_tables[table_name].columns)) == 1:
+                unique_subset = self.merged_tables[table_name].columns.to_list()
+                current_table_pk_name = self.merged_tables[table_name].columns[0]
+            else:
+                current_table_pk_name = self.primary_keys[table_name][0]
+                unique_subset = [
+                    x
+                    for x in self.merged_tables[table_name].columns
+                    if x != current_table_pk_name
+                ]
+            grouped = (
+                self.merged_tables[table_name]
+                .groupby(unique_subset)[current_table_pk_name]
+                .apply(list)
+            )
+            filtered_grouped = grouped[grouped.apply(len) > 1]
+            desired_result = {values[0]: values[1:] for values in filtered_grouped}
+            replacement_dict = {}
+            for orig, duplicate_values in desired_result.items():
+                for duplicate_value in duplicate_values:
+                    replacement_dict[duplicate_value] = orig
+            self.update_primary_and_foreign_keys(
+                table_name, current_table_pk_name, replacement_dict
+            )
+            if self.debug:
+                print("Saving deduplicated table to Excel:", table_name)
+                self.merged_tables[table_name].to_excel(
+                    os.path.join(
+                        self.working_folder, f"deduplicated-1st-pass-{table_name}.xlsx"
+                    ),
                 )
 
-        # Process duplicated entries, first pass: automatically merge when no conflict is found
-        unique_constraints = {
-            "Location": [
-                [
-                    "BookNumber",
-                    "ChapterNumber",
-                    "KeySymbol",
-                    "MepsLanguage",
-                    "Type",
-                    "IssueTagNumber",
-                    "DocumentId",
-                    "Track",
-                ],
-            ],
-            "InputField": [["TextTag", "Value"]],
-            "IndependentMedia": [["FilePath"]],
-            "Bookmark": [["PublicationLocationId", "Slot", "Title", "Snippet"]],
-            "UserMark": [
-                ["ColorIndex", "LocationId", "StyleIndex", "UserMarkGuid", "Version"],
-            ],
-            "BlockRange": [
-                ["BlockType", "Identifier", "StartToken", "EndToken", "UserMarkId"]
-            ],
-            "Note": [
-                [
-                    "Guid",
-                    "UserMarkId",
-                    "LocationId",
-                    "Title",
-                    "Content",
-                    "BlockType",
-                    "BlockIdentifier",
-                ],
-            ],
-            "PlaylistItemAccuracy": [["Description"]],
-            "PlaylistItemMarker": [["PlaylistItemId", "StartTimeTick"]],
-            "Tag": [["Type", "Name"]],
-        }
-        for table, subsets in tqdm(
-            unique_constraints.items(), desc="Reworking data in line with constraints"
-        ):
-            if table in self.dataframes["merged"]:
-                for subset in subsets:
-                    duplicate_values_mask = self.dataframes["merged"][table].duplicated(
-                        subset=subset, keep=False
-                    )
-                    duplicates = self.dataframes["merged"][table][duplicate_values_mask]
-                    primary_key = self.primary_keys[table][0]
-                    collision_replacement_dict = {}
-                    for _, row in duplicates.iterrows():
-                        primary_key_value = row[self.primary_keys[table][0]]
-                        key = tuple(row[subset])
-
-                        if key not in collision_replacement_dict:
-                            collision_replacement_dict[key] = [primary_key_value]
-                        else:
-                            collision_replacement_dict[key].append(primary_key_value)
-                    collision_replacement_dict = {
-                        v[0]: v[1:] for v in collision_replacement_dict.values()
-                    }
-                    collision_pair_replacement_dict = {}
-                    for key, values in collision_replacement_dict.items():
-                        for value in values:
-                            collision_pair_replacement_dict[value] = key
-                    if len(collision_pair_replacement_dict.keys()) == 0:
-                        continue
-
-                    self.update_primary_and_foreign_keys(
-                        table, primary_key, collision_pair_replacement_dict
-                    )
-
-        for table in tqdm(
-            self.dataframes["merged"],
-            desc="Removing duplicates we've identified so far",
-        ):
-            self.dataframes["merged"][table].drop_duplicates(
-                ignore_index=True, inplace=True
-            )
-
-        # Process duplicated entries, second pass: conflict is found, manual intervention might be required
+        # De-duplicate entries
         unique_constraints_requiring_attention = {
             "Bookmark": [["PublicationLocationId", "Slot"]],
             "InputField": [["LocationId", "TextTag"]],
@@ -285,32 +190,33 @@ class DatabaseProcessor:
         }
         for table, subsets in tqdm(
             unique_constraints_requiring_attention.items(),
-            desc="Reworking data in line with even more constraints",
+            desc="Reworking data and merging duplicates",
         ):
-            if table in self.dataframes["merged"]:
+            if table in self.merged_tables:
                 for subset in subsets:
                     if table == "Note":
-                        self.dataframes["merged"][table].sort_values(
+                        self.merged_tables[table].sort_values(
                             "LastModified", ascending=False, inplace=True
                         )
-                    duplicate_values_mask = self.dataframes["merged"][table].duplicated(
+                    duplicate_values_mask = self.merged_tables[table].duplicated(
                         subset=subset, keep=False
                     )
-                    duplicates = self.dataframes["merged"][table][duplicate_values_mask]
+                    duplicates = self.merged_tables[table][duplicate_values_mask]
                     if table == "TagMap":
                         mask = (
-                            self.dataframes["merged"][table][subset[0]].notna()
-                            & (self.dataframes["merged"][table][subset[0]] != "")
-                            & self.dataframes["merged"][table][subset[1]].notna()
-                            & (self.dataframes["merged"][table][subset[1]] != "")
+                            self.merged_tables[table][subset[0]].notna()
+                            & (self.merged_tables[table][subset[0]] != "")
+                            & self.merged_tables[table][subset[1]].notna()
+                            & (self.merged_tables[table][subset[1]] != "")
                         )
-                        duplicate_values_mask = self.dataframes["merged"][table][
+                        duplicate_values_mask = self.merged_tables[table][
                             mask
                         ].duplicated(subset=subset, keep=False)
-                        duplicates = self.dataframes["merged"][table][mask][
+                        duplicates = self.merged_tables[table][mask][
                             duplicate_values_mask
                         ]
                     primary_key = self.primary_keys[table][0]
+                    # TODO: find a better way to handle this, using groupby instead
                     collision_replacement_dict = {}
                     for _, row in duplicates.iterrows():
                         primary_key_value = row[self.primary_keys[table][0]]
@@ -334,13 +240,13 @@ class DatabaseProcessor:
                             old_primary_key,
                             new_primary_key,
                         ) in collision_pair_replacement_dict.items():
-                            old_row = self.dataframes["merged"][table].loc[
-                                self.dataframes["merged"][table][primary_key]
+                            old_row = self.merged_tables[table].loc[
+                                self.merged_tables[table][primary_key]
                                 == old_primary_key
                             ]
                             old_row_index = old_row.index[0]
-                            new_row = self.dataframes["merged"][table].loc[
-                                self.dataframes["merged"][table][primary_key]
+                            new_row = self.merged_tables[table].loc[
+                                self.merged_tables[table][primary_key]
                                 == new_primary_key
                             ]
                             new_row_index = new_row.index[0]
@@ -357,10 +263,10 @@ class DatabaseProcessor:
                                         old_row_text_value.splitlines(),
                                         new_row_text_value.splitlines(),
                                     )
-                                    self.dataframes["merged"][table].at[
+                                    self.merged_tables[table].at[
                                         new_row_index, text_column
                                     ] = "\n".join(diff)
-                            self.dataframes["merged"][table].drop(
+                            self.merged_tables[table].drop(
                                 index=old_row_index, inplace=True
                             )
                     else:
@@ -372,32 +278,40 @@ class DatabaseProcessor:
                         table, primary_key, collision_pair_replacement_dict
                     )
 
-        # Now, final cleanup times!
-        # First, remove empty notes
-        empty_notes = self.dataframes["merged"]["Note"][
-            (
-                self.dataframes["merged"]["Note"]["Title"].isnull()
-                | (self.dataframes["merged"]["Note"]["Title"] == "")
-            )
-            & (
-                self.dataframes["merged"]["Note"]["Content"].isnull()
-                | (self.dataframes["merged"]["Note"]["Content"] == "")
-            )
-        ]
-        for index, row in tqdm(empty_notes.iterrows(), desc="Removing empty notes"):
-            self.dataframes["merged"]["Note"].drop(index, inplace=True)
-            # Remove references in other tables to this note
-            self.remove_foreign_key_value(
-                "Note", self.primary_keys["Note"][0], row[self.primary_keys["Note"][0]]
-            )
+        # Remove empty notes that aren't referenced by TagMap table
+        if "Note" in self.merged_tables:
+            empty_notes = self.merged_tables["Note"][
+                (
+                    self.merged_tables["Note"]["Title"].isnull()
+                    | (self.merged_tables["Note"]["Title"] == "")
+                )
+                & (
+                    self.merged_tables["Note"]["Content"].isnull()
+                    | (self.merged_tables["Note"]["Content"] == "")
+                )
+            ]
+            untagged_empty_notes = empty_notes[
+                ~self.merged_tables["Note"]["NoteId"].isin(
+                    self.merged_tables["TagMap"]["NoteId"]
+                )
+            ]
+            for index, row in tqdm(untagged_empty_notes.iterrows(), desc="Removing untagged and empty notes"):
+                self.merged_tables["Note"].drop(index, inplace=True)
+                # Remove references in other tables to this note
+                self.remove_foreign_key_value(
+                    "Note",
+                    self.primary_keys["Note"][0],
+                    row[self.primary_keys["Note"][0]],
+                )
 
         # Remove entries from IndependentMedia that aren't referenced by PlaylistItemIndependentMediaMap table
-        if "IndependentMedia" in self.dataframes["merged"]:
-            orphan_independent_media = self.dataframes["merged"]["IndependentMedia"][
-                ~self.dataframes["merged"]["IndependentMedia"][
-                    "IndependentMediaId"
-                ].isin(
-                    self.dataframes["merged"]["PlaylistItemIndependentMediaMap"][
+        if (
+            "IndependentMedia" in self.merged_tables
+            and "PlaylistItemIndependentMediaMap" in self.merged_tables
+        ):
+            orphan_independent_media = self.merged_tables["IndependentMedia"][
+                ~self.merged_tables["IndependentMedia"]["IndependentMediaId"].isin(
+                    self.merged_tables["PlaylistItemIndependentMediaMap"][
                         "IndependentMediaId"
                     ]
                 )
@@ -406,7 +320,7 @@ class DatabaseProcessor:
                 orphan_independent_media.iterrows(),
                 desc="Removing references to unneeded media",
             ):
-                self.dataframes["merged"]["IndependentMedia"].drop(index, inplace=True)
+                self.merged_tables["IndependentMedia"].drop(index, inplace=True)
                 # Remove references in other tables to this note
                 self.remove_foreign_key_value(
                     "IndependentMedia",
@@ -415,49 +329,71 @@ class DatabaseProcessor:
                 )
 
         # Remove entries from BlockRange that aren't referenced by UserMark table
-        if "BlockRange" in self.dataframes["merged"]:
-            orphan_blockrange = self.dataframes["merged"]["BlockRange"][
-                ~self.dataframes["merged"]["BlockRange"]["UserMarkId"].isin(
-                    self.dataframes["merged"]["UserMark"]["UserMarkId"]
+        if "BlockRange" in self.merged_tables:
+            orphan_blockrange = self.merged_tables["BlockRange"][
+                ~self.merged_tables["BlockRange"]["UserMarkId"].isin(
+                    self.merged_tables["UserMark"]["UserMarkId"]
                 )
             ]
             for index, row in tqdm(
                 orphan_blockrange.iterrows(),
                 desc="Removing references to obsolete highlights",
             ):
-                self.dataframes["merged"]["BlockRange"].drop(index, inplace=True)
+                self.merged_tables["BlockRange"].drop(index, inplace=True)
                 # Remove references in other tables to this
                 self.remove_foreign_key_value(
                     "BlockRange",
                     self.primary_keys["BlockRange"][0],
                     row[self.primary_keys["BlockRange"][0]],
                 )
-
-        # Remove special conflicting entries from TagMap and UserMark
+        
+        # # Remove special conflicting entries from TagMap and UserMark
         ignore_list = ["ColorIndex", "Position", "Title"]
         for table in tqdm(
             ["TagMap", "UserMark", "Location"], desc="Removing conflicting entries"
         ):
-            self.dataframes["merged"][table].drop_duplicates(
+            self.merged_tables[table].drop_duplicates(
                 ignore_index=True,
                 inplace=True,
                 subset=[
                     elem
-                    for elem in self.dataframes["merged"][table].columns
+                    for elem in self.merged_tables[table].columns
                     if elem not in ignore_list
                 ],
             )
 
+        # Remove orphan locations
+        print(self.fk_constraints["Location"])
+        filter_condition = None
+        for table, field in self.fk_constraints["Location"]["LocationId"]:
+            # Initialize a temporary condition for the current key
+            temp_condition = ~self.merged_tables["Location"]["LocationId"].isin(
+                self.merged_tables[table][field]
+            )
+            if filter_condition is None:
+                filter_condition = temp_condition
+            else:
+                filter_condition &= temp_condition
+
+        orphan_locations = self.merged_tables["Location"][filter_condition]
+        for index, row in tqdm(
+            orphan_locations.iterrows(),
+            desc="Removing unneeded locations",
+        ):
+            self.merged_tables["Location"].drop(index, inplace=True)
+
         # Finally, reindex all tables
-        for table in tqdm(self.dataframes["merged"], desc="Re-indexing tables"):
-            if len(self.primary_keys[table]) > 1:
+        for table in tqdm(self.merged_tables, desc="Re-indexing tables"):
+            if (
+                table not in self.primary_keys
+                or len(list(self.merged_tables[table].columns)) == 1
+                or len(self.primary_keys[table]) > 1
+            ):
                 continue
-            self.dataframes["merged"][table].reset_index(drop=True, inplace=True)
+            self.merged_tables[table].reset_index(drop=True, inplace=True)
             new_pk_dict = {
                 row[self.primary_keys[table][0]]: index + 1
-                for index, row in self.dataframes["merged"][table].iterrows()
-                if row[self.primary_keys[table][0]] != index + 1
-                and str(row[self.primary_keys[table][0]]).replace(".", "").isnumeric()
+                for index, row in self.merged_tables[table].iterrows()
             }
             self.update_primary_and_foreign_keys(
                 table,
@@ -488,15 +424,13 @@ class DatabaseProcessor:
 
         try:
             independent_media_files = (
-                self.dataframes["merged"]["IndependentMedia"]["FilePath"]
-                .dropna()
-                .tolist()
+                self.merged_tables["IndependentMedia"]["FilePath"].dropna().tolist()
             )
         except KeyError:
             independent_media_files = []
         try:
             playlist_item_files = (
-                self.dataframes["merged"]["PlaylistItem"]["ThumbnailFilePath"]
+                self.merged_tables["PlaylistItem"]["ThumbnailFilePath"]
                 .dropna()
                 .tolist()
             )
@@ -516,42 +450,31 @@ class DatabaseProcessor:
         origin_table,
         origin_primary_key,
         replacement_dict,
-        additional_dataframe_letter=None,
     ):
         # Update primary key
-        self.dataframes["merged"][origin_table][origin_primary_key].replace(
-            replacement_dict, inplace=True
-        )
+        self.merged_tables[origin_table][origin_primary_key] = self.merged_tables[
+            origin_table
+        ][origin_primary_key].map(lambda x: replacement_dict.get(x, x))
         # Drop duplicates resulting from primary key change
-        self.dataframes["merged"][origin_table].drop_duplicates(
+        self.merged_tables[origin_table].drop_duplicates(
             ignore_index=True, inplace=True
         )
-        if additional_dataframe_letter:
-            self.dataframes[additional_dataframe_letter][origin_table][
-                origin_primary_key
-            ].replace(replacement_dict, inplace=True)
-            self.dataframes[additional_dataframe_letter][origin_table].drop_duplicates(
-                ignore_index=True, inplace=True
-            )
 
     def update_primary_and_foreign_keys(
         self,
         origin_table,
         origin_primary_key,
         replacement_dict,
-        additional_dataframe_letter=None,
     ):
-        self.update_primary_key(
-            origin_table,
-            origin_primary_key,
-            replacement_dict,
-            additional_dataframe_letter,
-        )
         self.update_foreign_keys(
             origin_table,
             origin_primary_key,
             replacement_dict,
-            additional_dataframe_letter,
+        )
+        self.update_primary_key(
+            origin_table,
+            origin_primary_key,
+            replacement_dict,
         )
 
     def update_foreign_keys(
@@ -559,62 +482,30 @@ class DatabaseProcessor:
         origin_table,
         origin_primary_key,
         replacement_dict,
-        additional_dataframe_letter=None,
     ):
         if origin_table in self.fk_constraints:
             for rel_table, fk in self.fk_constraints[origin_table][origin_primary_key]:
-                if rel_table in self.dataframes["merged"]:
+                if rel_table in self.merged_tables:
                     # Update foreign key
-                    self.dataframes["merged"][rel_table][fk].replace(
-                        replacement_dict, inplace=True
-                    )
+                    self.merged_tables[rel_table][fk] = self.merged_tables[rel_table][
+                        fk
+                    ].map(lambda x: replacement_dict.get(x, x))
                     # Drop duplicates resulting from foreign key change
-                    self.dataframes["merged"][rel_table].drop_duplicates(
+                    self.merged_tables[rel_table].drop_duplicates(
                         ignore_index=True, inplace=True
                     )
-                if (
-                    additional_dataframe_letter
-                    and rel_table in self.dataframes[additional_dataframe_letter]
-                ):
-                    self.dataframes[additional_dataframe_letter][rel_table][fk].replace(
-                        replacement_dict, inplace=True
-                    )
-                    # Drop duplicates resulting from foreign key change
-                    self.dataframes[additional_dataframe_letter][
-                        rel_table
-                    ].drop_duplicates(ignore_index=True, inplace=True)
 
     def remove_foreign_key_value(self, table, foreign_key, value):
         if table in self.fk_constraints:
             for rel_table, fk in self.fk_constraints[table][foreign_key]:
-                rows_to_remove = self.dataframes["merged"][rel_table][
-                    self.dataframes["merged"][rel_table][fk] == value
+                rows_to_remove = self.merged_tables[rel_table][
+                    self.merged_tables[rel_table][fk] == value
                 ]
                 if len(rows_to_remove) > 0:
-                    self.dataframes["merged"][rel_table].drop(
+                    self.merged_tables[rel_table].drop(
                         rows_to_remove.index,
                         inplace=True,
                     )
-
-    def get_safe_pk_starting_point_from_merged_table(self, table_name):
-        randomizer = random.randint(100000, 1000000)
-        if table_name not in self.primary_keys:
-            return None
-        highest_pks = None
-        for key in self.primary_keys[table_name]:
-            highest_pk = None
-            if not self.dataframes["merged"][table_name][key].empty:
-                highest_pk_lookup = max(self.dataframes["merged"][table_name][key])
-                if str(highest_pk_lookup).replace(".", "").isnumeric() and (
-                    not str(highest_pk).isnumeric() or highest_pk_lookup > highest_pk
-                ):
-                    highest_pk = max(highest_pk_lookup * randomizer, randomizer)
-            if highest_pks is None:
-                highest_pks = {}
-            if highest_pk is None or highest_pk == 0:
-                highest_pk = randomizer
-            highest_pks[key] = highest_pk
-        return highest_pks
 
     def get_tables(self, db):
         table_query = "SELECT name FROM sqlite_master WHERE type='table';"
@@ -622,13 +513,45 @@ class DatabaseProcessor:
         cursor.execute(table_query)
         return [table[0] for table in cursor.fetchall()]
 
-    def load_table_into_df(self, db, table_name, destination_letter):
-        if not destination_letter in self.dataframes:
-            self.dataframes[destination_letter] = {}
-        self.dataframes[destination_letter][table_name] = pd.read_sql_query(
-            f"SELECT * FROM {table_name}", db
-        )
-        self.dataframes[destination_letter][table_name].fillna("", inplace=True)
+    def get_primary_key_floor(self):
+        highest_value = None
+        floor = 0
+        incrementer = 100000
+        for table_name in self.merged_tables.keys():
+            if (
+                table_name in self.primary_keys
+                and len(list(self.merged_tables[table_name].columns)) != 1
+            ):
+                max_value = self.merged_tables[table_name][
+                    self.primary_keys[table_name][0]
+                ].max()
+                if highest_value is None or max_value > highest_value:
+                    highest_value = max_value
+                    floor = math.ceil(highest_value / incrementer) * incrementer
+        return floor
+
+    def load_table_into_df(self, db, table_name, floor):
+        new_table = pd.read_sql(f"SELECT * FROM {table_name}", db)
+        if table_name not in self.merged_tables:
+            self.merged_tables[table_name] = new_table
+        else:
+            if len(list(new_table.columns)) != 1:
+                for column in new_table.columns:
+                    if column in self.primary_keys[table_name] or (
+                        table_name in self.foreign_keys
+                        and column in self.foreign_keys[table_name]
+                    ):
+                        new_table[column] = new_table[column].apply(
+                            lambda x: x + floor
+                            if str(x).replace(".", "").isnumeric()
+                            else x
+                        )
+            self.merged_tables[table_name] = pd.concat(
+                [self.merged_tables[table_name], new_table],
+                ignore_index=True,
+            )
+            self.merged_tables[table_name].reset_index(drop=True, inplace=True)
+        self.merged_tables[table_name].fillna("", inplace=True)
 
     def save_merged_tables(self, indices, triggers):
         os.makedirs(self.working_folder, exist_ok=True)
@@ -654,7 +577,7 @@ class DatabaseProcessor:
         conn_merged.commit()
 
         for table_name in tqdm(
-            self.dataframes["merged"].keys(),
+            self.merged_tables.keys(),
             desc="Deleting all data from existing database",
         ):
             dest_cursor.execute(f"DELETE FROM {table_name};")
@@ -670,12 +593,15 @@ class DatabaseProcessor:
         dest_cursor.execute("VACUUM")
         conn_merged.commit()
         for table_name, table_data in tqdm(
-            self.dataframes["merged"].items(), desc="Inserting merged data into tables"
+            self.merged_tables.items(), desc="Inserting merged data into tables"
         ):
             if self.debug:
                 try:
                     table_data.to_excel(
-                        os.path.join(self.working_folder, f"{table_name}.xlsx")
+                        os.path.join(
+                            self.working_folder,
+                            f"{datetime.now().strftime('%Y-%m-%d-%H%M%S') }_{table_name}.xlsx",
+                        )
                     )
                 except:
                     print(f"Could not save {table_name}.xlsx; continuing...")
@@ -743,7 +669,6 @@ class DatabaseProcessor:
 
         dest_cursor.execute("VACUUM")
         conn_merged.commit()
-
         conn_merged.close()
 
     def createJwlFile(self, final=False):
@@ -874,15 +799,31 @@ class DatabaseProcessor:
         root = tk.Tk()
         root.withdraw()
         file_paths = []
-        while len(file_paths) < 2:
-            file_path = filedialog.askopenfilename(
-                filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")],
-                title="Select one or more backup files",
-                multiple=True,
-            )
-            if not file_path:
-                exit()
-            file_paths.extend(file_path)
+        if args.file is not None or args.folder is not None:
+            if args.file:
+                file_paths.extend(args.file)
+            if args.folder:
+                for file in os.listdir(args.folder):
+                    if not file.lower().endswith(".jwlibrary"):
+                        continue
+                    file_paths.append(os.path.join(args.folder, file))
+        # TODO: If --folder or --file, show confirm to user enumerating all files that will be merged
+        else:
+            while len(file_paths) < 2:
+                file_path = filedialog.askopenfilename(
+                    filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")],
+                    title="Select one or more backup files",
+                    multiple=True,
+                )
+                if not file_path:
+                    exit()
+                file_paths.extend(file_path)
+        if not file_paths or len(file_paths) == 1:
+            print("Not enough .JWLIBRARY files found to work with!")
+            print()
+            print("Provided arguments:")
+            print("\n".join(["- " + path for path in [args.file, args.folder] if path]))
+            exit()
         print(
             "Files selected:\n"
             + "\n".join(["- " + file_path for file_path in file_paths])
@@ -914,27 +855,8 @@ class DatabaseProcessor:
         return hash_sha256.hexdigest()
 
     def process_multiple_databases(self, file_paths):
-        while len(file_paths) > 2:
-            batch = file_paths[:2]
-            print()
-            print("============================")
-            print()
-            print(
-                "Currently merging:\n"
-                + "\n".join(["- " + file_path for file_path in batch])
-            )
-            self.process_databases(*batch)
-            jwl_file = self.createJwlFile()
-            file_paths = [self.extractDatabase(jwl_file)] + file_paths[2:]
-        if file_paths:
-            print()
-            print("============================")
-            print(
-                "Currently merging:\n"
-                + "\n".join(["- " + file_path for file_path in file_paths])
-            )
-            self.process_databases(*file_paths)
-            self.createJwlFile(final=True)
+        self.process_databases(file_paths)
+        self.createJwlFile()
 
 
 if __name__ == "__main__":

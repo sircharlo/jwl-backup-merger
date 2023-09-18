@@ -10,6 +10,7 @@
         "getch",
         "gettz",
         "iloc",
+        "incrementer",
         "isin",
         "iterrows",
         "jwlibrary",
