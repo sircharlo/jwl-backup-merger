@@ -50,7 +50,6 @@ class DatabaseProcessor:
         self.primary_keys = {}
         self.foreign_keys = {}
         self.fk_constraints = {}
-        self.db = {}
         self.files_to_include_in_archive = []
 
         self.working_folder = os.path.join(".", "working")
@@ -97,8 +96,10 @@ class DatabaseProcessor:
 
     def process_databases(self, database_files):
         source_cursor = None
+        opened_dbs = []
         for file_path in database_files:
             temp_db = sqlite3.connect(file_path)
+            opened_dbs.append(temp_db)
             if source_cursor is None:
                 source_cursor = temp_db.cursor()
                 self.get_primary_key_names(temp_db, source_cursor)
@@ -363,7 +364,6 @@ class DatabaseProcessor:
             )
 
         # Remove orphan locations
-        print(self.fk_constraints["Location"])
         filter_condition = None
         for table, field in self.fk_constraints["Location"]["LocationId"]:
             # Initialize a temporary condition for the current key
@@ -422,6 +422,9 @@ class DatabaseProcessor:
         indices = [x for x in list(set(indices)) if x]
         triggers = [x for x in list(set(triggers)) if x]
 
+        for opened_db in opened_dbs:
+            opened_db.close()
+
         try:
             independent_media_files = (
                 self.merged_tables["IndependentMedia"]["FilePath"].dropna().tolist()
@@ -441,9 +444,6 @@ class DatabaseProcessor:
         )
 
         self.save_merged_tables(indices, triggers)
-
-        for dataframe in self.db.values():
-            dataframe.close()
 
     def update_primary_key(
         self,
@@ -671,7 +671,7 @@ class DatabaseProcessor:
         conn_merged.commit()
         conn_merged.close()
 
-    def createJwlFile(self, final=False):
+    def createJwlFile(self):
         merged_dir = os.path.join(self.working_folder, "merged")
         manifest_file_path = os.path.join(merged_dir, "manifest.json")
         all_unzip_folder_names = list(
@@ -768,9 +768,8 @@ class DatabaseProcessor:
             output_jwl_file_path,
         )
 
-        if final:
-            print()
-            print("Created JWL file! Full path:", output_jwl_file_path)
+        print()
+        print("Created JWL file! Full path:", output_jwl_file_path)
 
         return output_jwl_file_path
 
