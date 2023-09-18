@@ -42,6 +42,7 @@ if args.file and len(args.file) == 1 and args.folder is None:
     )
     exit()
 
+
 class DatabaseProcessor:
     def __init__(self):
         self.app_name = "jw-backup-merger"
@@ -97,7 +98,8 @@ class DatabaseProcessor:
     def process_databases(self, database_files):
         source_cursor = None
         opened_dbs = []
-        for file_path in database_files:
+        print()
+        for file_path in tqdm(database_files, desc="Loading databases"):
             temp_db = sqlite3.connect(file_path)
             opened_dbs.append(temp_db)
             if source_cursor is None:
@@ -105,7 +107,7 @@ class DatabaseProcessor:
                 self.get_primary_key_names(temp_db, source_cursor)
                 self.get_foreign_key_names(temp_db, source_cursor)
             floor = self.get_primary_key_floor()
-            for table in tqdm(self.get_tables(temp_db), desc="Loading tables"):
+            for table in self.get_tables(temp_db):
                 self.load_table_into_df(temp_db, table, floor)
 
         # Reorder tables to facilitate processing, since some tables depend on others
@@ -135,7 +137,10 @@ class DatabaseProcessor:
                     os.path.join(self.working_folder, f"concat-{table_name}.xlsx"),
                 )
         print()
-        for table_name in tqdm(self.merged_tables.keys(), desc=f"Analyzing tables"):
+        for table_name in tqdm(
+            self.merged_tables.keys(),
+            desc=f"Removing identical entries from concatenated tables",
+        ):
             if len(list(self.merged_tables[table_name].columns)) == 1:
                 unique_subset = self.merged_tables[table_name].columns.to_list()
                 current_table_pk_name = self.merged_tables[table_name].columns[0]
@@ -292,11 +297,12 @@ class DatabaseProcessor:
                 )
             ]
             untagged_empty_notes = empty_notes[
-                ~self.merged_tables["Note"]["NoteId"].isin(
-                    self.merged_tables["TagMap"]["NoteId"]
-                )
+                ~empty_notes["NoteId"].isin(self.merged_tables["TagMap"]["NoteId"])
             ]
-            for index, row in tqdm(untagged_empty_notes.iterrows(), desc="Removing untagged and empty notes"):
+            for index, row in tqdm(
+                untagged_empty_notes.iterrows(),
+                desc="Removing untagged and empty notes",
+            ):
                 self.merged_tables["Note"].drop(index, inplace=True)
                 # Remove references in other tables to this note
                 self.remove_foreign_key_value(
@@ -347,7 +353,7 @@ class DatabaseProcessor:
                     self.primary_keys["BlockRange"][0],
                     row[self.primary_keys["BlockRange"][0]],
                 )
-        
+
         # # Remove special conflicting entries from TagMap and UserMark
         ignore_list = ["ColorIndex", "Position", "Title"]
         for table in tqdm(
@@ -532,19 +538,23 @@ class DatabaseProcessor:
 
     def load_table_into_df(self, db, table_name, floor):
         new_table = pd.read_sql(f"SELECT * FROM {table_name}", db)
+        foreign_key_list = [
+            value for values_list in self.foreign_keys.values() for value in values_list
+        ]
+        primary_key_list = [
+            values[0]
+            for values in self.primary_keys.values()
+            if values and values[0].endswith("Id")
+        ]
+        key_list = sorted(list(set(primary_key_list + foreign_key_list)))
         if table_name not in self.merged_tables:
             self.merged_tables[table_name] = new_table
         else:
             if len(list(new_table.columns)) != 1:
                 for column in new_table.columns:
-                    if column in self.primary_keys[table_name] or (
-                        table_name in self.foreign_keys
-                        and column in self.foreign_keys[table_name]
-                    ):
+                    if column in key_list and len(new_table[column]) > 0:
                         new_table[column] = new_table[column].apply(
-                            lambda x: x + floor
-                            if str(x).replace(".", "").isnumeric()
-                            else x
+                            lambda x: x + floor if isinstance(x, (int, float)) else x
                         )
             self.merged_tables[table_name] = pd.concat(
                 [self.merged_tables[table_name], new_table],
@@ -582,6 +592,10 @@ class DatabaseProcessor:
         ):
             dest_cursor.execute(f"DELETE FROM {table_name};")
             conn_merged.commit()
+
+        dest_cursor.execute(
+            "INSERT OR REPLACE INTO LastModified (LastModified) VALUES (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));"
+        )
 
         for index_sql in indices:
             dest_cursor.execute(index_sql)
@@ -624,22 +638,23 @@ class DatabaseProcessor:
                 for row in table_data.values
             ]
             for index, row in enumerate(rows_to_insert):
-                if table_name != "LastModified":
-                    try:
-                        dest_cursor.execute(insert_sql, row)
-                        if self.debug:
-                            self.output["info"].append(
-                                (
-                                    table_name,
-                                    insert_sql,
-                                    rows_to_insert[index],
-                                    "NO ERROR!",
-                                )
+                if table_name == "LastModified":
+                    continue
+                try:
+                    dest_cursor.execute(insert_sql, row)
+                    if self.debug:
+                        self.output["info"].append(
+                            (
+                                table_name,
+                                insert_sql,
+                                rows_to_insert[index],
+                                "NO ERROR!",
                             )
-                    except Exception as e:
-                        self.output["errors"].append(
-                            (table_name, insert_sql, rows_to_insert[index], e)
                         )
+                except Exception as e:
+                    self.output["errors"].append(
+                        (table_name, insert_sql, rows_to_insert[index], e)
+                    )
             conn_merged.commit()
         print()
 
