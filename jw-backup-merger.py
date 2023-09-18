@@ -175,6 +175,7 @@ class DatabaseProcessor:
 
         # De-duplicate entries
         unique_constraints_requiring_attention = {
+            "Location": [["BookNumber", "ChapterNumber", "DocumentId", "Track", "IssueTagNumber", "KeySymbol", "MepsLanguage", "Type"]],
             "Bookmark": [["PublicationLocationId", "Slot"]],
             "InputField": [["LocationId", "TextTag"]],
             "Note": [
@@ -182,6 +183,7 @@ class DatabaseProcessor:
                 ["LocationId", "Title", "Content", "BlockType", "BlockIdentifier"],
             ],
             "UserMark": [["UserMarkGuid"]],
+            "BlockRange": [["BlockType", "Identifier", "StartToken", "EndToken", "UserMarkId"]],
             "TagMap": [
                 ["TagId", "NoteId"],
                 ["TagId", "LocationId"],
