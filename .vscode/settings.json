@@ -1,28 +1,17 @@
 {
     "cSpell.words": [
-        "addstr",
         "blockrange",
-        "dataframe",
-        "dataframes",
         "dateutil",
         "dropna",
         "executemany",
         "fillna",
-        "getch",
         "gettz",
-        "iloc",
-        "incrementer",
         "isin",
         "iterrows",
         "jwlibrary",
-        "JWLIBRARY",
         "Meps",
         "notna",
-        "randomizer",
-        "Reindexing",
-        "stdscr",
         "tqdm",
-        "Userdata",
-        "usermark"
+        "Userdata"
     ]
 }

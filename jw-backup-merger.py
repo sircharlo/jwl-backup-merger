@@ -542,12 +542,12 @@ class DatabaseProcessor:
 
     def get_primary_key_floor(self):
         floor = 0
-        incrementer = 1000000
+        incrementor = 1000000
         for table_name, table_data in self.merged_tables.items():
             if table_name in self.primary_keys and len(table_data.columns) != 1:
                 max_value = table_data[self.primary_keys[table_name][0]].max()
                 if not np.isnan(max_value):
-                    floor = max(floor, math.ceil(max_value / incrementer) * incrementer)
+                    floor = max(floor, math.ceil(max_value / incrementor) * incrementor)
         return floor
 
     def load_table_into_df(self, db, table_name, floor):
@@ -803,7 +803,7 @@ class DatabaseProcessor:
 
         print()
         print(
-            "Successfully created JW Library backup file containing all merged user data!"
+            "Successfully created JW Library backup containing all merged user data!"
         )
         print()
         print("Find it here:\n- ", output_jwl_file_path)
@@ -849,15 +849,15 @@ class DatabaseProcessor:
             root.withdraw()
             while len(file_paths) < 2:
                 file_path = filedialog.askopenfilename(
-                    filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")],
-                    title="Select one or more backup files",
+                    filetypes=[("JW Library backups", "*.jwlibrary")],
+                    title="Select one or more JW Library backups",
                     multiple=True,
                 )
                 if not file_path:
                     break
                 file_paths.extend(file_path)
         if not file_paths or len(file_paths) == 1:
-            print("Not enough .JWLIBRARY files found to work with!")
+            print("Not enough JW Library backups found to work with!")
             print()
             if len(file_paths) > 0:
                 print("Provided arguments:")
