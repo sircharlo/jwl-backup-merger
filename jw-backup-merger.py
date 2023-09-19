@@ -133,6 +133,99 @@ class JwlBackupProcessor:
                     path.join(self.working_folder, f"concat-{table_name}.xlsx"),
                 )
         print()
+
+        # Remove notes that are empty and aren't referenced by TagMap table
+        if "Note" in self.merged_tables:
+            empty_notes = self.merged_tables["Note"][
+                (
+                    self.merged_tables["Note"]["Title"].isnull()
+                    | (self.merged_tables["Note"]["Title"] == "")
+                )
+                & (
+                    self.merged_tables["Note"]["Content"].isnull()
+                    | (self.merged_tables["Note"]["Content"] == "")
+                )
+            ]
+            untagged_empty_notes = empty_notes[
+                ~empty_notes["NoteId"].isin(self.merged_tables["TagMap"]["NoteId"])
+            ]
+            for index, row in tqdm(
+                untagged_empty_notes.iterrows(),
+                desc="Removing untagged and empty notes",
+                disable=len(untagged_empty_notes) == 0,
+            ):
+                self.merged_tables["Note"].drop(index, inplace=True)
+                # Remove references in other tables to this note
+                self.remove_foreign_key_value(
+                    "Note",
+                    self.primary_keys["Note"][0],
+                    row[self.primary_keys["Note"][0]],
+                )
+
+        # Remove entries from IndependentMedia that aren't referenced by PlaylistItemIndependentMediaMap table
+        if (
+            "IndependentMedia" in self.merged_tables
+            and "PlaylistItemIndependentMediaMap" in self.merged_tables
+        ):
+            orphan_independent_media = self.merged_tables["IndependentMedia"][
+                ~self.merged_tables["IndependentMedia"]["IndependentMediaId"].isin(
+                    self.merged_tables["PlaylistItemIndependentMediaMap"][
+                        "IndependentMediaId"
+                    ]
+                )
+            ]
+            for index, row in tqdm(
+                orphan_independent_media.iterrows(),
+                desc="Removing references to unneeded media",
+                disable=len(orphan_independent_media) == 0,
+            ):
+                self.merged_tables["IndependentMedia"].drop(index, inplace=True)
+                # Remove references in other tables to this note
+                self.remove_foreign_key_value(
+                    "IndependentMedia",
+                    self.primary_keys["IndependentMedia"][0],
+                    row[self.primary_keys["IndependentMedia"][0]],
+                )
+
+        # Remove entries in UserMark if their LocationId does not exist in Location table
+        if "UserMark" in self.merged_tables:
+            orphan_usermarks = self.merged_tables["UserMark"][
+                ~self.merged_tables["UserMark"]["LocationId"].isin(
+                    self.merged_tables["Location"]["LocationId"]
+                )
+            ]
+            for index, row in tqdm(
+                orphan_usermarks.iterrows(),
+                desc="Removing references to highlights in deleted locations",
+                disable=len(orphan_usermarks) == 0,
+            ):
+                self.merged_tables["UserMark"].drop(index, inplace=True)
+                # Remove references in other tables to this
+                self.remove_foreign_key_value(
+                    "UserMark",
+                    self.primary_keys["UserMark"][0],
+                    row[self.primary_keys["UserMark"][0]],
+                )
+
+        # Remove entries from BlockRange that aren't referenced by UserMark table
+        if "BlockRange" in self.merged_tables:
+            orphan_blockrange = self.merged_tables["BlockRange"][
+                ~self.merged_tables["BlockRange"]["UserMarkId"].isin(
+                    self.merged_tables["UserMark"]["UserMarkId"]
+                )
+            ]
+            for index, row in tqdm(
+                orphan_blockrange.iterrows(),
+                desc="Removing references to deleted highlights",
+                disable=len(orphan_blockrange) == 0,
+            ):
+                self.merged_tables["BlockRange"].drop(index, inplace=True)
+                # Remove references in other tables to this
+                self.remove_foreign_key_value(
+                    "BlockRange",
+                    self.primary_keys["BlockRange"][0],
+                    row[self.primary_keys["BlockRange"][0]],
+                )
         for table_name in tqdm(
             self.merged_tables.keys(),
             desc=f"Removing identical entries from concatenated tables",
@@ -292,79 +385,6 @@ class JwlBackupProcessor:
                     self.update_foreign_keys(
                         table, primary_key, collision_pair_replacement_dict
                     )
-
-        # Remove notes that are empty and aren't referenced by TagMap table
-        if "Note" in self.merged_tables:
-            empty_notes = self.merged_tables["Note"][
-                (
-                    self.merged_tables["Note"]["Title"].isnull()
-                    | (self.merged_tables["Note"]["Title"] == "")
-                )
-                & (
-                    self.merged_tables["Note"]["Content"].isnull()
-                    | (self.merged_tables["Note"]["Content"] == "")
-                )
-            ]
-            untagged_empty_notes = empty_notes[
-                ~empty_notes["NoteId"].isin(self.merged_tables["TagMap"]["NoteId"])
-            ]
-            for index, row in tqdm(
-                untagged_empty_notes.iterrows(),
-                desc="Removing untagged and empty notes",
-                disable=len(untagged_empty_notes) == 0,
-            ):
-                self.merged_tables["Note"].drop(index, inplace=True)
-                # Remove references in other tables to this note
-                self.remove_foreign_key_value(
-                    "Note",
-                    self.primary_keys["Note"][0],
-                    row[self.primary_keys["Note"][0]],
-                )
-
-        # Remove entries from IndependentMedia that aren't referenced by PlaylistItemIndependentMediaMap table
-        if (
-            "IndependentMedia" in self.merged_tables
-            and "PlaylistItemIndependentMediaMap" in self.merged_tables
-        ):
-            orphan_independent_media = self.merged_tables["IndependentMedia"][
-                ~self.merged_tables["IndependentMedia"]["IndependentMediaId"].isin(
-                    self.merged_tables["PlaylistItemIndependentMediaMap"][
-                        "IndependentMediaId"
-                    ]
-                )
-            ]
-            for index, row in tqdm(
-                orphan_independent_media.iterrows(),
-                desc="Removing references to unneeded media",
-                disable=len(orphan_independent_media) == 0,
-            ):
-                self.merged_tables["IndependentMedia"].drop(index, inplace=True)
-                # Remove references in other tables to this note
-                self.remove_foreign_key_value(
-                    "IndependentMedia",
-                    self.primary_keys["IndependentMedia"][0],
-                    row[self.primary_keys["IndependentMedia"][0]],
-                )
-
-        # Remove entries from BlockRange that aren't referenced by UserMark table
-        if "BlockRange" in self.merged_tables:
-            orphan_blockrange = self.merged_tables["BlockRange"][
-                ~self.merged_tables["BlockRange"]["UserMarkId"].isin(
-                    self.merged_tables["UserMark"]["UserMarkId"]
-                )
-            ]
-            for index, row in tqdm(
-                orphan_blockrange.iterrows(),
-                desc="Removing references to obsolete highlights",
-                disable=len(orphan_blockrange) == 0,
-            ):
-                self.merged_tables["BlockRange"].drop(index, inplace=True)
-                # Remove references in other tables to this
-                self.remove_foreign_key_value(
-                    "BlockRange",
-                    self.primary_keys["BlockRange"][0],
-                    row[self.primary_keys["BlockRange"][0]],
-                )
 
         # # Remove special conflicting entries from TagMap and UserMark
         ignore_dict = {

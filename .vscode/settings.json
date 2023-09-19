@@ -12,6 +12,7 @@
         "Meps",
         "notna",
         "tqdm",
-        "Userdata"
+        "Userdata",
+        "usermarks"
     ]
 }
