@@ -2,18 +2,15 @@
 import argparse
 from datetime import datetime
 from dateutil import tz
-import difflib
 import glob
-import hashlib
-import json
 import math
 import os
+import numpy as np
 import pandas as pd
 import shutil
 import sqlite3
 import time
 from tqdm import tqdm
-from zipfile import ZipFile
 
 start_time = time.time()
 
@@ -276,14 +273,11 @@ class DatabaseProcessor:
                                     and not new_row_text_value.strip()
                                     == old_row_text_value.strip()
                                 ):
-                                    differ = difflib.Differ()
-                                    diff = differ.compare(
-                                        old_row_text_value.splitlines(),
-                                        new_row_text_value.splitlines(),
-                                    )
                                     self.merged_tables[table].at[
                                         new_row_index, text_column
-                                    ] = "\n".join(diff)
+                                    ] = self.inline_diff(
+                                        old_row_text_value, new_row_text_value
+                                    )
                             self.merged_tables[table].drop(
                                 index=old_row_index, inplace=True
                             )
@@ -430,25 +424,13 @@ class DatabaseProcessor:
             )
 
         source_cursor.execute(
-            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index';"
+            "SELECT DISTINCT sql FROM sqlite_master WHERE type='index';"
         )
-        indices_fetcher = source_cursor.fetchall()
-
+        indices = [row[0] for row in source_cursor.fetchall() if row[0]]
         source_cursor.execute(
-            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='trigger';"
+            "SELECT DISTINCT sql FROM sqlite_master WHERE type='trigger';"
         )
-        triggers_fetcher = source_cursor.fetchall()
-
-        indices = []
-        triggers = []
-        for index_info in indices_fetcher:
-            index_name, table_name, index_sql = index_info
-            indices.append(index_sql)
-        for trigger_info in triggers_fetcher:
-            trigger_name, table_name, trigger_sql = trigger_info
-            triggers.append(trigger_sql)
-        indices = [x for x in list(set(indices)) if x]
-        triggers = [x for x in list(set(triggers)) if x]
+        triggers = [row[0] for row in source_cursor.fetchall() if row[0]]
 
         for opened_db in opened_dbs:
             opened_db.close()
@@ -473,20 +455,23 @@ class DatabaseProcessor:
 
         self.save_merged_tables(indices, triggers)
 
-    def update_primary_key(
-        self,
-        origin_table,
-        origin_primary_key,
-        replacement_dict,
-    ):
-        # Update primary key
-        self.merged_tables[origin_table][origin_primary_key] = self.merged_tables[
-            origin_table
-        ][origin_primary_key].map(lambda x: replacement_dict.get(x, x))
-        # Drop duplicates resulting from primary key change
-        self.merged_tables[origin_table].drop_duplicates(
-            ignore_index=True, inplace=True
-        )
+    def inline_diff(self, a, b):
+        import difflib
+
+        matcher = difflib.SequenceMatcher(None, a, b)
+
+        def process_tag(tag, i1, i2, j1, j2):
+            if tag == "replace":
+                return "{" + matcher.a[i1:i2] + " -> " + matcher.b[j1:j2] + "}"
+            if tag == "delete":
+                return "{- " + matcher.a[i1:i2] + "}"
+            if tag == "equal":
+                return matcher.a[i1:i2]
+            if tag == "insert":
+                return "{+ " + matcher.b[j1:j2] + "}"
+            assert False, "Unknown tag %r" % tag
+
+        return "".join(process_tag(*t) for t in matcher.get_opcodes())
 
     def update_primary_and_foreign_keys(
         self,
@@ -503,6 +488,21 @@ class DatabaseProcessor:
             origin_table,
             origin_primary_key,
             replacement_dict,
+        )
+
+    def update_primary_key(
+        self,
+        origin_table,
+        origin_primary_key,
+        replacement_dict,
+    ):
+        # Update primary key
+        self.merged_tables[origin_table][origin_primary_key] = self.merged_tables[
+            origin_table
+        ][origin_primary_key].map(lambda x: replacement_dict.get(x, x))
+        # Drop duplicates resulting from primary key change
+        self.merged_tables[origin_table].drop_duplicates(
+            ignore_index=True, inplace=True
         )
 
     def update_foreign_keys(
@@ -536,26 +536,18 @@ class DatabaseProcessor:
                     )
 
     def get_tables(self, db):
-        table_query = "SELECT name FROM sqlite_master WHERE type='table';"
         cursor = db.cursor()
-        cursor.execute(table_query)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
         return [table[0] for table in cursor.fetchall()]
 
     def get_primary_key_floor(self):
-        highest_value = None
         floor = 0
-        incrementer = 100000
-        for table_name in self.merged_tables.keys():
-            if (
-                table_name in self.primary_keys
-                and len(list(self.merged_tables[table_name].columns)) != 1
-            ):
-                max_value = self.merged_tables[table_name][
-                    self.primary_keys[table_name][0]
-                ].max()
-                if highest_value is None or max_value > highest_value:
-                    highest_value = max_value
-                    floor = math.ceil(highest_value / incrementer) * incrementer
+        incrementer = 1000000
+        for table_name, table_data in self.merged_tables.items():
+            if table_name in self.primary_keys and len(table_data.columns) != 1:
+                max_value = table_data[self.primary_keys[table_name][0]].max()
+                if not np.isnan(max_value):
+                    floor = max(floor, math.ceil(max_value / incrementer) * incrementer)
         return floor
 
     def load_table_into_df(self, db, table_name, floor):
@@ -636,48 +628,41 @@ class DatabaseProcessor:
                     table_data.to_excel(
                         os.path.join(
                             self.working_folder,
-                            f"{datetime.now().strftime('%Y-%m-%d-%H%M%S') }_{table_name}.xlsx",
+                            f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}_{table_name}.xlsx",
                         )
                     )
-                except:
+                except Exception:
                     print(f"Could not save {table_name}.xlsx; continuing...")
+
+            if table_name == "LastModified":
+                continue
+
             insert_sql = f"INSERT INTO {table_name} ({', '.join(table_data.columns)}) VALUES ({', '.join(['?'] * len(table_data.columns))})"
-            rows_to_insert = [
-                tuple(
-                    [
-                        None
-                        if cell == ""
-                        and not (
-                            "Text" in table_data.columns[i]
-                            or "Value" in table_data.columns[i]
-                        )
-                        else int(cell)
-                        if str(cell).isnumeric()
-                        else cell
-                        for i, cell in enumerate(row)
-                    ]
-                )
-                for row in table_data.values
-            ]
-            for index, row in enumerate(rows_to_insert):
-                if table_name == "LastModified":
-                    continue
-                try:
-                    dest_cursor.execute(insert_sql, row)
-                    if self.debug:
-                        self.output["info"].append(
-                            (
-                                table_name,
-                                insert_sql,
-                                rows_to_insert[index],
-                                "NO ERROR!",
-                            )
-                        )
-                except Exception as e:
-                    self.output["errors"].append(
-                        (table_name, insert_sql, rows_to_insert[index], e)
+            rows_to_insert = []
+
+            for row in table_data.values:
+                cleaned_row = [
+                    None
+                    if cell == ""
+                    and not any(keyword in col_name for keyword in ["Text", "Value"])
+                    else (int(cell) if str(cell).isnumeric() else cell)
+                    for col_name, cell in zip(table_data.columns, row)
+                ]
+                rows_to_insert.append(tuple(cleaned_row))
+
+            try:
+                dest_cursor.executemany(insert_sql, rows_to_insert)
+                if self.debug:
+                    self.output["info"].append(
+                        (table_name, insert_sql, rows_to_insert, "NO ERROR!")
                     )
-            conn_merged.commit()
+            except Exception as e:
+                self.output["errors"].append(
+                    (table_name, insert_sql, rows_to_insert, e)
+                )
+
+        conn_merged.commit()
+
         print()
 
         if self.debug and len(self.output["info"]) > 0:
@@ -755,6 +740,8 @@ class DatabaseProcessor:
                 merged_dir, os.path.basename(file_to_include_in_archive)
             ):
                 shutil.copy2(file_to_include_in_archive, merged_dir)
+
+        import json
 
         with open(manifest_file_path, "r") as file:
             manifest_data = json.load(file)
@@ -834,8 +821,7 @@ class DatabaseProcessor:
         basename = os.path.basename(file_path)
         basename = os.path.splitext(basename)[0]
         unzipPath = os.path.join(self.working_folder, basename)
-        with ZipFile(file_path, "r") as zip:
-            zip.extractall(path=unzipPath)
+        shutil.unpack_archive(file_path, extract_dir=unzipPath, format="zip")
         return unzipPath
 
     def getFirstDBFile(self, unzipPath):
@@ -901,6 +887,8 @@ class DatabaseProcessor:
         return self.getFirstDBFile(unzip_path)
 
     def calculate_sha256(self, file_path):
+        import hashlib
+
         hash_sha256 = hashlib.sha256()
         with open(file_path, "rb") as file:
             for chunk in iter(lambda: file.read(4096), b""):

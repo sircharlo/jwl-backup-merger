@@ -6,6 +6,7 @@
         "dataframes",
         "dateutil",
         "dropna",
+        "executemany",
         "fillna",
         "getch",
         "gettz",
