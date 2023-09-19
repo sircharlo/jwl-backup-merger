@@ -25,14 +25,14 @@ Running the app:
 #### Arguments
 
 - `--folder FOLDER_PATH`: Folder containing JWL files to merge.
-- `--file FILE_PATH`: JW Library backup file to add to the list of files to merge. You can specify multiple --file arguments to merge multiple files.
+- `--file FILE_PATH`: JW Library backup file to add to the list of files to merge. You can specify multiple `--file` arguments to merge multiple files.
 - `--debug`: Enable verbose debug output and Excel file creation to help with debugging; also prevents deletion of temporary files.
 
 #### Example usage
 
     python jwl-backup-merger.py --folder /path/to/folder-with-jwl-backups
-    python jwl-backup-merger.py --folder /path/to/folder-with-jwl-backups --file /path/to/additional-file1.jwlbackup
-    python jwl-backup-merger.py --file /path/to/phone.jwlbackup --file /path/to/tablet.jwlbackup --file /path/to/computer.jwlbackup
+    python jwl-backup-merger.py --folder /path/to/folder-with-jwl-backups --file /path/to/additional-file1.jwlibrary
+    python jwl-backup-merger.py --file /path/to/phone.jwlibrary --file /path/to/tablet.jwlibrary --file /path/to/computer.jwlibrary
 
 
 
