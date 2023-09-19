@@ -1,44 +1,45 @@
 #!/usr/bin/python
-import argparse
+from argparse import ArgumentParser
 from datetime import datetime
 from dateutil import tz
-import glob
-import math
-import os
-import numpy as np
-import pandas as pd
-import shutil
-import sqlite3
-import time
+from glob import glob
+from math import ceil
+from numpy import isnan
+from os import path, makedirs, listdir, rename, remove
+from shutil import copy2, make_archive, unpack_archive, rmtree
+from time import time
 from tqdm import tqdm
 
-start_time = time.time()
+import pandas as pd
+import sqlite3
 
-parser = argparse.ArgumentParser()
+start_time = time()
+
+parser = ArgumentParser()
 parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 parser.add_argument("--folder", type=str, help="Folder containing JWL files to merge")
 parser.add_argument("--file", type=str, help="JWL file to merge", action="append")
 args = parser.parse_args()
 
 
-if args.folder and not os.path.exists(args.folder):
+if args.folder is not None and not path.exists(args.folder):
     print(f"Folder not found: {args.folder}\nPlease validate the path.")
     exit()
 
 if args.file:
     for file_path in args.file:
-        if not os.path.exists(file_path) or not os.path.isfile(file_path):
+        if not path.isfile(file_path):
             print(f"File not found: {file_path}\nPlease validate the path.")
             exit()
 
 if args.file and len(args.file) == 1 and args.folder is None:
     print(
-        "Error: --file cannot be used on its own without another --file or --folder; you can't merge a file with itself!"
+        "Error: --file cannot be used on its own without --folder or at least one other --file ; you can't merge a file with itself!"
     )
     exit()
 
 
-class DatabaseProcessor:
+class JwlBackupProcessor:
     def __init__(self):
         self.app_name = "jw-backup-merger"
         self.debug = args.debug
@@ -48,9 +49,9 @@ class DatabaseProcessor:
         self.fk_constraints = {}
         self.files_to_include_in_archive = []
 
-        self.working_folder = os.path.join(".", "working")
-        self.jwl_output_folder = os.path.join(".", "merged")
-        self.merged_db_path = os.path.join(self.working_folder, "merged.db")
+        self.working_folder = path.join(".", "working")
+        self.jwl_output_folder = path.join(".", "merged")
+        self.merged_db_path = path.join(self.working_folder, "merged.db")
 
         self.output = {"info": [], "errors": []}
 
@@ -128,7 +129,7 @@ class DatabaseProcessor:
                 desc="Outputting concatenated tables to Excel for debugging",
             ):
                 self.merged_tables[table_name].to_excel(
-                    os.path.join(self.working_folder, f"concat-{table_name}.xlsx"),
+                    path.join(self.working_folder, f"concat-{table_name}.xlsx"),
                 )
         print()
         for table_name in tqdm(
@@ -162,7 +163,7 @@ class DatabaseProcessor:
             if self.debug:
                 print("Saving deduplicated table to Excel:", table_name)
                 self.merged_tables[table_name].to_excel(
-                    os.path.join(
+                    path.join(
                         self.working_folder, f"deduplicated-1st-pass-{table_name}.xlsx"
                     ),
                 )
@@ -290,7 +291,7 @@ class DatabaseProcessor:
                         table, primary_key, collision_pair_replacement_dict
                     )
 
-        # Remove empty notes that aren't referenced by TagMap table
+        # Remove notes that are empty and aren't referenced by TagMap table
         if "Note" in self.merged_tables:
             empty_notes = self.merged_tables["Note"][
                 (
@@ -546,8 +547,8 @@ class DatabaseProcessor:
         for table_name, table_data in self.merged_tables.items():
             if table_name in self.primary_keys and len(table_data.columns) != 1:
                 max_value = table_data[self.primary_keys[table_name][0]].max()
-                if not np.isnan(max_value):
-                    floor = max(floor, math.ceil(max_value / incrementor) * incrementor)
+                if not isnan(max_value):
+                    floor = max(floor, ceil(max_value / incrementor) * incrementor)
         return floor
 
     def load_table_into_df(self, db, table_name, floor):
@@ -578,7 +579,7 @@ class DatabaseProcessor:
         self.merged_tables[table_name].fillna("", inplace=True)
 
     def save_merged_tables(self, indices, triggers):
-        os.makedirs(self.working_folder, exist_ok=True)
+        makedirs(self.working_folder, exist_ok=True)
 
         conn_merged = sqlite3.connect(self.merged_db_path)
         dest_cursor = conn_merged.cursor()
@@ -626,7 +627,7 @@ class DatabaseProcessor:
             if self.debug:
                 try:
                     table_data.to_excel(
-                        os.path.join(
+                        path.join(
                             self.working_folder,
                             f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}_{table_name}.xlsx",
                         )
@@ -669,7 +670,7 @@ class DatabaseProcessor:
             print("Check the log file for debug info.")
             print()
             with open(
-                os.path.join(self.working_folder, "info.txt"), "w", encoding="utf-8"
+                path.join(self.working_folder, "info.txt"), "w", encoding="utf-8"
             ) as f:
                 for error in self.output["info"]:
                     f.write(str(error) + "\n")
@@ -680,7 +681,7 @@ class DatabaseProcessor:
                 print("Check the log file.")
                 print()
                 with open(
-                    os.path.join(self.working_folder, "errors.txt"),
+                    path.join(self.working_folder, "errors.txt"),
                     "w",
                     encoding="utf-8",
                 ) as f:
@@ -694,40 +695,39 @@ class DatabaseProcessor:
         conn_merged.close()
 
     def createJwlFile(self):
-        merged_dir = os.path.join(self.working_folder, "merged")
-        manifest_file_path = os.path.join(merged_dir, "manifest.json")
+        merged_dir = path.join(self.working_folder, "merged")
+        manifest_file_path = path.join(merged_dir, "manifest.json")
         all_unzip_folder_names = list(
             directory
-            for directory in os.listdir(self.working_folder)
+            for directory in listdir(self.working_folder)
             if directory != "merged"
-            and os.path.isdir(os.path.join(self.working_folder, directory))
+            and path.isdir(path.join(self.working_folder, directory))
         )
         first_jwl_unzip_folder_name = all_unzip_folder_names[0]
-        first_jwl_unzip_folder_path = os.path.join(
+        first_jwl_unzip_folder_path = path.join(
             self.working_folder, first_jwl_unzip_folder_name
         )
 
-        if not os.path.exists(merged_dir):
-            os.mkdir(merged_dir)
+        makedirs(merged_dir, exist_ok=True)
 
         for file_name in tqdm(
-            os.listdir(first_jwl_unzip_folder_path), desc="Adding base files to archive"
+            listdir(first_jwl_unzip_folder_path), desc="Adding base files to archive"
         ):
             if file_name.endswith(".png") or file_name.endswith(".json"):
-                shutil.copy2(
-                    os.path.join(first_jwl_unzip_folder_path, file_name), merged_dir
+                copy2(
+                    path.join(first_jwl_unzip_folder_path, file_name), merged_dir
                 )
         for i in range(len(self.files_to_include_in_archive)):
-            if not os.path.exists(self.files_to_include_in_archive[i]):
-                file_path = glob.glob(
-                    os.path.join(
+            if not path.exists(self.files_to_include_in_archive[i]):
+                file_path = glob(
+                    path.join(
                         self.working_folder, "**", self.files_to_include_in_archive[i]
                     ),
                     recursive=True,
                 )
                 if file_path:
-                    self.files_to_include_in_archive[i] = os.path.join(
-                        os.path.dirname(file_path[0]),
+                    self.files_to_include_in_archive[i] = path.join(
+                        path.dirname(file_path[0]),
                         self.files_to_include_in_archive[i],
                     )
 
@@ -736,20 +736,20 @@ class DatabaseProcessor:
             desc="Adding additional media files to archive",
             disable=len(self.files_to_include_in_archive) == 0,
         ):
-            if file_to_include_in_archive != os.path.join(
-                merged_dir, os.path.basename(file_to_include_in_archive)
+            if file_to_include_in_archive != path.join(
+                merged_dir, path.basename(file_to_include_in_archive)
             ):
-                shutil.copy2(file_to_include_in_archive, merged_dir)
+                copy2(file_to_include_in_archive, merged_dir)
 
         import json
 
         with open(manifest_file_path, "r") as file:
             manifest_data = json.load(file)
 
-        database_file_path = os.path.join(
+        database_file_path = path.join(
             merged_dir, manifest_data["userDataBackup"]["databaseName"]
         )
-        shutil.copy2(
+        copy2(
             self.merged_db_path,
             database_file_path,
         )
@@ -777,19 +777,18 @@ class DatabaseProcessor:
         with open(manifest_file_path, "w") as file:
             json.dump(manifest_data, file, indent=2)
 
-        if not os.path.exists(self.jwl_output_folder):
-            os.mkdir(self.jwl_output_folder)
+        makedirs(self.jwl_output_folder, exist_ok=True)
 
-        shutil.make_archive(
-            os.path.join(self.jwl_output_folder, merged_file_name),
+        make_archive(
+            path.join(self.jwl_output_folder, merged_file_name),
             "zip",
             merged_dir,
         )
 
-        output_jwl_file_path = os.path.abspath(
-            os.path.join(self.jwl_output_folder, merged_file_name)
+        output_jwl_file_path = path.abspath(
+            path.join(self.jwl_output_folder, merged_file_name)
         )
-        os.rename(
+        rename(
             output_jwl_file_path + ".zip",
             output_jwl_file_path,
         )
@@ -797,14 +796,12 @@ class DatabaseProcessor:
         processor.cleanTempFiles()
 
         print()
-        end_time = time.time()
+        end_time = time()
         execution_time = end_time - start_time
         print(f"Work completed in {round(execution_time, 1)} seconds.")
 
         print()
-        print(
-            "Successfully created JW Library backup containing all merged user data!"
-        )
+        print("Successfully created JW Library backup containing all merged user data!")
         print()
         print("Find it here:\n- ", output_jwl_file_path)
         print()
@@ -812,20 +809,19 @@ class DatabaseProcessor:
 
     def cleanTempFiles(self):
         if not self.debug:
-            if os.path.exists(self.working_folder):
-                shutil.rmtree(self.working_folder)
+            if path.isdir(self.working_folder):
+                rmtree(self.working_folder)
             print()
             print("Cleaned up temporary files!")
 
     def unzipFile(self, file_path):
-        basename = os.path.basename(file_path)
-        basename = os.path.splitext(basename)[0]
-        unzipPath = os.path.join(self.working_folder, basename)
-        shutil.unpack_archive(file_path, extract_dir=unzipPath, format="zip")
+        basename = path.splitext(path.basename(file_path))[0]
+        unzipPath = path.join(self.working_folder, basename)
+        unpack_archive(file_path, extract_dir=unzipPath, format="zip")
         return unzipPath
 
     def getFirstDBFile(self, unzipPath):
-        db_files = glob.glob(unzipPath + "/*.db")
+        db_files = glob(unzipPath + "/*.db")
         if db_files:
             return db_files[0]
         else:
@@ -837,10 +833,10 @@ class DatabaseProcessor:
             if args.file:
                 file_paths.extend(args.file)
             if args.folder:
-                for file in os.listdir(args.folder):
+                for file in listdir(args.folder):
                     if not file.lower().endswith(".jwlibrary"):
                         continue
-                    file_paths.append(os.path.join(args.folder, file))
+                    file_paths.append(path.join(args.folder, file))
         else:
             import tkinter as tk
             from tkinter import filedialog
@@ -872,19 +868,14 @@ class DatabaseProcessor:
             + "\n".join(["- " + file_path for file_path in file_paths])
         )
         print()
-        if os.path.exists(self.merged_db_path):
-            os.remove(self.merged_db_path)
+        if path.exists(self.merged_db_path):
+            remove(self.merged_db_path)
         db_paths = []
         for file_path in tqdm(file_paths, desc="Extracting databases"):
-            db_path = self.extractDatabase(file_path)
-            if not os.path.exists(self.merged_db_path):
-                shutil.copy2(db_path, self.merged_db_path)
+            db_path = self.getFirstDBFile(self.unzipFile(file_path))
+            copy2(db_path, self.merged_db_path)
             db_paths.append(db_path)
         return db_paths
-
-    def extractDatabase(self, file_path):
-        unzip_path = self.unzipFile(file_path)
-        return self.getFirstDBFile(unzip_path)
 
     def calculate_sha256(self, file_path):
         import hashlib
@@ -895,12 +886,9 @@ class DatabaseProcessor:
                 hash_sha256.update(chunk)
         return hash_sha256.hexdigest()
 
-    def process_multiple_databases(self, file_paths):
-        self.process_databases(file_paths)
-        self.createJwlFile()
-
 
 if __name__ == "__main__":
-    processor = DatabaseProcessor()
+    processor = JwlBackupProcessor()
     selected_paths = processor.getJwlFiles()
-    processor.process_multiple_databases(selected_paths)
+    processor.process_databases(selected_paths)
+    processor.createJwlFile()
