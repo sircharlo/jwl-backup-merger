@@ -112,6 +112,7 @@ class JwlBackupProcessor:
             "UserMark",
             "Note",
             "Bookmark",
+            "PlaylistItemAccuracy",
             "PlaylistItem",
             "Tag",
         ]
@@ -189,9 +190,6 @@ class JwlBackupProcessor:
                 ["LocationId", "Title", "Content", "BlockType", "BlockIdentifier"],
             ],
             "UserMark": [["UserMarkGuid"]],
-            "BlockRange": [
-                ["BlockType", "Identifier", "StartToken", "EndToken", "UserMarkId"]
-            ],
             "TagMap": [
                 ["TagId", "NoteId"],
                 ["TagId", "LocationId"],
@@ -629,7 +627,7 @@ class JwlBackupProcessor:
                     table_data.to_excel(
                         path.join(
                             self.working_folder,
-                            f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}_{table_name}.xlsx",
+                            f"final_{table_name}.xlsx",
                         )
                     )
                 except Exception:
@@ -714,9 +712,7 @@ class JwlBackupProcessor:
             listdir(first_jwl_unzip_folder_path), desc="Adding base files to archive"
         ):
             if file_name.endswith(".png") or file_name.endswith(".json"):
-                copy2(
-                    path.join(first_jwl_unzip_folder_path, file_name), merged_dir
-                )
+                copy2(path.join(first_jwl_unzip_folder_path, file_name), merged_dir)
         for i in range(len(self.files_to_include_in_archive)):
             if not path.exists(self.files_to_include_in_archive[i]):
                 file_path = glob(
