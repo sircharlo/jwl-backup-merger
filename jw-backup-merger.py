@@ -1,7 +1,4 @@
 #!/usr/bin/python
-
-# Todo: delete intermediary JWL files if more than 2 files merged
-
 import argparse
 from datetime import datetime
 from dateutil import tz
@@ -14,10 +11,11 @@ import os
 import pandas as pd
 import shutil
 import sqlite3
-import tkinter as tk
-from tkinter import filedialog
+import time
 from tqdm import tqdm
 from zipfile import ZipFile
+
+start_time = time.time()
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--debug", action="store_true", help="Enable debug mode")
@@ -98,8 +96,7 @@ class DatabaseProcessor:
     def process_databases(self, database_files):
         source_cursor = None
         opened_dbs = []
-        print()
-        for file_path in tqdm(database_files, desc="Loading databases"):
+        for file_path in tqdm(database_files, desc="Loading databases into memory"):
             temp_db = sqlite3.connect(file_path)
             opened_dbs.append(temp_db)
             if source_cursor is None:
@@ -175,7 +172,18 @@ class DatabaseProcessor:
 
         # De-duplicate entries
         unique_constraints_requiring_attention = {
-            "Location": [["BookNumber", "ChapterNumber", "DocumentId", "Track", "IssueTagNumber", "KeySymbol", "MepsLanguage", "Type"]],
+            "Location": [
+                [
+                    "BookNumber",
+                    "ChapterNumber",
+                    "DocumentId",
+                    "Track",
+                    "IssueTagNumber",
+                    "KeySymbol",
+                    "MepsLanguage",
+                    "Type",
+                ]
+            ],
             "Bookmark": [["PublicationLocationId", "Slot"]],
             "InputField": [["LocationId", "TextTag"]],
             "Note": [
@@ -183,7 +191,9 @@ class DatabaseProcessor:
                 ["LocationId", "Title", "Content", "BlockType", "BlockIdentifier"],
             ],
             "UserMark": [["UserMarkGuid"]],
-            "BlockRange": [["BlockType", "Identifier", "StartToken", "EndToken", "UserMarkId"]],
+            "BlockRange": [
+                ["BlockType", "Identifier", "StartToken", "EndToken", "UserMarkId"]
+            ],
             "TagMap": [
                 ["TagId", "NoteId"],
                 ["TagId", "LocationId"],
@@ -224,7 +234,7 @@ class DatabaseProcessor:
                             duplicate_values_mask
                         ]
                     primary_key = self.primary_keys[table][0]
-                    # TODO: find a better way to handle this, using groupby instead
+                    # TODO: find a better way to handle this, using groupby instead?
                     collision_replacement_dict = {}
                     for _, row in duplicates.iterrows():
                         primary_key_value = row[self.primary_keys[table][0]]
@@ -304,6 +314,7 @@ class DatabaseProcessor:
             for index, row in tqdm(
                 untagged_empty_notes.iterrows(),
                 desc="Removing untagged and empty notes",
+                disable=len(untagged_empty_notes) == 0,
             ):
                 self.merged_tables["Note"].drop(index, inplace=True)
                 # Remove references in other tables to this note
@@ -328,6 +339,7 @@ class DatabaseProcessor:
             for index, row in tqdm(
                 orphan_independent_media.iterrows(),
                 desc="Removing references to unneeded media",
+                disable=len(orphan_independent_media) == 0,
             ):
                 self.merged_tables["IndependentMedia"].drop(index, inplace=True)
                 # Remove references in other tables to this note
@@ -347,6 +359,7 @@ class DatabaseProcessor:
             for index, row in tqdm(
                 orphan_blockrange.iterrows(),
                 desc="Removing references to obsolete highlights",
+                disable=len(orphan_blockrange) == 0,
             ):
                 self.merged_tables["BlockRange"].drop(index, inplace=True)
                 # Remove references in other tables to this
@@ -357,9 +370,14 @@ class DatabaseProcessor:
                 )
 
         # # Remove special conflicting entries from TagMap and UserMark
-        ignore_list = ["ColorIndex", "Position", "Title"]
-        for table in tqdm(
-            ["TagMap", "UserMark", "Location"], desc="Removing conflicting entries"
+        ignore_dict = {
+            "TagMap": "Position",
+            "UserMark": "ColorIndex",
+            "Location": "Title",
+        }
+        for table, ignore_column in tqdm(
+            ignore_dict.items(),
+            desc="Removing duplicate entries for highlights, tags, and locations",
         ):
             self.merged_tables[table].drop_duplicates(
                 ignore_index=True,
@@ -367,7 +385,7 @@ class DatabaseProcessor:
                 subset=[
                     elem
                     for elem in self.merged_tables[table].columns
-                    if elem not in ignore_list
+                    if elem != ignore_column
                 ],
             )
 
@@ -387,11 +405,13 @@ class DatabaseProcessor:
         for index, row in tqdm(
             orphan_locations.iterrows(),
             desc="Removing unneeded locations",
+            disable=len(orphan_locations) == 0,
         ):
             self.merged_tables["Location"].drop(index, inplace=True)
 
+        print()
         # Finally, reindex all tables
-        for table in tqdm(self.merged_tables, desc="Re-indexing tables"):
+        for table in tqdm(self.merged_tables, desc="Re-indexing entries in all tables"):
             if (
                 table not in self.primary_keys
                 or len(list(self.merged_tables[table].columns)) == 1
@@ -590,7 +610,7 @@ class DatabaseProcessor:
 
         for table_name in tqdm(
             self.merged_tables.keys(),
-            desc="Deleting all data from existing database",
+            desc="Emptying existing database",
         ):
             dest_cursor.execute(f"DELETE FROM {table_name};")
             conn_merged.commit()
@@ -609,7 +629,7 @@ class DatabaseProcessor:
         dest_cursor.execute("VACUUM")
         conn_merged.commit()
         for table_name, table_data in tqdm(
-            self.merged_tables.items(), desc="Inserting merged data into tables"
+            self.merged_tables.items(), desc="Inserting fresh data into database"
         ):
             if self.debug:
                 try:
@@ -706,7 +726,7 @@ class DatabaseProcessor:
             os.mkdir(merged_dir)
 
         for file_name in tqdm(
-            os.listdir(first_jwl_unzip_folder_path), desc="Copying base files"
+            os.listdir(first_jwl_unzip_folder_path), desc="Adding base files to archive"
         ):
             if file_name.endswith(".png") or file_name.endswith(".json"):
                 shutil.copy2(
@@ -727,7 +747,9 @@ class DatabaseProcessor:
                     )
 
         for file_to_include_in_archive in tqdm(
-            self.files_to_include_in_archive, desc="Copying additional media files"
+            self.files_to_include_in_archive,
+            desc="Adding additional media files to archive",
+            disable=len(self.files_to_include_in_archive) == 0,
         ):
             if file_to_include_in_archive != os.path.join(
                 merged_dir, os.path.basename(file_to_include_in_archive)
@@ -772,28 +794,40 @@ class DatabaseProcessor:
             os.mkdir(self.jwl_output_folder)
 
         shutil.make_archive(
-            os.path.join(".", self.jwl_output_folder, merged_file_name),
+            os.path.join(self.jwl_output_folder, merged_file_name),
             "zip",
             merged_dir,
         )
 
-        output_jwl_file_path = os.path.join(
-            ".", self.jwl_output_folder, merged_file_name
+        output_jwl_file_path = os.path.abspath(
+            os.path.join(self.jwl_output_folder, merged_file_name)
         )
         os.rename(
             output_jwl_file_path + ".zip",
             output_jwl_file_path,
         )
 
-        print()
-        print("Created JWL file! Full path:", output_jwl_file_path)
+        processor.cleanTempFiles()
 
+        print()
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"Work completed in {round(execution_time, 1)} seconds.")
+
+        print()
+        print(
+            "Successfully created JW Library backup file containing all merged user data!"
+        )
+        print()
+        print("Find it here:\n- ", output_jwl_file_path)
+        print()
         return output_jwl_file_path
 
     def cleanTempFiles(self):
         if not self.debug:
             if os.path.exists(self.working_folder):
                 shutil.rmtree(self.working_folder)
+            print()
             print("Cleaned up temporary files!")
 
     def unzipFile(self, file_path):
@@ -812,8 +846,6 @@ class DatabaseProcessor:
             return None
 
     def getJwlFiles(self):
-        root = tk.Tk()
-        root.withdraw()
         file_paths = []
         if args.file is not None or args.folder is not None:
             if args.file:
@@ -823,8 +855,12 @@ class DatabaseProcessor:
                     if not file.lower().endswith(".jwlibrary"):
                         continue
                     file_paths.append(os.path.join(args.folder, file))
-        # TODO: If --folder or --file, show confirm to user enumerating all files that will be merged
         else:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
             while len(file_paths) < 2:
                 file_path = filedialog.askopenfilename(
                     filetypes=[(".JWLIBRARY files", "*.JWLIBRARY")],
@@ -832,31 +868,32 @@ class DatabaseProcessor:
                     multiple=True,
                 )
                 if not file_path:
-                    exit()
+                    break
                 file_paths.extend(file_path)
         if not file_paths or len(file_paths) == 1:
             print("Not enough .JWLIBRARY files found to work with!")
             print()
-            print("Provided arguments:")
-            print("\n".join(["- " + path for path in [args.file, args.folder] if path]))
+            if len(file_paths) > 0:
+                print("Provided arguments:")
+                print(
+                    "\n".join(
+                        ["- " + path for path in [args.file, args.folder] if path]
+                    )
+                )
             exit()
         print(
-            "Files selected:\n"
+            "JW Library backup files to be merged:\n"
             + "\n".join(["- " + file_path for file_path in file_paths])
         )
         print()
         if os.path.exists(self.merged_db_path):
             os.remove(self.merged_db_path)
         db_paths = []
-        for file_path in file_paths:
+        for file_path in tqdm(file_paths, desc="Extracting databases"):
             db_path = self.extractDatabase(file_path)
             if not os.path.exists(self.merged_db_path):
                 shutil.copy2(db_path, self.merged_db_path)
             db_paths.append(db_path)
-        print(
-            "Databases extracted:\n"
-            + "\n".join(["- " + db_path for db_path in db_paths])
-        )
         return db_paths
 
     def extractDatabase(self, file_path):
@@ -879,4 +916,3 @@ if __name__ == "__main__":
     processor = DatabaseProcessor()
     selected_paths = processor.getJwlFiles()
     processor.process_multiple_databases(selected_paths)
-    processor.cleanTempFiles()
