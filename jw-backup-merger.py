@@ -269,14 +269,18 @@ class JwlBackupProcessor:
                                 new_row_text_value = new_row[text_column].values[0]
                                 if (
                                     len(old_row_text_value) > 0
-                                    and not new_row_text_value.strip()
-                                    == old_row_text_value.strip()
+                                    and old_row_text_value.strip()
+                                    != new_row_text_value.strip()
                                 ):
+                                    if old_row_text_value in new_row_text_value:
+                                        new_value = new_row_text_value
+                                    else:
+                                        new_value = self.inline_diff(
+                                            old_row_text_value, new_row_text_value
+                                        )
                                     self.merged_tables[table].at[
                                         new_row_index, text_column
-                                    ] = self.inline_diff(
-                                        old_row_text_value, new_row_text_value
-                                    )
+                                    ] = new_value
                             self.merged_tables[table].drop(
                                 index=old_row_index, inplace=True
                             )
