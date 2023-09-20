@@ -13,8 +13,6 @@ from tqdm import tqdm
 import pandas as pd
 import sqlite3
 
-start_time = time()
-
 parser = ArgumentParser()
 parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 parser.add_argument("--folder", type=str, help="Folder containing JWL files to merge")
@@ -48,6 +46,7 @@ class JwlBackupProcessor:
         self.foreign_keys = {}
         self.fk_constraints = {}
         self.files_to_include_in_archive = []
+        self.start_time = 0
 
         self.working_folder = path.join(".", "working")
         self.jwl_output_folder = path.join(".", "merged")
@@ -92,6 +91,7 @@ class JwlBackupProcessor:
                         self.foreign_keys[to_table].append(fk)
 
     def process_databases(self, database_files):
+        self.start_time = time()
         source_cursor = None
         opened_dbs = []
         for file_path in tqdm(database_files, desc="Loading databases into memory"):
@@ -133,6 +133,42 @@ class JwlBackupProcessor:
                     path.join(self.working_folder, f"concat-{table_name}.xlsx"),
                 )
         print()
+
+        for table_name in tqdm(
+            self.merged_tables.keys(),
+            desc=f"Removing identical entries from concatenated tables",
+        ):
+            if len(list(self.merged_tables[table_name].columns)) == 1:
+                unique_subset = self.merged_tables[table_name].columns.to_list()
+                current_table_pk_name = self.merged_tables[table_name].columns[0]
+            else:
+                current_table_pk_name = self.primary_keys[table_name][0]
+                unique_subset = [
+                    x
+                    for x in self.merged_tables[table_name].columns
+                    if x != current_table_pk_name
+                ]
+            grouped = (
+                self.merged_tables[table_name]
+                .groupby(unique_subset)[current_table_pk_name]
+                .apply(list)
+            )
+            filtered_grouped = grouped[grouped.apply(len) > 1]
+            desired_result = {values[0]: values[1:] for values in filtered_grouped}
+            replacement_dict = {}
+            for orig, duplicate_values in desired_result.items():
+                for duplicate_value in duplicate_values:
+                    replacement_dict[duplicate_value] = orig
+            self.update_primary_and_foreign_keys(
+                table_name, current_table_pk_name, replacement_dict
+            )
+            if self.debug:
+                print("Saving deduplicated table to Excel:", table_name)
+                self.merged_tables[table_name].to_excel(
+                    path.join(
+                        self.working_folder, f"deduplicated-1st-pass-{table_name}.xlsx"
+                    ),
+                )
 
         # Remove notes that are empty and aren't referenced by TagMap table
         if "Note" in self.merged_tables:
@@ -226,43 +262,6 @@ class JwlBackupProcessor:
                     self.primary_keys["BlockRange"][0],
                     row[self.primary_keys["BlockRange"][0]],
                 )
-        for table_name in tqdm(
-            self.merged_tables.keys(),
-            desc=f"Removing identical entries from concatenated tables",
-        ):
-            if len(list(self.merged_tables[table_name].columns)) == 1:
-                unique_subset = self.merged_tables[table_name].columns.to_list()
-                current_table_pk_name = self.merged_tables[table_name].columns[0]
-            else:
-                current_table_pk_name = self.primary_keys[table_name][0]
-                unique_subset = [
-                    x
-                    for x in self.merged_tables[table_name].columns
-                    if x != current_table_pk_name
-                ]
-            grouped = (
-                self.merged_tables[table_name]
-                .groupby(unique_subset)[current_table_pk_name]
-                .apply(list)
-            )
-            filtered_grouped = grouped[grouped.apply(len) > 1]
-            desired_result = {values[0]: values[1:] for values in filtered_grouped}
-            replacement_dict = {}
-            for orig, duplicate_values in desired_result.items():
-                for duplicate_value in duplicate_values:
-                    replacement_dict[duplicate_value] = orig
-            self.update_primary_and_foreign_keys(
-                table_name, current_table_pk_name, replacement_dict
-            )
-            if self.debug:
-                print("Saving deduplicated table to Excel:", table_name)
-                self.merged_tables[table_name].to_excel(
-                    path.join(
-                        self.working_folder, f"deduplicated-1st-pass-{table_name}.xlsx"
-                    ),
-                )
-
-        # De-duplicate entries
         unique_constraints_requiring_attention = {
             "Location": [
                 [
@@ -297,7 +296,7 @@ class JwlBackupProcessor:
         }
         for table, subsets in tqdm(
             unique_constraints_requiring_attention.items(),
-            desc="Reworking data and merging duplicates",
+            desc="Reworking data and merging obvious duplicates",
         ):
             if table in self.merged_tables:
                 for subset in subsets:
@@ -386,7 +385,7 @@ class JwlBackupProcessor:
                         table, primary_key, collision_pair_replacement_dict
                     )
 
-        # # Remove special conflicting entries from TagMap and UserMark
+        # Remove special conflicting entries from Location, TagMap and UserMark
         ignore_dict = {
             "TagMap": "Position",
             "UserMark": "ColorIndex",
@@ -394,7 +393,7 @@ class JwlBackupProcessor:
         }
         for table, ignore_column in tqdm(
             ignore_dict.items(),
-            desc="Removing duplicate entries for highlights, tags, and locations",
+            desc="Removing additional duplicates from locations, tags and highlights",
         ):
             self.merged_tables[table].drop_duplicates(
                 ignore_index=True,
@@ -421,14 +420,45 @@ class JwlBackupProcessor:
         orphan_locations = self.merged_tables["Location"][filter_condition]
         for index, row in tqdm(
             orphan_locations.iterrows(),
-            desc="Removing unneeded locations",
+            desc="Removing locations that are no longer referenced anywhere",
             disable=len(orphan_locations) == 0,
         ):
             self.merged_tables["Location"].drop(index, inplace=True)
 
+        merged_br_df = pd.merge(
+            self.merged_tables["BlockRange"],
+            self.merged_tables["UserMark"],
+            on="UserMarkId",
+        )
+        mask = merged_br_df.duplicated(
+            subset=["LocationId", "Identifier", "StartToken", "EndToken"], keep="first"
+        )
+        overlapping_block_range_ids = merged_br_df.loc[mask, "BlockRangeId"].tolist()
+        overlapping_usermark_ids = merged_br_df.loc[mask, "UserMarkId"].tolist()
+        number_of_overlapping_ranges = max(
+            len(overlapping_block_range_ids), len(overlapping_usermark_ids)
+        )
+        if number_of_overlapping_ranges > 0:
+            progress_bar = tqdm(
+                total=number_of_overlapping_ranges,
+                desc="Removing overlapping highlights",
+            )
+            self.merged_tables["BlockRange"] = self.merged_tables["BlockRange"][
+                ~self.merged_tables["BlockRange"]["BlockRangeId"].isin(
+                    overlapping_block_range_ids
+                )
+            ]
+            self.merged_tables["UserMark"] = self.merged_tables["UserMark"][
+                ~self.merged_tables["UserMark"]["UserMarkId"].isin(
+                    overlapping_usermark_ids
+                )
+            ]
+            progress_bar.update(number_of_overlapping_ranges)
+            progress_bar.close()
+
         print()
         # Finally, reindex all tables
-        for table in tqdm(self.merged_tables, desc="Re-indexing entries in all tables"):
+        for table in tqdm(self.merged_tables, desc="Re-indexing all tables"):
             if (
                 table not in self.primary_keys
                 or len(list(self.merged_tables[table].columns)) == 1
@@ -646,17 +676,6 @@ class JwlBackupProcessor:
         for table_name, table_data in tqdm(
             self.merged_tables.items(), desc="Inserting fresh data into database"
         ):
-            if self.debug:
-                try:
-                    table_data.to_excel(
-                        path.join(
-                            self.working_folder,
-                            f"final_{table_name}.xlsx",
-                        )
-                    )
-                except Exception:
-                    print(f"Could not save {table_name}.xlsx; continuing...")
-
             if table_name == "LastModified":
                 continue
 
@@ -683,6 +702,16 @@ class JwlBackupProcessor:
                 self.output["errors"].append(
                     (table_name, insert_sql, rows_to_insert, e)
                 )
+            if self.debug or len(self.output["errors"]) > 0:
+                try:
+                    table_data.to_excel(
+                        path.join(
+                            self.working_folder,
+                            f"final_{table_name}.xlsx",
+                        )
+                    )
+                except Exception:
+                    print(f"Could not save {table_name}.xlsx; continuing...")
 
         conn_merged.commit()
 
@@ -817,7 +846,7 @@ class JwlBackupProcessor:
 
         print()
         end_time = time()
-        execution_time = end_time - start_time
+        execution_time = end_time - self.start_time
         print(f"Work completed in {round(execution_time, 1)} seconds.")
 
         print()
@@ -828,7 +857,7 @@ class JwlBackupProcessor:
         return output_jwl_file_path
 
     def cleanTempFiles(self):
-        if not self.debug:
+        if not self.debug and len(self.output["errors"]) == 0:
             if path.isdir(self.working_folder):
                 rmtree(self.working_folder)
             print()

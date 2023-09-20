@@ -13,6 +13,7 @@
         "notna",
         "tqdm",
         "Userdata",
+        "usermark",
         "usermarks"
     ]
 }
