@@ -783,7 +783,7 @@ class JwlBackupProcessor:
         name_timestamp = current_datetime.strftime("%Y-%m-%d-%H%M%S")
         merged_file_name = f"UserdataBackup_{name_timestamp}_{self.app_name}.jwlibrary"
 
-        manifest_data["name"] = merged_file_name
+        manifest_data["name"] = self.app_name
 
         userDataBackup = {
             "lastModifiedDate": formatted_date,
