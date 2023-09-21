@@ -84,26 +84,85 @@ class JwlBackupProcessor:
                         if from_table not in self.fk_constraints:
                             self.fk_constraints[from_table] = {}
                         if pk not in self.fk_constraints[from_table]:
-                            self.fk_constraints[from_table][pk] = []
-                        self.fk_constraints[from_table][pk].append((to_table, fk))
+                            self.fk_constraints[from_table][pk] = set()
+                        self.fk_constraints[from_table][pk].add((to_table, fk))
                         if to_table not in self.foreign_keys:
                             self.foreign_keys[to_table] = []
-                        self.foreign_keys[to_table].append(fk)
+                        if fk not in self.foreign_keys[to_table]:
+                            self.foreign_keys[to_table].append(fk)
 
     def process_databases(self, database_files):
         self.start_time = time()
-        source_cursor = None
         opened_dbs = []
+        indices = []
+        triggers = []
         for file_path in tqdm(database_files, desc="Loading databases into memory"):
             temp_db = sqlite3.connect(file_path)
             opened_dbs.append(temp_db)
-            if source_cursor is None:
-                source_cursor = temp_db.cursor()
-                self.get_primary_key_names(temp_db, source_cursor)
-                self.get_foreign_key_names(temp_db, source_cursor)
+            source_cursor = temp_db.cursor()
+            self.get_primary_key_names(temp_db, source_cursor)
+            self.get_foreign_key_names(temp_db, source_cursor)
             floor = self.get_primary_key_floor()
             for table in self.get_tables(temp_db):
                 self.load_table_into_df(temp_db, table, floor)
+            source_cursor.execute(
+                "SELECT DISTINCT sql FROM sqlite_master WHERE type='index';"
+            )
+            indices.extend([row[0] for row in source_cursor.fetchall() if row[0]])
+            source_cursor.execute(
+                "SELECT DISTINCT sql FROM sqlite_master WHERE type='trigger';"
+            )
+            triggers.extend([row[0] for row in source_cursor.fetchall() if row[0]])
+
+        unique_indices = set()
+        for value in indices:
+            cleaned_index = " ".join(value.split())
+            unique_indices.add(cleaned_index)
+        indices = list(unique_indices)
+
+        unique_triggers = set()
+        for value in triggers:
+            cleaned_trigger = " ".join(value.split())
+            unique_triggers.add(cleaned_trigger)
+        triggers = list(unique_triggers)
+
+        # Remove tables that are no longer present in latest schema (2023.09.21: v14)
+        v14_tables = [
+            "BlockRange",
+            "Bookmark",
+            "grdb_migrations",
+            "IndependentMedia",
+            "InputField",
+            "LastModified",
+            "Location",
+            "Note",
+            "PlaylistItem",
+            "PlaylistItemAccuracy",
+            "PlaylistItemIndependentMediaMap",
+            "PlaylistItemLocationMap",
+            "PlaylistItemMarker",
+            "PlaylistItemMarkerBibleVerseMap",
+            "PlaylistItemMarkerParagraphMap",
+            "Tag",
+            "TagMap",
+            "UserMark",
+        ]
+        obsolete_tables = [
+            value for value in self.merged_tables if value not in v14_tables
+        ]
+        for obsolete_table in tqdm(
+            obsolete_tables,
+            desc="Removing obsolete tables",
+            disable=len(obsolete_tables) == 0,
+        ):
+            if obsolete_table in self.merged_tables:
+                self.merged_tables.pop(obsolete_table)
+            if obsolete_table in self.primary_keys:
+                self.primary_keys.pop(obsolete_table)
+            if obsolete_table in self.foreign_keys:
+                self.foreign_keys.pop(obsolete_table)
+            if obsolete_table in self.fk_constraints:
+                self.fk_constraints.pop(obsolete_table)
 
         # Reorder tables to facilitate processing, since some tables depend on others
         table_order = [
@@ -127,10 +186,10 @@ class JwlBackupProcessor:
         if self.debug:
             for table_name in tqdm(
                 self.merged_tables.keys(),
-                desc="Outputting concatenated tables to Excel for debugging",
+                desc="Outputting concatenated tables to CSV for debugging",
             ):
-                self.merged_tables[table_name].to_excel(
-                    path.join(self.working_folder, f"concat-{table_name}.xlsx"),
+                self.merged_tables[table_name].to_csv(
+                    path.join(self.working_folder, f"concat-{table_name}.csv"),
                 )
         print()
 
@@ -147,6 +206,7 @@ class JwlBackupProcessor:
                     x
                     for x in self.merged_tables[table_name].columns
                     if x != current_table_pk_name
+                    and not (table_name == "Location" and x == "Title")
                 ]
             grouped = (
                 self.merged_tables[table_name]
@@ -163,12 +223,158 @@ class JwlBackupProcessor:
                 table_name, current_table_pk_name, replacement_dict
             )
             if self.debug:
-                print("Saving deduplicated table to Excel:", table_name)
-                self.merged_tables[table_name].to_excel(
+                # print("Saving deduplicated table to Excel:", table_name)
+                self.merged_tables[table_name].to_csv(
                     path.join(
-                        self.working_folder, f"deduplicated-1st-pass-{table_name}.xlsx"
+                        self.working_folder, f"deduplicated-1st-pass-{table_name}.csv"
                     ),
                 )
+
+        unique_constraints_requiring_attention = {
+            "Location": [
+                [
+                    "BookNumber",
+                    "ChapterNumber",
+                    "KeySymbol",
+                    "MepsLanguage",
+                    "Type",
+                ],
+                [
+                    "KeySymbol",
+                    "IssueTagNumber",
+                    "MepsLanguage",
+                    "DocumentId",
+                    "Track",
+                    "Type",
+                ],
+            ],
+            "Bookmark": [["PublicationLocationId", "Slot"]],
+            "InputField": [["LocationId", "TextTag"]],
+            "Note": [
+                ["Guid"],
+                ["LocationId", "Title", "Content", "BlockType", "BlockIdentifier"],
+            ],
+            "UserMark": [["UserMarkGuid"]],
+            "TagMap": [
+                ["TagId", "NoteId"],
+                ["TagId", "LocationId"],
+                ["TagId", "PlaylistItemId"],
+            ],
+        }
+        text_values_to_merge = {
+            "Bookmark": ["Title", "Snippet"],
+            "InputField": ["Value"],
+            "Note": ["Title", "Content"],
+        }
+        for table, subsets in tqdm(
+            unique_constraints_requiring_attention.items(),
+            desc="Reworking data and merging obvious duplicates",
+        ):
+            if table in self.merged_tables:
+                for subset in subsets:
+                    if table == "Note":
+                        self.merged_tables[table].sort_values(
+                            "LastModified", ascending=False, inplace=True
+                        )
+                    elif table == "TagMap":
+                        self.merged_tables[table].sort_values(
+                            "Position", ascending=False, inplace=True
+                        )
+                    else:
+                        self.merged_tables[table].sort_values(subset, inplace=True)
+                    mask = (
+                        ~self.merged_tables[table][subset]
+                        .apply(lambda x: x == "")
+                        .any(axis=1)
+                    )
+                    duplicate_values_mask = self.merged_tables[table][mask].duplicated(
+                        subset=subset, keep=False
+                    )
+                    duplicates = self.merged_tables[table][mask][duplicate_values_mask]
+                    primary_key = self.primary_keys[table][0]
+                    # TODO: find a better way to handle this, using groupby instead?
+                    collision_replacement_dict = {}
+                    for _, row in duplicates.iterrows():
+                        primary_key_value = row[self.primary_keys[table][0]]
+                        key = tuple(row[subset])
+
+                        if key not in collision_replacement_dict:
+                            collision_replacement_dict[key] = [primary_key_value]
+                        else:
+                            collision_replacement_dict[key].append(primary_key_value)
+                    collision_replacement_dict = {
+                        v[0]: v[1:] for v in collision_replacement_dict.values()
+                    }
+                    collision_pair_replacement_dict = {}
+                    for key, values in collision_replacement_dict.items():
+                        for value in values:
+                            if key != value:
+                                collision_pair_replacement_dict[value] = key
+                    if len(collision_pair_replacement_dict.keys()) == 0:
+                        continue
+                    if table in text_values_to_merge.keys():
+                        for (
+                            old_primary_key,
+                            new_primary_key,
+                        ) in collision_pair_replacement_dict.items():
+                            old_row = self.merged_tables[table].loc[
+                                self.merged_tables[table][primary_key]
+                                == old_primary_key
+                            ]
+                            old_row_index = old_row.index[0]
+                            new_row = self.merged_tables[table].loc[
+                                self.merged_tables[table][primary_key]
+                                == new_primary_key
+                            ]
+                            new_row_index = new_row.index[0]
+                            for text_column in text_values_to_merge[table]:
+                                old_row_text_value = old_row[text_column].values[0]
+                                new_row_text_value = new_row[text_column].values[0]
+                                if (
+                                    len(old_row_text_value) > 0
+                                    and old_row_text_value.strip()
+                                    != new_row_text_value.strip()
+                                ):
+                                    if old_row_text_value in new_row_text_value:
+                                        new_value = new_row_text_value
+                                    else:
+                                        new_value = self.inline_diff(
+                                            old_row_text_value, new_row_text_value
+                                        )
+                                    self.merged_tables[table].at[
+                                        new_row_index, text_column
+                                    ] = new_value
+                            self.merged_tables[table].drop(
+                                index=old_row_index, inplace=True
+                            )
+                    else:
+                        self.update_primary_key(
+                            table, primary_key, collision_pair_replacement_dict
+                        )
+
+                    self.update_foreign_keys(
+                        table, primary_key, collision_pair_replacement_dict
+                    )
+
+        # Remove orphan locations
+        filter_condition = None
+        for table, field in self.fk_constraints["Location"]["LocationId"]:
+            # Initialize a temporary condition for the current key
+            temp_condition = ~self.merged_tables["Location"]["LocationId"].isin(
+                self.merged_tables[table][field]
+            )
+            if filter_condition is None:
+                filter_condition = temp_condition
+            else:
+                filter_condition &= temp_condition
+
+        orphan_locations = self.merged_tables["Location"][filter_condition]
+        for index, row in tqdm(
+            orphan_locations.iterrows(),
+            desc="Removing locations that are no longer referenced anywhere",
+            disable=len(orphan_locations) == 0,
+        ):
+            self.merged_tables["Location"].drop(index, inplace=True)
 
         # Remove notes that are empty and aren't referenced by TagMap table
         if "Note" in self.merged_tables:
@@ -225,205 +431,41 @@ class JwlBackupProcessor:
 
         # Remove entries in UserMark if their LocationId does not exist in Location table
         if "UserMark" in self.merged_tables:
-            orphan_usermarks = self.merged_tables["UserMark"][
-                ~self.merged_tables["UserMark"]["LocationId"].isin(
-                    self.merged_tables["Location"]["LocationId"]
-                )
-            ]
-            for index, row in tqdm(
-                orphan_usermarks.iterrows(),
-                desc="Removing references to highlights in deleted locations",
+            orphan_usermarks = self.merged_tables["UserMark"].merge(
+                self.merged_tables["Location"][["LocationId"]],
+                on="LocationId",
+                how="left",
+                indicator=True,
+            )
+            progress_bar = tqdm(
+                total=len(orphan_usermarks),
+                desc="Removing overlapping highlights",
                 disable=len(orphan_usermarks) == 0,
-            ):
-                self.merged_tables["UserMark"].drop(index, inplace=True)
-                # Remove references in other tables to this
-                self.remove_foreign_key_value(
-                    "UserMark",
-                    self.primary_keys["UserMark"][0],
-                    row[self.primary_keys["UserMark"][0]],
-                )
+            )
+            self.merged_tables["UserMark"] = orphan_usermarks[
+                orphan_usermarks["_merge"] == "both"
+            ].drop(columns=["_merge"])
+            progress_bar.update(len(orphan_usermarks))
+            progress_bar.close()
 
         # Remove entries from BlockRange that aren't referenced by UserMark table
         if "BlockRange" in self.merged_tables:
-            orphan_blockrange = self.merged_tables["BlockRange"][
-                ~self.merged_tables["BlockRange"]["UserMarkId"].isin(
-                    self.merged_tables["UserMark"]["UserMarkId"]
-                )
-            ]
-            for index, row in tqdm(
-                orphan_blockrange.iterrows(),
+            orphan_blockrange = self.merged_tables["BlockRange"].merge(
+                self.merged_tables["UserMark"][["UserMarkId"]],
+                on="UserMarkId",
+                how="left",
+                indicator=True,
+            )
+            progress_bar = tqdm(
+                total=len(orphan_blockrange),
                 desc="Removing references to deleted highlights",
                 disable=len(orphan_blockrange) == 0,
-            ):
-                self.merged_tables["BlockRange"].drop(index, inplace=True)
-                # Remove references in other tables to this
-                self.remove_foreign_key_value(
-                    "BlockRange",
-                    self.primary_keys["BlockRange"][0],
-                    row[self.primary_keys["BlockRange"][0]],
-                )
-        unique_constraints_requiring_attention = {
-            "Location": [
-                [
-                    "BookNumber",
-                    "ChapterNumber",
-                    "DocumentId",
-                    "Track",
-                    "IssueTagNumber",
-                    "KeySymbol",
-                    "MepsLanguage",
-                    "Type",
-                ]
-            ],
-            "Bookmark": [["PublicationLocationId", "Slot"]],
-            "InputField": [["LocationId", "TextTag"]],
-            "Note": [
-                ["Guid"],
-                ["LocationId", "Title", "Content", "BlockType", "BlockIdentifier"],
-            ],
-            "UserMark": [["UserMarkGuid"]],
-            "TagMap": [
-                ["TagId", "NoteId"],
-                ["TagId", "LocationId"],
-                ["TagId", "PlaylistItemId"],
-                ["TagId", "Position"],
-            ],
-        }
-        text_values_to_merge = {
-            "Bookmark": ["Title", "Snippet"],
-            "InputField": ["Value"],
-            "Note": ["Title", "Content"],
-        }
-        for table, subsets in tqdm(
-            unique_constraints_requiring_attention.items(),
-            desc="Reworking data and merging obvious duplicates",
-        ):
-            if table in self.merged_tables:
-                for subset in subsets:
-                    if table == "Note":
-                        self.merged_tables[table].sort_values(
-                            "LastModified", ascending=False, inplace=True
-                        )
-                    duplicate_values_mask = self.merged_tables[table].duplicated(
-                        subset=subset, keep=False
-                    )
-                    duplicates = self.merged_tables[table][duplicate_values_mask]
-                    if table == "TagMap":
-                        mask = (
-                            self.merged_tables[table][subset[0]].notna()
-                            & (self.merged_tables[table][subset[0]] != "")
-                            & self.merged_tables[table][subset[1]].notna()
-                            & (self.merged_tables[table][subset[1]] != "")
-                        )
-                        duplicate_values_mask = self.merged_tables[table][
-                            mask
-                        ].duplicated(subset=subset, keep=False)
-                        duplicates = self.merged_tables[table][mask][
-                            duplicate_values_mask
-                        ]
-                    primary_key = self.primary_keys[table][0]
-                    # TODO: find a better way to handle this, using groupby instead?
-                    collision_replacement_dict = {}
-                    for _, row in duplicates.iterrows():
-                        primary_key_value = row[self.primary_keys[table][0]]
-                        key = tuple(row[subset])
-
-                        if key not in collision_replacement_dict:
-                            collision_replacement_dict[key] = [primary_key_value]
-                        else:
-                            collision_replacement_dict[key].append(primary_key_value)
-                    collision_replacement_dict = {
-                        v[0]: v[1:] for v in collision_replacement_dict.values()
-                    }
-                    collision_pair_replacement_dict = {}
-                    for key, values in collision_replacement_dict.items():
-                        for value in values:
-                            collision_pair_replacement_dict[value] = key
-                    if len(collision_pair_replacement_dict.keys()) == 0:
-                        continue
-                    if table in text_values_to_merge.keys():
-                        for (
-                            old_primary_key,
-                            new_primary_key,
-                        ) in collision_pair_replacement_dict.items():
-                            old_row = self.merged_tables[table].loc[
-                                self.merged_tables[table][primary_key]
-                                == old_primary_key
-                            ]
-                            old_row_index = old_row.index[0]
-                            new_row = self.merged_tables[table].loc[
-                                self.merged_tables[table][primary_key]
-                                == new_primary_key
-                            ]
-                            new_row_index = new_row.index[0]
-                            for text_column in text_values_to_merge[table]:
-                                old_row_text_value = old_row[text_column].values[0]
-                                new_row_text_value = new_row[text_column].values[0]
-                                if (
-                                    len(old_row_text_value) > 0
-                                    and old_row_text_value.strip()
-                                    != new_row_text_value.strip()
-                                ):
-                                    if old_row_text_value in new_row_text_value:
-                                        new_value = new_row_text_value
-                                    else:
-                                        new_value = self.inline_diff(
-                                            old_row_text_value, new_row_text_value
-                                        )
-                                    self.merged_tables[table].at[
-                                        new_row_index, text_column
-                                    ] = new_value
-                            self.merged_tables[table].drop(
-                                index=old_row_index, inplace=True
-                            )
-                    else:
-                        self.update_primary_key(
-                            table, primary_key, collision_pair_replacement_dict
-                        )
-
-                    self.update_foreign_keys(
-                        table, primary_key, collision_pair_replacement_dict
-                    )
-
-        # Remove special conflicting entries from Location, TagMap and UserMark
-        ignore_dict = {
-            "TagMap": "Position",
-            "UserMark": "ColorIndex",
-            "Location": "Title",
-        }
-        for table, ignore_column in tqdm(
-            ignore_dict.items(),
-            desc="Removing additional duplicates from locations, tags and highlights",
-        ):
-            self.merged_tables[table].drop_duplicates(
-                ignore_index=True,
-                inplace=True,
-                subset=[
-                    elem
-                    for elem in self.merged_tables[table].columns
-                    if elem != ignore_column
-                ],
             )
-
-        # Remove orphan locations
-        filter_condition = None
-        for table, field in self.fk_constraints["Location"]["LocationId"]:
-            # Initialize a temporary condition for the current key
-            temp_condition = ~self.merged_tables["Location"]["LocationId"].isin(
-                self.merged_tables[table][field]
-            )
-            if filter_condition is None:
-                filter_condition = temp_condition
-            else:
-                filter_condition &= temp_condition
-
-        orphan_locations = self.merged_tables["Location"][filter_condition]
-        for index, row in tqdm(
-            orphan_locations.iterrows(),
-            desc="Removing locations that are no longer referenced anywhere",
-            disable=len(orphan_locations) == 0,
-        ):
-            self.merged_tables["Location"].drop(index, inplace=True)
+            self.merged_tables["BlockRange"] = orphan_blockrange[
+                orphan_blockrange["_merge"] == "both"
+            ].drop(columns=["_merge"])
+            progress_bar.update(len(orphan_blockrange))
+            progress_bar.close()
 
         merged_br_df = pd.merge(
             self.merged_tables["BlockRange"],
@@ -456,8 +498,23 @@ class JwlBackupProcessor:
             progress_bar.update(number_of_overlapping_ranges)
             progress_bar.close()
 
+        if "TagMap" in self.merged_tables:
+            tag_map_len = len(self.merged_tables["TagMap"])
+            self.merged_tables["TagMap"].sort_values(
+                ["TagId", "Position"], inplace=True
+            )
+            progress_bar = tqdm(
+                total=tag_map_len,
+                desc="Renumbering tagged items",
+            )
+            self.merged_tables["TagMap"]["Position"] = (
+                self.merged_tables["TagMap"].groupby("TagId").cumcount()
+            )
+            progress_bar.update(tag_map_len)
+            progress_bar.close()
+
         print()
-        # Finally, reindex all tables
+
         for table in tqdm(self.merged_tables, desc="Re-indexing all tables"):
             if (
                 table not in self.primary_keys
@@ -475,15 +532,6 @@ class JwlBackupProcessor:
                 self.primary_keys[table][0],
                 new_pk_dict,
             )
-
-        source_cursor.execute(
-            "SELECT DISTINCT sql FROM sqlite_master WHERE type='index';"
-        )
-        indices = [row[0] for row in source_cursor.fetchall() if row[0]]
-        source_cursor.execute(
-            "SELECT DISTINCT sql FROM sqlite_master WHERE type='trigger';"
-        )
-        triggers = [row[0] for row in source_cursor.fetchall() if row[0]]
 
         for opened_db in opened_dbs:
             opened_db.close()
@@ -553,9 +601,15 @@ class JwlBackupProcessor:
         self.merged_tables[origin_table][origin_primary_key] = self.merged_tables[
             origin_table
         ][origin_primary_key].map(lambda x: replacement_dict.get(x, x))
+        subset = list(self.merged_tables[origin_table].columns)
+        if origin_table == "Location":
+            subset.remove("Title")
+            self.merged_tables[origin_table].sort_values(
+                "Title", ascending=False, inplace=True
+            )
         # Drop duplicates resulting from primary key change
         self.merged_tables[origin_table].drop_duplicates(
-            ignore_index=True, inplace=True
+            subset=subset, ignore_index=True, inplace=True
         )
 
     def update_foreign_keys(
@@ -628,6 +682,42 @@ class JwlBackupProcessor:
                 ignore_index=True,
             )
             self.merged_tables[table_name].reset_index(drop=True, inplace=True)
+
+        # Make sure that some needed values in Note table are not empty
+        if table_name == "Note":
+            if "Created" not in self.merged_tables[table_name]:
+                self.merged_tables[table_name]["Created"] = self.merged_tables[
+                    table_name
+                ]["LastModified"]
+            self.merged_tables[table_name]["LastModified"] = (
+                self.merged_tables[table_name]["LastModified"]
+                .fillna(self.merged_tables[table_name]["Created"])
+                .fillna(datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+            )
+            self.merged_tables[table_name]["Created"] = (
+                self.merged_tables[table_name]["Created"]
+                .fillna(self.merged_tables[table_name]["LastModified"])
+                .fillna(datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+            )
+
+        # Remove columns no longer used in certain tables in latest schema (v14)
+        obsolete_columns_per_table = {
+            "PlaylistItem": [
+                "AccuracyStatement",
+                "StartTimeOffsetTicks",
+                "EndTimeOffsetTicks",
+                "ThumbnailFilename",
+                "PlaylistMediaId",
+            ],
+            "Tag": ["ImageFilename"],
+        }
+        for table_to_check, obsolete_columns in obsolete_columns_per_table.items():
+            if table_name == table_to_check:
+                for column in obsolete_columns:
+                    if column in self.merged_tables[table_name].columns:
+                        self.merged_tables[table_name].drop(
+                            column, axis=1, inplace=True
+                        )
         self.merged_tables[table_name].fillna("", inplace=True)
 
     def save_merged_tables(self, indices, triggers):
@@ -699,19 +789,17 @@ class JwlBackupProcessor:
                         (table_name, insert_sql, rows_to_insert, "NO ERROR!")
                     )
             except Exception as e:
-                self.output["errors"].append(
-                    (table_name, insert_sql, rows_to_insert, e)
-                )
+                self.output["errors"].append((table_name, insert_sql, e))
             if self.debug or len(self.output["errors"]) > 0:
                 try:
-                    table_data.to_excel(
+                    table_data.to_csv(
                         path.join(
                             self.working_folder,
-                            f"final_{table_name}.xlsx",
+                            f"final_{table_name}.csv",
                         )
                     )
                 except Exception:
-                    print(f"Could not save {table_name}.xlsx; continuing...")
+                    print(f"Could not save {table_name}.csv; continuing...")
 
         conn_merged.commit()
 
@@ -856,12 +944,12 @@ class JwlBackupProcessor:
         print()
         return output_jwl_file_path
 
-    def cleanTempFiles(self):
-        if not self.debug and len(self.output["errors"]) == 0:
+    def cleanTempFiles(self, force=False):
+        if force or (not self.debug and len(self.output["errors"]) == 0):
             if path.isdir(self.working_folder):
                 rmtree(self.working_folder)
             print()
-            print("Cleaned up temporary files!")
+            print("Cleaned up working directory!")
 
     def unzipFile(self, file_path):
         basename = path.splitext(path.basename(file_path))[0]
@@ -912,6 +1000,7 @@ class JwlBackupProcessor:
                     )
                 )
             exit()
+        processor.cleanTempFiles(force=True)
         print(
             "JW Library backup files to be merged:\n"
             + "\n".join(["- " + file_path for file_path in file_paths])
