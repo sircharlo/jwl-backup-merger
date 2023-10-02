@@ -1,11 +1,14 @@
 {
     "cSpell.words": [
         "blockrange",
+        "blockranges",
+        "cumcount",
         "dateutil",
         "dropna",
         "executemany",
         "fillna",
         "gettz",
+        "grdb",
         "isin",
         "iterrows",
         "jwlibrary",

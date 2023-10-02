@@ -155,6 +155,13 @@ class JwlBackupProcessor:
             desc="Removing obsolete tables",
             disable=len(obsolete_tables) == 0,
         ):
+            if self.debug:
+                self.merged_tables[obsolete_table].to_csv(
+                    path.join(
+                        self.working_folder,
+                        f"removed-obsolete-table-{obsolete_table}.csv",
+                    ),
+                )
             if obsolete_table in self.merged_tables:
                 self.merged_tables.pop(obsolete_table)
             if obsolete_table in self.primary_keys:
@@ -223,7 +230,6 @@ class JwlBackupProcessor:
                 table_name, current_table_pk_name, replacement_dict
             )
             if self.debug:
-                # print("Saving deduplicated table to Excel:", table_name)
                 self.merged_tables[table_name].to_csv(
                     path.join(
                         self.working_folder, f"deduplicated-1st-pass-{table_name}.csv"
@@ -431,72 +437,79 @@ class JwlBackupProcessor:
 
         # Remove entries in UserMark if their LocationId does not exist in Location table
         if "UserMark" in self.merged_tables:
-            orphan_usermarks = self.merged_tables["UserMark"].merge(
+            usermarks_and_locations = self.merged_tables["UserMark"].merge(
                 self.merged_tables["Location"][["LocationId"]],
                 on="LocationId",
                 how="left",
                 indicator=True,
             )
-            progress_bar = tqdm(
-                total=len(orphan_usermarks),
-                desc="Removing overlapping highlights",
-                disable=len(orphan_usermarks) == 0,
+            orphan_usermarks_length = len(
+                usermarks_and_locations[usermarks_and_locations["_merge"] != "both"]
             )
-            self.merged_tables["UserMark"] = orphan_usermarks[
-                orphan_usermarks["_merge"] == "both"
-            ].drop(columns=["_merge"])
-            progress_bar.update(len(orphan_usermarks))
-            progress_bar.close()
+            if orphan_usermarks_length > 0:
+                progress_bar = tqdm(
+                    total=orphan_usermarks_length,
+                    desc="Removing overlapping highlights",
+                )
+                self.merged_tables["UserMark"] = usermarks_and_locations[
+                    usermarks_and_locations["_merge"] == "both"
+                ].drop(columns=["_merge"])
+                progress_bar.update(orphan_usermarks_length)
+                progress_bar.close()
 
         # Remove entries from BlockRange that aren't referenced by UserMark table
         if "BlockRange" in self.merged_tables:
-            orphan_blockrange = self.merged_tables["BlockRange"].merge(
+            blockranges_and_usermarks = self.merged_tables["BlockRange"].merge(
                 self.merged_tables["UserMark"][["UserMarkId"]],
                 on="UserMarkId",
                 how="left",
                 indicator=True,
             )
-            progress_bar = tqdm(
-                total=len(orphan_blockrange),
-                desc="Removing references to deleted highlights",
-                disable=len(orphan_blockrange) == 0,
+            orphan_blockranges_length = len(
+                blockranges_and_usermarks[blockranges_and_usermarks["_merge"] != "both"]
             )
-            self.merged_tables["BlockRange"] = orphan_blockrange[
-                orphan_blockrange["_merge"] == "both"
-            ].drop(columns=["_merge"])
-            progress_bar.update(len(orphan_blockrange))
-            progress_bar.close()
+            if orphan_blockranges_length > 0:
+                progress_bar = tqdm(
+                    total=orphan_blockranges_length,
+                    desc="Removing references to deleted highlights",
+                )
+                self.merged_tables["BlockRange"] = blockranges_and_usermarks[
+                    blockranges_and_usermarks["_merge"] == "both"
+                ].drop(columns=["_merge"])
+                progress_bar.update(orphan_blockranges_length)
+                progress_bar.close()
 
-        merged_br_df = pd.merge(
-            self.merged_tables["BlockRange"],
-            self.merged_tables["UserMark"],
-            on="UserMarkId",
-        )
-        mask = merged_br_df.duplicated(
-            subset=["LocationId", "Identifier", "StartToken", "EndToken"], keep="first"
-        )
-        overlapping_block_range_ids = merged_br_df.loc[mask, "BlockRangeId"].tolist()
-        overlapping_usermark_ids = merged_br_df.loc[mask, "UserMarkId"].tolist()
-        number_of_overlapping_ranges = max(
-            len(overlapping_block_range_ids), len(overlapping_usermark_ids)
-        )
-        if number_of_overlapping_ranges > 0:
-            progress_bar = tqdm(
-                total=number_of_overlapping_ranges,
-                desc="Removing overlapping highlights",
-            )
-            self.merged_tables["BlockRange"] = self.merged_tables["BlockRange"][
-                ~self.merged_tables["BlockRange"]["BlockRangeId"].isin(
-                    overlapping_block_range_ids
-                )
-            ]
-            self.merged_tables["UserMark"] = self.merged_tables["UserMark"][
-                ~self.merged_tables["UserMark"]["UserMarkId"].isin(
-                    overlapping_usermark_ids
-                )
-            ]
-            progress_bar.update(number_of_overlapping_ranges)
-            progress_bar.close()
+        # TODO: Flesh out the overlapping highlights removal to include note merging when necessary
+        # merged_br_df = pd.merge(
+        #     self.merged_tables["BlockRange"],
+        #     self.merged_tables["UserMark"],
+        #     on="UserMarkId",
+        # )
+        # mask = merged_br_df.duplicated(
+        #     subset=["LocationId", "Identifier", "StartToken", "EndToken"], keep="first"
+        # )
+        # overlapping_block_range_ids = merged_br_df.loc[mask, "BlockRangeId"].tolist()
+        # overlapping_usermark_ids = merged_br_df.loc[mask, "UserMarkId"].tolist()
+        # number_of_overlapping_ranges = max(
+        #     len(overlapping_block_range_ids), len(overlapping_usermark_ids)
+        # )
+        # if number_of_overlapping_ranges > 0:
+        #     progress_bar = tqdm(
+        #         total=number_of_overlapping_ranges,
+        #         desc="Removing overlapping highlights",
+        #     )
+        #     self.merged_tables["BlockRange"] = self.merged_tables["BlockRange"][
+        #         ~self.merged_tables["BlockRange"]["BlockRangeId"].isin(
+        #             overlapping_block_range_ids
+        #         )
+        #     ]
+        #     self.merged_tables["UserMark"] = self.merged_tables["UserMark"][
+        #         ~self.merged_tables["UserMark"]["UserMarkId"].isin(
+        #             overlapping_usermark_ids
+        #         )
+        #     ]
+        #     progress_bar.update(number_of_overlapping_ranges)
+        #     progress_bar.close()
 
         if "TagMap" in self.merged_tables:
             tag_map_len = len(self.merged_tables["TagMap"])
