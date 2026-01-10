@@ -243,6 +243,22 @@ class JwlBackupProcessor:
                             new_pk = merged_cursor.lastrowid
                             if old_pk is not None:
                                 self.pk_map[table][old_pk] = new_pk
+                        except sqlite3.IntegrityError as e:
+                            # Special handling for TagMap position conflicts
+                            if table_target == "TagMap" and "TagMap.TagId, TagMap.Position" in str(e):
+                                tag_id = insert_dict.get("TagId")
+                                position = insert_dict.get("Position")
+                                # Shift existing items forward manually to avoid "ORDER BY" syntax requirements in UPDATE
+                                merged_cursor.execute(f"SELECT TagMapId, Position FROM [{table}] WHERE TagId = ? AND Position >= ? ORDER BY Position DESC", (tag_id, position))
+                                for tid, pos in merged_cursor.fetchall():
+                                    merged_cursor.execute(f"UPDATE [{table}] SET Position = ? WHERE TagMapId = ?", (pos + 1, tid))
+                                # Retry insertion
+                                merged_cursor.execute(insert_query, list(insert_dict.values()))
+                                new_pk = merged_cursor.lastrowid
+                                if old_pk is not None:
+                                    self.pk_map[table][old_pk] = new_pk
+                            else:
+                                self.output["errors"].append((table, insert_query, e))
                         except sqlite3.Error as e:
                             self.output["errors"].append((table, insert_query, e))
 
