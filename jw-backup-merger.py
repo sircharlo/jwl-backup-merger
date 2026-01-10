@@ -46,6 +46,7 @@ class JwlBackupProcessor:
         self.fk_map = {}  # {from_table_lower: {from_col_lower: (to_table, to_col)}}
         self.table_name_map = {}  # {table_name_lower: table_name_original}
         self.pk_map = {}  # {table_name: {old_pk: new_pk}}
+        self.note_bases = {}  # {guid: {'title': title, 'content': content, 'last_modified': ts}}
         self.files_to_include_in_archive = []
         self.start_time = 0
 
@@ -101,6 +102,7 @@ class JwlBackupProcessor:
             None
         """
         self.start_time = time()
+        self.note_bases = {}
         
         # Initialize merged_db from first file
         first_db = database_files[0]
@@ -236,11 +238,33 @@ class JwlBackupProcessor:
                             existing_new_pk = res[0]
 
                     if existing_new_pk is not None:
+                        if table_target == "Note":
+                            # Perform intelligent 3-way merge for notes
+                            merged_cursor.execute(f"SELECT Title, Content, LastModified FROM [{table}] WHERE {self.primary_keys[table][0]} = ?", (existing_new_pk,))
+                            current_merged = merged_cursor.fetchone()
+                            
+                            guid = row_dict.get("Guid")
+                            base = self.note_bases.get(guid, {"title": current_merged[0], "content": current_merged[1]})
+                            
+                            new_title = self.merge_text(base.get("title"), current_merged[0], row_dict.get("Title"))
+                            new_content = self.merge_text(base.get("content"), current_merged[1], row_dict.get("Content"))
+                            
+                            # Determine latest LastModified
+                            m_ts = current_merged[2]
+                            s_ts = row_dict.get("LastModified")
+                            latest_ts = s_ts if (not m_ts or (s_ts and s_ts > m_ts)) else m_ts
+                            
+                            merged_cursor.execute(f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE {self.primary_keys[table][0]} = ?", 
+                                                  (new_title, new_content, latest_ts, existing_new_pk))
+
                         if old_pk is not None:
                             self.pk_map[table][old_pk] = existing_new_pk
                     else:
                         # Insert new row
                         insert_dict = row_dict.copy()
+                        if table_target == "Note":
+                            self.note_bases[row_dict.get("Guid")] = {"title": row_dict.get("Title"), "content": row_dict.get("Content")}
+                        
                         if len(self.primary_keys[table]) == 1:
                             pk_name = self.primary_keys[table][0]
                             if isinstance(insert_dict.get(pk_name), int):
@@ -415,6 +439,68 @@ class JwlBackupProcessor:
         print("Find it here:\n- ", output_jwl_file_path)
         print()
         return output_jwl_file_path
+
+    def merge_text(self, base, a, b):
+        """ Perform a 3-way merge on two strings using a common base. """
+        if a == b: return a
+        if not a: return b
+        if not b: return a
+        if not base:
+            if a in b: return b
+            if b in a: return a
+            sep = "\n" if "\n" in a or "\n" in b else " "
+            return a + sep + b
+
+        if a == base: return b
+        if b == base: return a
+
+        # Identify changes in A and B relative to base
+        def get_change(orig, other):
+            i = 0
+            while i < len(orig) and i < len(other) and orig[i] == other[i]:
+                i += 1
+            j = 0
+            while j < (len(orig)-i) and j < (len(other)-i) and orig[-(j+1)] == other[-(j+1)]:
+                j += 1
+            return i, len(orig)-j, other[i:len(other)-j] if j > 0 else other[i:]
+
+        start_a, end_a, content_a = get_change(base, a)
+        start_b, end_b, content_b = get_change(base, b)
+
+        # If changes are non-overlapping, apply both
+        if end_a <= start_b:
+            return base[:start_a] + content_a + base[end_a:start_b] + content_b + base[end_b:]
+        if end_b <= start_a:
+            return base[:start_b] + content_b + base[end_b:start_a] + content_a + base[end_a:]
+
+        # Overlapping changes: use current conservative logic or concatenate
+        # Find common prefix/suffix of all three
+        i = 0
+        while i < len(base) and i < len(a) and i < len(b) and base[i] == a[i] == b[i]:
+            i += 1
+        prefix = base[:i]
+
+        j = 0
+        while j < (len(base)-i) and j < (len(a)-i) and j < (len(b)-i) and base[-(j+1)] == a[-(j+1)] == b[-(j+1)]:
+            j += 1
+        suffix = base[len(base)-j:] if j > 0 else ""
+
+        base_m = base[i:len(base)-j] if j > 0 else base[i:]
+        a_m = a[i:len(a)-j] if j > 0 else a[i:]
+        b_m = b[i:len(b)-j] if j > 0 else b[i:]
+
+        if a_m == base_m:
+            merged_m = b_m
+        elif b_m == base_m:
+            merged_m = a_m
+        else:
+            if a_m in b_m: merged_m = b_m
+            elif b_m in a_m: merged_m = a_m
+            else:
+                sep = "\n" if "\n" in a_m or "\n" in b_m else " "
+                merged_m = a_m + sep + b_m
+
+        return prefix + merged_m + suffix
 
     def cleanTempFiles(self, force=False):
         """ Clean up temporary files 
