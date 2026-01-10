@@ -43,8 +43,8 @@ class JwlBackupProcessor:
         self.debug = args.debug
         self.merged_tables = {}
         self.primary_keys = {}
-        self.foreign_keys = {}
-        self.fk_constraints = {}
+        self.fk_map = {}  # {from_table_lower: {from_col_lower: (to_table, to_col)}}
+        self.table_name_map = {}  # {table_name_lower: table_name_original}
         self.pk_map = {}  # {table_name: {old_pk: new_pk}}
         self.files_to_include_in_archive = []
         self.start_time = 0
@@ -59,8 +59,10 @@ class JwlBackupProcessor:
         cursor = db.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = [table[0] for table in cursor.fetchall()]
-        
+
+        self.fk_map = {}
         for table_name in tables:
+            self.table_name_map[table_name.lower()] = table_name
             # Get PKs
             cursor.execute(f"PRAGMA table_info('{table_name}');")
             columns = cursor.fetchall()
@@ -75,11 +77,11 @@ class JwlBackupProcessor:
                 to_table = fk[2]
                 from_col = fk[3]
                 to_col = fk[4]
-                if to_table not in self.fk_constraints:
-                    self.fk_constraints[to_table] = {}
-                if to_col not in self.fk_constraints[to_table]:
-                    self.fk_constraints[to_table][to_col] = []
-                self.fk_constraints[to_table][to_col].append((table_name, from_col))
+
+                table_lower = table_name.lower()
+                if table_lower not in self.fk_map:
+                    self.fk_map[table_lower] = {}
+                self.fk_map[table_lower][from_col.lower()] = (to_table, to_col)
 
     def process_databases(self, database_files):
         self.start_time = time()
@@ -138,40 +140,81 @@ class JwlBackupProcessor:
         for file_path in tqdm(database_files, desc="Merging databases"):
             source_conn = sqlite3.connect(file_path)
             source_cursor = source_conn.cursor()
-            
-            for table in table_order:
-                if table not in self.primary_keys:
+
+            for table_target in table_order:
+                table = self.table_name_map.get(table_target.lower())
+                if not table or table not in self.primary_keys:
                     continue
-                
+
                 # Get data from source
-                source_cursor.execute(f"SELECT * FROM {table}")
-                cols = [description[0] for description in source_cursor.description]
+                try:
+                    source_cursor.execute(f"SELECT * FROM [{table}]")
+                except sqlite3.Error:
+                    continue  # Table might not exist in this database
+
+                cols_source = [
+                    description[0] for description in source_cursor.description
+                ]
                 rows = source_cursor.fetchall()
-                
+
                 if table not in self.pk_map:
                     self.pk_map[table] = {}
-                
+
+                # Get target column names for consistency
+                merged_cursor.execute(f"PRAGMA table_info([{table}])")
+                cols_target = [col[1] for col in merged_cursor.fetchall()]
+
                 for row in rows:
-                    row_dict = dict(zip(cols, row))
-                    old_pk = row_dict.get(self.primary_keys[table][0]) if self.primary_keys[table] else None
-                    
+                    # Map source row to target schema
+                    row_dict_source = dict(zip(cols_source, row))
+                    row_dict = {}
+                    source_cols_lower = {k.lower(): k for k in row_dict_source.keys()}
+
+                    for col_target in cols_target:
+                        col_source = source_cols_lower.get(col_target.lower())
+                        row_dict[col_target] = (
+                            row_dict_source[col_source] if col_source else None
+                        )
+
+                    old_pk = (
+                        row_dict.get(self.primary_keys[table][0])
+                        if self.primary_keys[table]
+                        else None
+                    )
+
                     # Remap Foreign Keys
-                    for col, val in row_dict.items():
-                        # Check if this column is a FK to another table
-                        for to_table, fks in self.fk_constraints.items():
-                            for to_col, from_fks in fks.items():
-                                for from_table, from_col in from_fks:
-                                    if from_table == table and from_col == col:
-                                        if val in self.pk_map.get(to_table, {}):
-                                            row_dict[col] = self.pk_map[to_table][val]
+                    table_lower = table.lower()
+                    if table_lower in self.fk_map:
+                        for col_name, val in row_dict.items():
+                            col_lower = col_name.lower()
+                            if col_lower in self.fk_map[table_lower]:
+                                to_table, to_col = self.fk_map[table_lower][col_lower]
+                                to_table_canonical = self.table_name_map.get(
+                                    to_table.lower(), to_table
+                                )
+                                if val in self.pk_map.get(to_table_canonical, {}):
+                                    row_dict[col_name] = self.pk_map[to_table_canonical][
+                                        val
+                                    ]
 
                     # Check for duplicates in merged_db
-                    identity_cols = identity_keys.get(table)
+                    identity_cols = identity_keys.get(table_target)
                     existing_new_pk = None
                     if identity_cols:
-                        where_clause = " AND ".join([f"{c} IS ?" if row_dict[c] is None else f"{c} = ?" for c in identity_cols])
-                        query = f"SELECT {self.primary_keys[table][0]} FROM {table} WHERE {where_clause}"
-                        merged_cursor.execute(query, [row_dict[c] for c in identity_cols])
+                        conditions = []
+                        vals = []
+                        for c in identity_cols:
+                            if row_dict.get(c) is None:
+                                conditions.append(f"[{c}] IS ?")
+                            elif table_target == "Tag" and c == "Name":
+                                conditions.append(f"[{c}] = ? COLLATE NOCASE")
+                            else:
+                                conditions.append(f"[{c}] = ?")
+                            vals.append(row_dict.get(c))
+
+                        where_clause = " AND ".join(conditions)
+                        query = f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE {where_clause}"
+                        merged_cursor.execute(query, vals)
                         res = merged_cursor.fetchone()
                         if res:
                             existing_new_pk = res[0]
@@ -181,20 +224,22 @@ class JwlBackupProcessor:
                             self.pk_map[table][old_pk] = existing_new_pk
                     else:
                         # Insert new row
-                        # Only remove PK if it's a single INTEGER PK (likely autoincrement)
-                        # and NOT part of a composite PK
                         insert_dict = row_dict.copy()
                         if len(self.primary_keys[table]) == 1:
                             pk_name = self.primary_keys[table][0]
-                            if isinstance(insert_dict[pk_name], int):
+                            if isinstance(insert_dict.get(pk_name), int):
                                 del insert_dict[pk_name]
-                        
-                        columns = ', '.join(insert_dict.keys())
-                        placeholders = ', '.join(['?'] * len(insert_dict))
-                        insert_query = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
-                        
+
+                        columns = ", ".join([f"[{k}]" for k in insert_dict.keys()])
+                        placeholders = ", ".join(["?"] * len(insert_dict))
+                        insert_query = (
+                            f"INSERT INTO [{table}] ({columns}) VALUES ({placeholders})"
+                        )
+
                         try:
-                            merged_cursor.execute(insert_query, list(insert_dict.values()))
+                            merged_cursor.execute(
+                                insert_query, list(insert_dict.values())
+                            )
                             new_pk = merged_cursor.lastrowid
                             if old_pk is not None:
                                 self.pk_map[table][old_pk] = new_pk
