@@ -56,6 +56,14 @@ class JwlBackupProcessor:
         self.output = {"info": [], "errors": []}
 
     def get_table_info(self, db):
+        """ Get table info from database
+
+        Args:
+            db (sqlite3.Connection): Database connection
+
+        Returns:
+            None
+        """
         cursor = db.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = [table[0] for table in cursor.fetchall()]
@@ -84,6 +92,14 @@ class JwlBackupProcessor:
                 self.fk_map[table_lower][from_col.lower()] = (to_table, to_col)
 
     def process_databases(self, database_files):
+        """ Process databases
+
+        Args:
+            database_files (list): List of database files to process
+
+        Returns:
+            None
+        """
         self.start_time = time()
         
         # Initialize merged_db from first file
@@ -284,26 +300,12 @@ class JwlBackupProcessor:
 
         merged_conn.close()
 
-    def inline_diff(self, a, b):
-        import difflib
-
-        matcher = difflib.SequenceMatcher(None, a, b)
-
-        def process_tag(tag, i1, i2, j1, j2):
-            if tag == "replace":
-                return "{" + matcher.a[i1:i2] + " -> " + matcher.b[j1:j2] + "}"
-            if tag == "delete":
-                return "{- " + matcher.a[i1:i2] + "}"
-            if tag == "equal":
-                return matcher.a[i1:i2]
-            if tag == "insert":
-                return "{+ " + matcher.b[j1:j2] + "}"
-            assert False, "Unknown tag %r" % tag
-
-        return "".join(process_tag(*t) for t in matcher.get_opcodes())
-        conn_merged.close()
-
     def createJwlFile(self):
+        """ Create JWL file from the merged database in the working folder
+
+        Returns:
+            None
+        """
         merged_dir = path.join(self.working_folder, "merged")
         manifest_file_path = path.join(merged_dir, "manifest.json")
         all_unzip_folder_names = list(
@@ -415,6 +417,14 @@ class JwlBackupProcessor:
         return output_jwl_file_path
 
     def cleanTempFiles(self, force=False):
+        """ Clean up temporary files 
+
+        Args:
+            force (bool, optional): Force cleanup. Defaults to False.
+
+        Returns:
+            None
+        """
         if force or (not self.debug and len(self.output["errors"]) == 0):
             if path.isdir(self.working_folder):
                 rmtree(self.working_folder)
@@ -422,12 +432,28 @@ class JwlBackupProcessor:
             print("Cleaned up working directory!")
 
     def unzipFile(self, file_path):
+        """ Unzip a file
+
+        Args:
+            file_path (str): Path to the file to unzip
+
+        Returns:
+            str: Path to the unzipped file
+        """
         basename = path.splitext(path.basename(file_path))[0]
         unzipPath = path.join(self.working_folder, basename)
         unpack_archive(file_path, extract_dir=unzipPath, format="zip")
         return unzipPath
 
     def getFirstDBFile(self, unzipPath):
+        """ Get the first database file in the unzipped folder
+
+        Args:
+            unzipPath (str): Path to the unzipped folder
+
+        Returns:
+            str: Path to the first database file
+        """
         db_files = glob(unzipPath + "/*.db")
         if db_files:
             return db_files[0]
@@ -435,6 +461,11 @@ class JwlBackupProcessor:
             return None
 
     def getJwlFiles(self):
+        """ Get the list of JW Library backup files to merge
+
+        Returns:
+            list: List of JW Library backup database files
+        """
         file_paths = []
         if args.file is not None or args.folder is not None:
             if args.file:
@@ -486,6 +517,14 @@ class JwlBackupProcessor:
         return db_paths
 
     def calculate_sha256(self, file_path):
+        """ Calculate the SHA-256 hash of a file 
+
+        Args:
+            file_path (str): Path to the file to calculate the hash of
+
+        Returns:
+            str: SHA-256 hash of the file
+        """
         import hashlib
 
         hash_sha256 = hashlib.sha256()
