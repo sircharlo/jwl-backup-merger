@@ -159,6 +159,7 @@ class JwlBackupProcessor:
         for file_path in tqdm(database_files, desc="Merging databases"):
             source_conn = sqlite3.connect(file_path)
             source_cursor = source_conn.cursor()
+            skipped_pks = {} # {table: set(old_pk)}
 
             for table_target in table_order:
                 table = self.table_name_map.get(table_target.lower())
@@ -178,6 +179,8 @@ class JwlBackupProcessor:
 
                 if table not in self.pk_map:
                     self.pk_map[table] = {}
+                if table not in skipped_pks:
+                    skipped_pks[table] = set()
 
                 # Get target column names for consistency
                 merged_cursor.execute(f"PRAGMA table_info([{table}])")
@@ -200,6 +203,9 @@ class JwlBackupProcessor:
                         if self.primary_keys[table]
                         else None
                     )
+                    
+                    if old_pk is not None and old_pk in skipped_pks.get(table, set()):
+                        continue
 
                     # Remap Foreign Keys
                     table_lower = table.lower()
@@ -240,7 +246,59 @@ class JwlBackupProcessor:
 
                     if existing_new_pk is not None:
                         # Handle conflicts for specific tables
-                        if table_target in ["UserMark", "BlockRange", "Bookmark", "InputField"]:
+                        if table_target == "UserMark":
+                            # Bundle UserMark with its BlockRanges
+                            merged_cursor.execute(f"SELECT ColorIndex, LocationId FROM [{table}] WHERE UserMarkId = ?", (existing_new_pk,))
+                            curr_color, loc_id = merged_cursor.fetchone()
+                            
+                            # Get current BlockRanges
+                            merged_cursor.execute("SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?", (existing_new_pk,))
+                            curr_ranges = sorted(merged_cursor.fetchall())
+                            
+                            # Get incoming BlockRanges
+                            source_cursor.execute("SELECT BlockRangeId, BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?", (old_pk,))
+                            inc_br_rows = source_cursor.fetchall()
+                            inc_ranges = sorted([r[1:] for r in inc_br_rows])
+                            
+                            inc_color = row_dict.get("ColorIndex")
+                            color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
+                            
+                            if inc_color != curr_color or inc_ranges != curr_ranges:
+                                loc_info = self.get_location_info(merged_cursor, loc_id)
+                                print(f"\nConflict in Highlight at {loc_info}:")
+                                
+                                if inc_color != curr_color:
+                                    print(f"  Color: current='{curr_color} ({color_names.get(curr_color)})' vs incoming='{inc_color} ({color_names.get(inc_color)})'")
+                                if inc_ranges != curr_ranges:
+                                    print(f"  Ranges (BlockType, Id, Start, End):")
+                                    print(f"    current : {curr_ranges}")
+                                    print(f"    incoming: {inc_ranges}")
+                                
+                                choice = ""
+                                while choice not in ["c", "i"]:
+                                    choice = input("Keep (c)urrent or (i)ncoming? ").lower()
+                                
+                                if choice == "i":
+                                    # Update UserMark color
+                                    merged_cursor.execute(f"UPDATE [{table}] SET ColorIndex = ? WHERE UserMarkId = ?", (inc_color, existing_new_pk))
+                                    # Replace BlockRanges
+                                    merged_cursor.execute("DELETE FROM BlockRange WHERE UserMarkId = ?", (existing_new_pk,))
+                                    for br in inc_br_rows:
+                                        # Insert new BlockRange linked to existing_new_pk
+                                        br_dict = dict(zip(["BlockRangeId", "BlockType", "Identifier", "StartToken", "EndToken"], br))
+                                        br_dict["UserMarkId"] = existing_new_pk
+                                        del br_dict["BlockRangeId"]
+                                        cols = ", ".join([f"[{k}]" for k in br_dict.keys()])
+                                        places = ", ".join(["?"] * len(br_dict))
+                                        merged_cursor.execute(f"INSERT INTO BlockRange ({cols}) VALUES ({places})", list(br_dict.values()))
+                                        # We don't need to update pk_map for BR here because we mark them as skipped
+                            
+                            # Mark all incoming BlockRanges as skipped
+                            if "BlockRange" not in skipped_pks: skipped_pks["BlockRange"] = set()
+                            for br in inc_br_rows:
+                                skipped_pks["BlockRange"].add(br[0])
+
+                        elif table_target in ["Bookmark", "InputField"]:
                             # Get existing data
                             merged_cursor.execute(f"SELECT * FROM [{table}] WHERE {self.primary_keys[table][0]} = ?", (existing_new_pk,))
                             current_row = dict(zip(cols_target, merged_cursor.fetchone()))
@@ -254,26 +312,10 @@ class JwlBackupProcessor:
                             
                             if diffs:
                                 # Fetch context for the user
-                                loc_id = None
-                                if table_target == "UserMark":
-                                    loc_id = current_row.get("LocationId")
-                                elif table_target == "BlockRange":
-                                    um_id = current_row.get("UserMarkId")
-                                    merged_cursor.execute("SELECT LocationId FROM UserMark WHERE UserMarkId = ?", (um_id,))
-                                    res_loc = merged_cursor.fetchone()
-                                    loc_id = res_loc[0] if res_loc else None
-                                elif table_target == "Bookmark":
-                                    loc_id = current_row.get("LocationId")
-                                elif table_target == "InputField":
-                                    loc_id = current_row.get("LocationId")
-                                
+                                loc_id = current_row.get("LocationId")
                                 loc_info = self.get_location_info(merged_cursor, loc_id)
                                 print(f"\nConflict in {table_target} at {loc_info}:")
-                                color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
                                 for col, (old_val, new_val) in diffs.items():
-                                    if col == "ColorIndex":
-                                        old_val = f"{old_val} ({color_names.get(old_val, 'unknown')})"
-                                        new_val = f"{new_val} ({color_names.get(new_val, 'unknown')})"
                                     print(f"  {col}: current='{old_val}' vs incoming='{new_val}'")
                                 
                                 choice = ""
@@ -299,27 +341,29 @@ class JwlBackupProcessor:
 
                         elif table_target == "Note":
                             # Perform interactive 3-way merge for notes
-                            merged_cursor.execute(f"SELECT Title, Content, LastModified FROM [{table}] WHERE {self.primary_keys[table][0]} = ?", (existing_new_pk,))
+                            merged_cursor.execute(f"SELECT Title, Content, LastModified, LocationId FROM [{table}] WHERE {self.primary_keys[table][0]} = ?", (existing_new_pk,))
                             current_merged = merged_cursor.fetchone()
-                            curr_title, curr_content, m_ts = current_merged
+                            curr_title, curr_content, m_ts, loc_id = current_merged
                             
                             guid = row_dict.get("Guid")
                             base = self.note_bases.get(guid, {"title": curr_title, "content": curr_content})
                             
-                            inc_title = row_dict.get("Title")
-                            inc_content = row_dict.get("Content")
+                            inc_title = row_dict.get("Title") or ""
+                            inc_content = row_dict.get("Content") or ""
+                            curr_title = curr_title or ""
+                            curr_content = curr_content or ""
                             
                             merged_title = self.merge_text(base.get("title"), curr_title, inc_title)
                             merged_content = self.merge_text(base.get("content"), curr_content, inc_content)
                             
                             if inc_title != curr_title or inc_content != curr_content:
-                                print(f"\nConflict in Note at {self.get_location_info(merged_cursor, None)} (GUID: {guid}):")
+                                print(f"\nConflict in Note at {self.get_location_info(merged_cursor, loc_id)} (GUID: {guid}):")
                                 print(f"  [c]urrent title  : '{curr_title}'")
-                                print(f"  [c]urrent content: '{curr_content[:50]}...'")
+                                print(f"  [c]urrent content: '{curr_content}'")
                                 print(f"  [i]ncoming title : '{inc_title}'")
-                                print(f"  [i]ncoming content: '{inc_content[:50]}...'")
+                                print(f"  [i]ncoming content: '{inc_content}'")
                                 print(f"  [m]erged title   : '{merged_title}'")
-                                print(f"  [m]erged content : '{merged_content[:50]}...'")
+                                print(f"  [m]erged content : '{merged_content}'")
                                 
                                 choice = ""
                                 while choice not in ["c", "i", "m"]:
