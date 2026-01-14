@@ -161,6 +161,7 @@ class JwlBackupProcessor:
             source_conn = sqlite3.connect(file_path)
             source_cursor = source_conn.cursor()
             skipped_pks = {} # {table: set(old_pk)}
+            self.pk_map = {} # Clear for each file to avoid old PK collisions!
 
             for table_target in table_order:
                 table = self.table_name_map.get(table_target.lower())
@@ -186,6 +187,51 @@ class JwlBackupProcessor:
                 # Get target column names for consistency
                 merged_cursor.execute(f"PRAGMA table_info([{table}])")
                 cols_target = [col[1] for col in merged_cursor.fetchall()]
+
+                # Pre-scan this table for conflicts
+                table_conflicts = 0
+                if table_target in ["UserMark", "Bookmark", "InputField", "Note"]:
+                    for row in rows:
+                        # Temporary dict to check identity
+                        temp_row = dict(zip(cols_source, row))
+                        temp_dict = {}
+                        for ct in cols_target:
+                            cs = next((k for k in temp_row if k.lower() == ct.lower()), None)
+                            temp_dict[ct] = temp_row[cs] if cs else None
+                        
+                        # Remap FKs for identity check
+                        table_lower = table.lower()
+                        if table_lower in self.fk_map:
+                            for c_name, val in temp_dict.items():
+                                c_lower = c_name.lower()
+                                if c_lower in self.fk_map[table_lower]:
+                                    t_table, t_col = self.fk_map[table_lower][c_lower]
+                                    t_canonical = self.table_name_map.get(t_table.lower(), t_table)
+                                    if val in self.pk_map.get(t_canonical, {}):
+                                        temp_dict[c_name] = self.pk_map[t_canonical][val]
+                        
+                        # Check identity
+                        id_cols = identity_keys.get(table_target)
+                        if id_cols:
+                            query = f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE " + " AND ".join([f"[{k}] IS ?" for k in id_cols])
+                            merged_cursor.execute(query, [temp_dict.get(k) for k in id_cols])
+                            res = merged_cursor.fetchone()
+                            if res:
+                                # Conflict check
+                                merged_cursor.execute(f"SELECT * FROM [{table}] WHERE {self.primary_keys[table][0]} = ?", (res[0],))
+                                curr = dict(zip(cols_target, merged_cursor.fetchone()))
+                                is_diff = False
+                                for c in temp_dict:
+                                    if c in self.primary_keys[table]: continue
+                                    if table_target == "Note" and c in ["Title", "Content"]:
+                                        if (temp_dict[c] or "") != (curr.get(c) or ""): is_diff = True; break
+                                    elif temp_dict[c] != curr.get(c):
+                                        is_diff = True; break
+                                
+                                if is_diff:
+                                    table_conflicts += 1
+                
+                table_conflict_index = 0
 
                 for row in rows:
                     # Map source row to target schema
@@ -265,8 +311,9 @@ class JwlBackupProcessor:
                             color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
                             
                             if inc_color != curr_color or inc_ranges != curr_ranges:
+                                table_conflict_index += 1
                                 loc_info = self.get_location_info(merged_cursor, loc_id)
-                                print(f"\nConflict in Highlight at {loc_info}:")
+                                print(f"\nConflict {table_conflict_index}/{table_conflicts} in Highlight at {loc_info}:")
                                 
                                 if inc_color != curr_color:
                                     print(f"  Color: current='{curr_color} ({color_names.get(curr_color)})' vs incoming='{inc_color} ({color_names.get(inc_color)})'")
@@ -312,10 +359,11 @@ class JwlBackupProcessor:
                                     diffs[col] = (current_row.get(col), row_dict[col])
                             
                             if diffs:
+                                table_conflict_index += 1
                                 # Fetch context for the user
                                 loc_id = current_row.get("LocationId")
                                 loc_info = self.get_location_info(merged_cursor, loc_id)
-                                print(f"\nConflict in {table_target} at {loc_info}:")
+                                print(f"\nConflict {table_conflict_index}/{table_conflicts} in {table_target} at {loc_info}:")
                                 for col, (old_val, new_val) in diffs.items():
                                     print(f"  {col}: current='{old_val}' vs incoming='{new_val}'")
                                 
@@ -358,8 +406,9 @@ class JwlBackupProcessor:
                             merged_content = self.merge_text(base.get("content"), curr_content, inc_content)
                             
                             if inc_title != curr_title or inc_content != curr_content:
+                                table_conflict_index += 1
                                 loc_info = self.get_location_info(merged_cursor, loc_id)
-                                print(f"\nConflict in Note at {loc_info} (GUID: {guid}):")
+                                print(f"\nConflict {table_conflict_index}/{table_conflicts} in Note at {loc_info} (GUID: {guid}):")
                                 
                                 if inc_title != curr_title:
                                     print("\n--- Title Diff (current vs incoming) ---")
