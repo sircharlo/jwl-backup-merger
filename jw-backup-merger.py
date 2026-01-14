@@ -10,6 +10,7 @@ from shutil import copy2, make_archive, unpack_archive, rmtree
 from time import time
 from tqdm import tqdm
 
+import difflib
 import pandas as pd
 import sqlite3
 
@@ -357,17 +358,31 @@ class JwlBackupProcessor:
                             merged_content = self.merge_text(base.get("content"), curr_content, inc_content)
                             
                             if inc_title != curr_title or inc_content != curr_content:
-                                print(f"\nConflict in Note at {self.get_location_info(merged_cursor, loc_id)} (GUID: {guid}):")
-                                print(f"  [c]urrent title  : '{curr_title}'")
-                                print(f"  [c]urrent content: '{curr_content}'")
-                                print(f"  [i]ncoming title : '{inc_title}'")
-                                print(f"  [i]ncoming content: '{inc_content}'")
-                                print(f"  [m]erged title   : '{merged_title}'")
-                                print(f"  [m]erged content : '{merged_content}'")
+                                loc_info = self.get_location_info(merged_cursor, loc_id)
+                                print(f"\nConflict in Note at {loc_info} (GUID: {guid}):")
+                                
+                                if inc_title != curr_title:
+                                    print("\n--- Title Diff (current vs incoming) ---")
+                                    self.print_diff(curr_title, inc_title)
+
+                                    print("\n--- Auto-merged title ---")
+                                    print(merged_title)
+                                
+                                if inc_content != curr_content:
+                                    print("\n--- Content Diff (current vs incoming) ---")
+                                    self.print_diff(curr_content, inc_content)
+
+                                    print("\n--- Auto-merged content ---")
+                                    print(merged_content)
+                                
+                                print("\nOptions:")
+                                print(f"  [c]urrent")
+                                print(f"  [i]ncoming")
+                                print(f"  [m]erged")
                                 
                                 choice = ""
                                 while choice not in ["c", "i", "m"]:
-                                    choice = input("Keep (c)urrent, (i)ncoming, or (m)erged? ").lower()
+                                    choice = input("\nKeep (c)urrent, (i)ncoming, or (m)erged? ").lower()
                                 
                                 final_title, final_content = curr_title, curr_content
                                 if choice == "i":
@@ -564,6 +579,27 @@ class JwlBackupProcessor:
         print("Find it here:\n- ", output_jwl_file_path)
         print()
         return output_jwl_file_path
+
+    def print_diff(self, a, b):
+        """ Print a colored diff between two strings. """
+        a_lines = (a or "").splitlines()
+        b_lines = (b or "").splitlines()
+        
+        # Color codes
+        RED = "\033[91m"
+        GREEN = "\033[92m"
+        RESET = "\033[0m"
+        
+        diff = difflib.ndiff(a_lines, b_lines)
+        for line in diff:
+            if line.startswith("+ "):
+                print(f"{GREEN}{line}{RESET}")
+            elif line.startswith("- "):
+                print(f"{RED}{line}{RESET}")
+            elif line.startswith("? "):
+                continue
+            else:
+                print(line)
 
     def get_location_info(self, cursor, location_id):
         """ Get formatted location info for display """
