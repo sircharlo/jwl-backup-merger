@@ -139,7 +139,7 @@ class JwlBackupProcessor:
 
         # Deduplication Identity Keys
         identity_keys = {
-            "Location": ["BookNumber", "ChapterNumber", "DocumentId", "Track", "IssueTagNumber", "KeySymbol", "MepsLanguage", "Type"],
+            "Location": ["BookNumber", "ChapterNumber", "DocumentId", "Track", "IssueTagNumber", "KeySymbol", "MepsLanguage", "Type", "Title"],
             "Tag": ["Type", "Name"],
             "IndependentMedia": ["Hash"],
             "PlaylistItemAccuracy": ["Description"],
@@ -147,6 +147,7 @@ class JwlBackupProcessor:
             "UserMark": ["UserMarkGuid"],
             "Note": ["Guid"],
             "Bookmark": ["PublicationLocationId", "Slot"],
+            "BlockRange": ["BlockType", "Identifier", "UserMarkId"],
             "InputField": ["LocationId", "TextTag"],
             "TagMap": ["TagId", "PlaylistItemId", "LocationId", "NoteId"],
             "PlaylistItemIndependentMediaMap": ["PlaylistItemId", "IndependentMediaId"],
@@ -238,24 +239,104 @@ class JwlBackupProcessor:
                             existing_new_pk = res[0]
 
                     if existing_new_pk is not None:
-                        if table_target == "Note":
-                            # Perform intelligent 3-way merge for notes
+                        # Handle conflicts for specific tables
+                        if table_target in ["UserMark", "BlockRange", "Bookmark", "InputField"]:
+                            # Get existing data
+                            merged_cursor.execute(f"SELECT * FROM [{table}] WHERE {self.primary_keys[table][0]} = ?", (existing_new_pk,))
+                            current_row = dict(zip(cols_target, merged_cursor.fetchone()))
+                            
+                            # Compare relevant fields
+                            diffs = {}
+                            for col in row_dict:
+                                if col in self.primary_keys[table]: continue
+                                if row_dict[col] != current_row.get(col):
+                                    diffs[col] = (current_row.get(col), row_dict[col])
+                            
+                            if diffs:
+                                # Fetch context for the user
+                                loc_id = None
+                                if table_target == "UserMark":
+                                    loc_id = current_row.get("LocationId")
+                                elif table_target == "BlockRange":
+                                    um_id = current_row.get("UserMarkId")
+                                    merged_cursor.execute("SELECT LocationId FROM UserMark WHERE UserMarkId = ?", (um_id,))
+                                    res_loc = merged_cursor.fetchone()
+                                    loc_id = res_loc[0] if res_loc else None
+                                elif table_target == "Bookmark":
+                                    loc_id = current_row.get("LocationId")
+                                elif table_target == "InputField":
+                                    loc_id = current_row.get("LocationId")
+                                
+                                loc_info = self.get_location_info(merged_cursor, loc_id)
+                                print(f"\nConflict in {table_target} at {loc_info}:")
+                                color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
+                                for col, (old_val, new_val) in diffs.items():
+                                    if col == "ColorIndex":
+                                        old_val = f"{old_val} ({color_names.get(old_val, 'unknown')})"
+                                        new_val = f"{new_val} ({color_names.get(new_val, 'unknown')})"
+                                    print(f"  {col}: current='{old_val}' vs incoming='{new_val}'")
+                                
+                                choice = ""
+                                options = ["c", "i"]
+                                if table_target == "InputField":
+                                    options.append("m")
+                                    merged_val = self.merge_text(None, current_row.get("Value"), row_dict.get("Value"))
+                                    print(f"  Merged value: '{merged_val}'")
+                                
+                                prompt = f"Keep (c)urrent, (i)ncoming?"
+                                if "m" in options: prompt = f"Keep (c)urrent, (i)ncoming, or (m)erged?"
+                                
+                                while choice not in options:
+                                    choice = input(f"{prompt} ").lower()
+                                
+                                if choice == "i":
+                                    update_cols = ", ".join([f"[{k}] = ?" for k in diffs.keys()])
+                                    merged_cursor.execute(f"UPDATE [{table}] SET {update_cols} WHERE {self.primary_keys[table][0]} = ?", 
+                                                          list(row_dict[k] for k in diffs.keys()) + [existing_new_pk])
+                                elif choice == "m" and table_target == "InputField":
+                                    merged_cursor.execute(f"UPDATE [{table}] SET Value = ? WHERE {self.primary_keys[table][0]} = ?", 
+                                                          (merged_val, existing_new_pk))
+
+                        elif table_target == "Note":
+                            # Perform interactive 3-way merge for notes
                             merged_cursor.execute(f"SELECT Title, Content, LastModified FROM [{table}] WHERE {self.primary_keys[table][0]} = ?", (existing_new_pk,))
                             current_merged = merged_cursor.fetchone()
+                            curr_title, curr_content, m_ts = current_merged
                             
                             guid = row_dict.get("Guid")
-                            base = self.note_bases.get(guid, {"title": current_merged[0], "content": current_merged[1]})
+                            base = self.note_bases.get(guid, {"title": curr_title, "content": curr_content})
                             
-                            new_title = self.merge_text(base.get("title"), current_merged[0], row_dict.get("Title"))
-                            new_content = self.merge_text(base.get("content"), current_merged[1], row_dict.get("Content"))
+                            inc_title = row_dict.get("Title")
+                            inc_content = row_dict.get("Content")
                             
-                            # Determine latest LastModified
-                            m_ts = current_merged[2]
-                            s_ts = row_dict.get("LastModified")
-                            latest_ts = s_ts if (not m_ts or (s_ts and s_ts > m_ts)) else m_ts
+                            merged_title = self.merge_text(base.get("title"), curr_title, inc_title)
+                            merged_content = self.merge_text(base.get("content"), curr_content, inc_content)
                             
-                            merged_cursor.execute(f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE {self.primary_keys[table][0]} = ?", 
-                                                  (new_title, new_content, latest_ts, existing_new_pk))
+                            if inc_title != curr_title or inc_content != curr_content:
+                                print(f"\nConflict in Note at {self.get_location_info(merged_cursor, None)} (GUID: {guid}):")
+                                print(f"  [c]urrent title  : '{curr_title}'")
+                                print(f"  [c]urrent content: '{curr_content[:50]}...'")
+                                print(f"  [i]ncoming title : '{inc_title}'")
+                                print(f"  [i]ncoming content: '{inc_content[:50]}...'")
+                                print(f"  [m]erged title   : '{merged_title}'")
+                                print(f"  [m]erged content : '{merged_content[:50]}...'")
+                                
+                                choice = ""
+                                while choice not in ["c", "i", "m"]:
+                                    choice = input("Keep (c)urrent, (i)ncoming, or (m)erged? ").lower()
+                                
+                                final_title, final_content = curr_title, curr_content
+                                if choice == "i":
+                                    final_title, final_content = inc_title, inc_content
+                                elif choice == "m":
+                                    final_title, final_content = merged_title, merged_content
+                                
+                                # Determine latest LastModified
+                                s_ts = row_dict.get("LastModified")
+                                latest_ts = s_ts if (not m_ts or (s_ts and s_ts > m_ts)) else m_ts
+                                
+                                merged_cursor.execute(f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE {self.primary_keys[table][0]} = ?", 
+                                                      (final_title, final_content, latest_ts, existing_new_pk))
 
                         if old_pk is not None:
                             self.pk_map[table][old_pk] = existing_new_pk
@@ -439,6 +520,23 @@ class JwlBackupProcessor:
         print("Find it here:\n- ", output_jwl_file_path)
         print()
         return output_jwl_file_path
+
+    def get_location_info(self, cursor, location_id):
+        """ Get formatted location info for display """
+        if not location_id: return "Unknown Location"
+        cursor.execute("SELECT BookNumber, ChapterNumber, DocumentId, Title, KeySymbol, IssueTagNumber, MepsLanguage FROM Location WHERE LocationId = ?", (location_id,))
+        row = cursor.fetchone()
+        if not row: return f"Location ID {location_id}"
+        book, chapter, doc, title, keysym, issue, lang = row
+        info = []
+        if title: info.append(title)
+        if keysym: info.append(f"{keysym}")
+        if issue: info.append(f"{issue}")
+        if lang: info.append(f"Lang {lang}")
+        if book: info.append(f"Book {book}")
+        if chapter: info.append(f"Ch. {chapter}")
+        if not keysym and doc: info.append(f"Doc {doc}")
+        return " - ".join(info) if info else f"Location {location_id}"
 
     def merge_text(self, base, a, b):
         """ Perform a 3-way merge on two strings using a common base. """
