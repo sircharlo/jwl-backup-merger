@@ -606,9 +606,7 @@ class JwlBackupProcessor:
                                     loc_res = merged_cursor.fetchone()
                                     if loc_res and loc_res[0]:
                                         doc_id, lang = loc_res
-                                        print(
-                                            f"  Fetching text context from JW.org... Language: {lang}"
-                                        )
+                                        print("  Fetching text context from JW.org...")
                                 except Exception as e:
                                     print(f"Error fetching document info: {e}")
                                     pass
@@ -1181,10 +1179,21 @@ class JwlBackupProcessor:
         self, docid, identifier, start_token, end_token, meps_lang_code="0"
     ):
         """Fetch content from JW.org and extract highlighted text based on tokens."""
-        lang_code = LANGUAGES.get(str(meps_lang_code)).get("Symbol")
-        if lang_code is None:
+        # Convert to int for dictionary lookup
+        try:
+            lang_key = int(meps_lang_code) if meps_lang_code is not None else 0
+        except (ValueError, TypeError):
+            lang_key = 0
+
+        lang_info = LANGUAGES.get(lang_key)
+        if lang_info is None:
             print(f"Invalid language code: {meps_lang_code}")
-            return ""
+            return None
+
+        lang_code = lang_info.get("Symbol")
+        if lang_code is None:
+            print(f"No symbol found for language code: {meps_lang_code}")
+            return None
 
         if (docid, lang_code) in self.doc_cache:
             html_content = self.doc_cache[(docid, lang_code)]
