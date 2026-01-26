@@ -25,6 +25,55 @@ parser.add_argument("--file", type=str, help="JWL file to merge", action="append
 args = parser.parse_args()
 
 
+class PExtractor(HTMLParser):
+    def __init__(self, pid=None):
+        super().__init__()
+        self.pid = str(pid) if pid is not None else None
+        self.found = pid is None  # Always found if no pid requested
+        self.in_parNum = False
+        self.in_verseNum = False
+        self.in_chapterNum = False
+        self.text = ""
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if tag == "p" and self.pid is not None:
+            # data-pid matches Identifier
+            if d.get("data-pid") == self.pid:
+                self.found = True
+        elif self.found:
+            classes = d.get("class", "").split()
+            if tag == "span" or tag == "sup":
+                if "parNum" in classes:
+                    self.in_parNum = True
+                if "verseNum" in classes:
+                    self.in_verseNum = True
+                if "chapterNum" in classes:
+                    self.in_chapterNum = True
+
+    def handle_endtag(self, tag):
+        if tag == "p" and self.pid is not None and self.found:
+            self.found = False
+        elif tag == "span" or tag == "sup":
+            if self.in_parNum:
+                self.in_parNum = False
+            if self.in_verseNum:
+                self.in_verseNum = False
+            if self.in_chapterNum:
+                self.in_chapterNum = False
+
+    def handle_data(self, data):
+        if (
+            self.found
+            and not self.in_parNum
+            and not self.in_verseNum
+            and not self.in_chapterNum
+        ):
+            data = data.replace("·", "")
+            if data:
+                self.text += data
+
+
 if args.folder is not None and not path.exists(args.folder):
     print(f"Folder not found: {args.folder}\nPlease validate the path.")
     exit()
@@ -61,6 +110,13 @@ class JwlBackupProcessor:
 
         self.output = {"info": [], "errors": []}
         self.doc_cache = {}
+        self.bible_api_cache = {}  # {lang_code: bible_data_api_path}
+        self.conflict_cache = {
+            "UserMark": {},  # {conflict_key: chosen_signature}
+            "Note": {},  # {conflict_key: choice}
+            "Bookmark": {},  # {conflict_key: choice}
+            "InputField": {},  # {conflict_key: choice}
+        }
 
     def get_table_info(self, db):
         """Get table info from database
@@ -212,126 +268,8 @@ class JwlBackupProcessor:
                 table_conflicts = 0
                 table_automerged = 0
 
-                # For UserMark, we need to pre-scan for overlaps and check signatures
-                if table_target == "UserMark":
-                    for row in rows:
-                        temp_row = dict(zip(cols_source, row))
-                        temp_dict = {}
-                        for ct in cols_target:
-                            cs = next(
-                                (k for k in temp_row if k.lower() == ct.lower()), None
-                            )
-                            temp_dict[ct] = temp_row[cs] if cs else None
-
-                        # Remap FKs
-                        table_lower = table.lower()
-                        if table_lower in self.fk_map:
-                            for c_name, val in temp_dict.items():
-                                c_lower = c_name.lower()
-                                if c_lower in self.fk_map[table_lower]:
-                                    t_table, t_col = self.fk_map[table_lower][c_lower]
-                                    t_canonical = self.table_name_map.get(
-                                        t_table.lower(), t_table
-                                    )
-                                    if val in self.pk_map.get(t_canonical, {}):
-                                        temp_dict[c_name] = self.pk_map[t_canonical][
-                                            val
-                                        ]
-
-                        old_pk = temp_dict.get(self.primary_keys[table][0])
-                        loc_id = temp_dict.get("LocationId")
-
-                        # Check for existing match or overlap
-                        id_cols = identity_keys.get(table_target)
-                        existing_new_pk = None
-                        if id_cols:
-                            query = (
-                                f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE "
-                                + " AND ".join([f"[{k}] IS ?" for k in id_cols])
-                            )
-                            merged_cursor.execute(
-                                query, [temp_dict.get(k) for k in id_cols]
-                            )
-                            res = merged_cursor.fetchone()
-                            if res:
-                                existing_new_pk = res[0]
-
-                        # Get incoming ranges
-                        source_cursor.execute(
-                            "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                            (old_pk,),
-                        )
-                        inc_ranges = sorted(source_cursor.fetchall())
-                        inc_color = temp_dict.get("ColorIndex")
-
-                        if not inc_ranges:
-                            continue
-
-                        # Check for overlaps
-                        overlap_pks = self.check_overlap(
-                            merged_cursor,
-                            loc_id,
-                            inc_ranges,
-                            exclude_usermark_id=existing_new_pk,
-                        )
-
-                        if existing_new_pk or overlap_pks:
-                            # Simulate the grouping logic
-                            all_highlights = []
-
-                            if existing_new_pk:
-                                merged_cursor.execute(
-                                    f"SELECT ColorIndex FROM [{table}] WHERE UserMarkId = ?",
-                                    (existing_new_pk,),
-                                )
-                                curr_res = merged_cursor.fetchone()
-                                if curr_res:
-                                    merged_cursor.execute(
-                                        "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                        (existing_new_pk,),
-                                    )
-                                    curr_ranges = sorted(merged_cursor.fetchall())
-                                    all_highlights.append(
-                                        {
-                                            "color": curr_res[0],
-                                            "ranges": tuple(curr_ranges),
-                                        }
-                                    )
-
-                            all_highlights.append(
-                                {"color": inc_color, "ranges": tuple(inc_ranges)}
-                            )
-
-                            for ov_pk in overlap_pks:
-                                merged_cursor.execute(
-                                    "SELECT ColorIndex FROM UserMark WHERE UserMarkId = ?",
-                                    (ov_pk,),
-                                )
-                                ov_res = merged_cursor.fetchone()
-                                if ov_res:
-                                    merged_cursor.execute(
-                                        "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                        (ov_pk,),
-                                    )
-                                    ov_ranges = sorted(merged_cursor.fetchall())
-                                    all_highlights.append(
-                                        {"color": ov_res[0], "ranges": tuple(ov_ranges)}
-                                    )
-
-                            # Group by signature
-                            signatures = set()
-                            for hl in all_highlights:
-                                sig = (hl["color"], hl["ranges"])
-                                signatures.add(sig)
-
-                            # If more than one unique signature, it's a user-facing conflict
-                            if len(signatures) > 1:
-                                table_conflicts += 1
-                            else:
-                                # Will be auto-merged
-                                table_automerged += 1
-
-                elif table_target in ["Bookmark", "InputField", "Note"]:
+                # Pre-scan (non-UserMark tables)
+                if table_target in ["Bookmark", "InputField", "Note"]:
                     for row in rows:
                         # Temporary dict to check identity
                         temp_row = dict(zip(cols_source, row))
@@ -396,6 +334,533 @@ class JwlBackupProcessor:
                 table_conflict_index = 0
                 automerge_stats_shown = False
 
+                # Special handling for UserMark: process location by location
+                if table_target == "UserMark":
+                    # Group incoming UserMarks by LocationId
+                    loc_to_usermarks = {}
+                    for row in rows:
+                        row_dict_source = dict(zip(cols_source, row))
+                        loc_id = row_dict_source.get("LocationId")
+                        if loc_id not in loc_to_usermarks:
+                            loc_to_usermarks[loc_id] = []
+                        loc_to_usermarks[loc_id].append(row_dict_source)
+
+                    for loc_id, incoming_rows in loc_to_usermarks.items():
+                        # We need to simulate the grouping to get counts
+                        # 1. Get existing
+                        merged_cursor.execute(
+                            "SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?",
+                            (loc_id,),
+                        )
+                        existing_usermarks = merged_cursor.fetchall()
+                        all_highlights = []
+                        for um_id, color in existing_usermarks:
+                            merged_cursor.execute(
+                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                                (um_id,),
+                            )
+                            ranges = sorted(merged_cursor.fetchall())
+                            all_highlights.append(
+                                {"color": color, "ranges": ranges, "source": "current"}
+                            )
+                        # 2. Add incoming
+                        for row_dict_source in incoming_rows:
+                            old_pk = row_dict_source.get(self.primary_keys[table][0])
+                            source_cursor.execute(
+                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                                (old_pk,),
+                            )
+                            inc_ranges = sorted(source_cursor.fetchall())
+                            inc_color = row_dict_source.get("ColorIndex")
+                            all_highlights.append(
+                                {
+                                    "color": inc_color,
+                                    "ranges": inc_ranges,
+                                    "source": "incoming",
+                                }
+                            )
+
+                        # 3. Find components
+                        num_hl = len(all_highlights)
+                        adj = {i: set() for i in range(num_hl)}
+                        for i in range(num_hl):
+                            for j in range(i + 1, num_hl):
+                                h1, h2 = all_highlights[i], all_highlights[j]
+                                same_sig = (
+                                    h1["color"] == h2["color"]
+                                    and h1["ranges"] == h2["ranges"]
+                                )
+                                overlap = False
+                                if not same_sig:
+                                    for r1 in h1["ranges"]:
+                                        for r2 in h2["ranges"]:
+                                            if r1[0] == r2[0] and r1[1] == r2[1]:
+                                                if r1[2] < r2[3] and r2[2] < r1[3]:
+                                                    overlap = True
+                                                    break
+                                        if overlap:
+                                            break
+                                if same_sig or overlap:
+                                    adj[i].add(j)
+                                    adj[j].add(i)
+
+                        visited = set()
+                        for i in range(num_hl):
+                            if i not in visited:
+                                comp = []
+                                stack = [i]
+                                visited.add(i)
+                                sigs = set()
+                                has_current = False
+                                while stack:
+                                    curr = stack.pop()
+                                    hl = all_highlights[curr]
+                                    sigs.add((hl["color"], tuple(hl["ranges"])))
+                                    if hl["source"] == "current":
+                                        has_current = True
+                                    for neighbor in adj[curr]:
+                                        if neighbor not in visited:
+                                            visited.add(neighbor)
+                                            stack.append(neighbor)
+                                if len(sigs) > 1:
+                                    table_conflicts += 1
+                                elif len(all_highlights) > 1 and has_current:
+                                    # This logic is a bit simplified but good enough for counting automerge
+                                    # (multiple highlights in component but all same signature)
+                                    # Wait, if sigs is 1 but we have multiple highlights, it's automerge
+                                    # IF there's at least one current to merge into.
+                                    table_automerged += 1
+
+                    # Sort locations (optional, but keep it ordered like before if possible)
+                    source_cursor.execute("SELECT LocationId, KeySymbol FROM Location")
+                    loc_symbol_map = {
+                        r[0]: (r[1] or "") for r in source_cursor.fetchall()
+                    }
+                    sorted_loc_ids = sorted(
+                        loc_to_usermarks.keys(),
+                        key=lambda lid: loc_symbol_map.get(lid, ""),
+                    )
+
+                    for loc_id in sorted_loc_ids:
+                        incoming_rows = loc_to_usermarks[loc_id]
+
+                        # Get all existing highlights at this location in merged DB
+                        merged_cursor.execute(
+                            "SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?",
+                            (loc_id,),
+                        )
+                        existing_usermarks = merged_cursor.fetchall()
+                        all_highlights = []
+
+                        # Add existing highlights
+                        for um_id, color in existing_usermarks:
+                            merged_cursor.execute(
+                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                                (um_id,),
+                            )
+                            ranges = sorted(merged_cursor.fetchall())
+                            all_highlights.append(
+                                {
+                                    "usermark_id": um_id,
+                                    "color": color,
+                                    "ranges": ranges,
+                                    "source": "current",
+                                }
+                            )
+
+                        # Add all incoming highlights for this location
+                        for row_dict_source in incoming_rows:
+                            # Map source row to target schema
+                            row_dict = {}
+                            source_cols_lower = {
+                                k.lower(): k for k in row_dict_source.keys()
+                            }
+                            for col_target in cols_target:
+                                col_source = source_cols_lower.get(col_target.lower())
+                                row_dict[col_target] = (
+                                    row_dict_source[col_source] if col_source else None
+                                )
+
+                            old_pk = row_dict_source.get(self.primary_keys[table][0])
+
+                            # Fetch incoming ranges
+                            source_cursor.execute(
+                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                                (old_pk,),
+                            )
+                            inc_ranges = sorted(source_cursor.fetchall())
+                            inc_color = row_dict.get("ColorIndex")
+
+                            all_highlights.append(
+                                {
+                                    "usermark_id": old_pk,
+                                    "color": inc_color,
+                                    "ranges": inc_ranges,
+                                    "source": "incoming",
+                                    "row_dict": row_dict,
+                                }
+                            )
+
+                        # Group by actual overlap or identical signature within this location
+                        # Two highlights have an edge if they overlap OR have same signature
+                        num_hl = len(all_highlights)
+                        adj = {i: set() for i in range(num_hl)}
+                        for i in range(num_hl):
+                            for j in range(i + 1, num_hl):
+                                h1, h2 = all_highlights[i], all_highlights[j]
+                                # Check identical signature
+                                same_sig = (
+                                    h1["color"] == h2["color"]
+                                    and h1["ranges"] == h2["ranges"]
+                                )
+                                # Check overlap
+                                overlap = False
+                                if not same_sig:
+                                    for r1 in h1["ranges"]:
+                                        for r2 in h2["ranges"]:
+                                            # BlockType, Identifier match
+                                            if r1[0] == r2[0] and r1[1] == r2[1]:
+                                                # Token overlap
+                                                if r1[2] < r2[3] and r2[2] < r1[3]:
+                                                    overlap = True
+                                                    break
+                                        if overlap:
+                                            break
+                                if same_sig or overlap:
+                                    adj[i].add(j)
+                                    adj[j].add(i)
+
+                        # Find connected components
+                        visited = set()
+                        hl_components = []
+                        for i in range(num_hl):
+                            if i not in visited:
+                                comp = []
+                                stack = [i]
+                                visited.add(i)
+                                while stack:
+                                    curr = stack.pop()
+                                    comp.append(all_highlights[curr])
+                                    for neighbor in adj[curr]:
+                                        if neighbor not in visited:
+                                            visited.add(neighbor)
+                                            stack.append(neighbor)
+                                hl_components.append(comp)
+
+                        for comp_highlights in hl_components:
+                            # Group by unique signature (color + ranges) within this component
+                            signature_groups = {}  # {(color, tuple(ranges)): [highlight_dicts]}
+                            for hl in comp_highlights:
+                                sig = (hl["color"], tuple(hl["ranges"]))
+                                if sig not in signature_groups:
+                                    signature_groups[sig] = []
+                                signature_groups[sig].append(hl)
+
+                            # Check if we need user input
+                            needs_user_input = len(signature_groups) > 1
+
+                            if needs_user_input:
+                                # Show automerge statistics once
+                                if not automerge_stats_shown and table_automerged > 0:
+                                    print(
+                                        f"\n  Automerged {table_automerged} identical highlight(s)"
+                                    )
+                                    print(
+                                        f"  {table_conflicts} conflict(s) require your input\n"
+                                    )
+                                    automerge_stats_shown = True
+
+                                table_conflict_index += 1
+                                loc_info = self.get_location_info(merged_cursor, loc_id)
+                                print(
+                                    f"\nConflict {table_conflict_index}/{table_conflicts} in Highlight at {loc_info}:"
+                                )
+                                print(
+                                    f"  Found {len(comp_highlights)} highlight(s) with {len(signature_groups)} unique variant(s)"
+                                )
+
+                                color_names = {
+                                    1: "yellow",
+                                    2: "green",
+                                    3: "blue",
+                                    4: "red",
+                                    5: "orange",
+                                    6: "purple",
+                                }
+                                color_codes = {
+                                    1: "\033[93m",
+                                    2: "\033[92m",
+                                    3: "\033[94m",
+                                    4: "\033[91m",
+                                    5: "\033[38;5;208m",
+                                    6: "\033[95m",
+                                }
+                                RESET = "\033[0m"
+
+                                # Fetch text context info
+                                doc_id, lang, keysym, book, chapter = (
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                try:
+                                    merged_cursor.execute(
+                                        "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+                                        (loc_id,),
+                                    )
+                                    loc_res = merged_cursor.fetchone()
+                                    if loc_res:
+                                        doc_id, lang, keysym, book, chapter = loc_res
+                                        print("  Fetching text context from JW.org...")
+                                except Exception as e:
+                                    print(f"Error fetching text context: {e}")
+                                    pass
+
+                                # Display options
+                                options = []
+                                for idx, (sig, group) in enumerate(
+                                    signature_groups.items(), 1
+                                ):
+                                    color, ranges = sig
+                                    sources = []
+                                    for hl in group:
+                                        if hl["source"] not in sources:
+                                            sources.append(hl["source"])
+
+                                    color_name = color_names.get(
+                                        color, f"color_{color}"
+                                    )
+                                    color_code = color_codes.get(color, "")
+
+                                    print(
+                                        f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
+                                    )
+
+                                    # Fetch text
+                                    text = None
+                                    if doc_id or (keysym and book and chapter):
+                                        try:
+                                            full_text = []
+                                            for r in ranges:
+                                                txt = self.get_highlighted_text(
+                                                    doc_id,
+                                                    r[1],
+                                                    r[2],
+                                                    r[3],
+                                                    lang,
+                                                    keysym,
+                                                    book,
+                                                    chapter,
+                                                )
+                                                if txt is None:
+                                                    text = None
+                                                    break
+                                                full_text.append(txt)
+                                            if full_text and None not in full_text:
+                                                text = " [...] ".join(full_text)
+                                        except Exception as e:
+                                            print(f"Error fetching text: {e}")
+                                            text = None
+
+                                    if text:
+                                        print(f"    Text: {color_code}'{text}'{RESET}")
+                                    else:
+                                        print("    (Text unavailable)")
+                                        print(f"    Ranges: {list(ranges)}")
+
+                                    options.append(
+                                        {
+                                            "color": color,
+                                            "ranges": ranges,
+                                            "highlights": group,
+                                        }
+                                    )
+
+                                conflict_key = (
+                                    (doc_id, lang, keysym, book, chapter),
+                                    tuple(sorted(signature_groups.keys())),
+                                )
+                                chosen_option = None
+                                if conflict_key in self.conflict_cache["UserMark"]:
+                                    chosen_sig = self.conflict_cache["UserMark"][
+                                        conflict_key
+                                    ]
+                                    chosen_option = next(
+                                        (
+                                            o
+                                            for o in options
+                                            if (o["color"], tuple(o["ranges"]))
+                                            == chosen_sig
+                                        ),
+                                        None,
+                                    )
+                                    if chosen_option:
+                                        print(
+                                            f"  (Using previously resolved choice: Option {options.index(chosen_option) + 1})"
+                                        )
+
+                                if not chosen_option:
+                                    choice_idx = None
+                                    while choice_idx is None:
+                                        try:
+                                            choice_str = input(
+                                                f"\n  Choose option (1-{len(options)}): "
+                                            ).strip()
+                                            choice_idx = int(choice_str)
+                                            if choice_idx < 1 or choice_idx > len(
+                                                options
+                                            ):
+                                                choice_idx = None
+                                        except ValueError:
+                                            pass
+
+                                    chosen_option = options[choice_idx - 1]
+                                    self.conflict_cache["UserMark"][conflict_key] = (
+                                        chosen_option["color"],
+                                        tuple(chosen_option["ranges"]),
+                                    )
+                            else:
+                                # Auto-merge or single variant
+                                if len(comp_highlights) > 1 and any(
+                                    h["source"] == "current" for h in comp_highlights
+                                ):
+                                    table_automerged += 1
+                                chosen_hl_proto = list(signature_groups.values())[0][0]
+                                chosen_option = {
+                                    "color": chosen_hl_proto["color"],
+                                    "ranges": chosen_hl_proto["ranges"],
+                                    "highlights": list(signature_groups.values())[0],
+                                }
+
+                            # Apply the chosen option
+                            # 1. Choose a lead UserMarkId from the chosen group
+                            lead_usermark_id = None
+                            # Prefer existing highlight if it's in the chosen group
+                            for hl in chosen_option["highlights"]:
+                                if hl["source"] == "current":
+                                    lead_usermark_id = hl["usermark_id"]
+                                    break
+                            if not lead_usermark_id:
+                                # If no existing highlight matches, we'll need to create/keep one incoming
+                                lead_usermark_id = chosen_option["highlights"][0][
+                                    "usermark_id"
+                                ]
+
+                            # 2. Remap ALL highlights in this component to the lead_usermark_id in our map
+                            for hl in comp_highlights:
+                                if hl["source"] == "incoming":
+                                    self.pk_map[table][hl["usermark_id"]] = (
+                                        lead_usermark_id
+                                    )
+
+                            # 3. Handle Merged DB cleanup and update
+                            # Remove all existing UserMarks in this COMPONENT that were NOT chosen
+                            comp_existing_ids = [
+                                hl["usermark_id"]
+                                for hl in comp_highlights
+                                if hl["source"] == "current"
+                            ]
+                            for um_id in comp_existing_ids:
+                                if um_id != lead_usermark_id:
+                                    # Remap references in Note table
+                                    merged_cursor.execute(
+                                        "UPDATE Note SET UserMarkId = ? WHERE UserMarkId = ?",
+                                        (lead_usermark_id, um_id),
+                                    )
+                                    # Delete BlockRanges
+                                    merged_cursor.execute(
+                                        "DELETE FROM BlockRange WHERE UserMarkId = ?",
+                                        (um_id,),
+                                    )
+                                    # Delete UserMark
+                                    merged_cursor.execute(
+                                        "DELETE FROM UserMark WHERE UserMarkId = ?",
+                                        (um_id,),
+                                    )
+
+                            # 4. If lead is incoming, we need to insert it (if not already there)
+                            if lead_usermark_id not in comp_existing_ids:
+                                # Insert the chosen incoming highlight
+                                chosen_hl = next(
+                                    hl
+                                    for hl in chosen_option["highlights"]
+                                    if hl["usermark_id"] == lead_usermark_id
+                                )
+                                row_dict = chosen_hl["row_dict"]
+
+                                # Clean PK
+                                insert_dict = row_dict.copy()
+                                pk_name = self.primary_keys[table][0]
+                                if isinstance(insert_dict.get(pk_name), int):
+                                    del insert_dict[pk_name]
+
+                                columns_str = ", ".join(
+                                    [f"[{k}]" for k in insert_dict.keys()]
+                                )
+                                placeholders = ", ".join(["?"] * len(insert_dict))
+                                merged_cursor.execute(
+                                    f"INSERT INTO [{table}] ({columns_str}) VALUES ({placeholders})",
+                                    list(insert_dict.values()),
+                                )
+                                new_pk = merged_cursor.lastrowid
+                                # Re-map all that were pointing to the temporary old_pk in this component
+                                for hl in comp_highlights:
+                                    if (
+                                        hl["source"] == "incoming"
+                                        and self.pk_map[table][hl["usermark_id"]]
+                                        == lead_usermark_id
+                                    ):
+                                        self.pk_map[table][hl["usermark_id"]] = new_pk
+
+                                lead_usermark_id = new_pk
+
+                                # Insert ranges for the new lead
+                                source_cursor.execute(
+                                    "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                                    (chosen_hl["usermark_id"],),
+                                )
+                                for br in source_cursor.fetchall():
+                                    merged_cursor.execute(
+                                        "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
+                                        list(br) + [lead_usermark_id],
+                                    )
+                            else:
+                                # Lead is already in DB, just ensure its color matches (in case we chose an incoming variant color)
+                                merged_cursor.execute(
+                                    "UPDATE UserMark SET ColorIndex = ? WHERE UserMarkId = ?",
+                                    (chosen_option["color"], lead_usermark_id),
+                                )
+                                # And ensure ranges match (delete and re-insert for simplicity)
+                                merged_cursor.execute(
+                                    "DELETE FROM BlockRange WHERE UserMarkId = ?",
+                                    (lead_usermark_id,),
+                                )
+                                # Get ranges from the chosen variant
+                                ranges = chosen_option["ranges"]
+                                for r in ranges:
+                                    merged_cursor.execute(
+                                        "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
+                                        list(r) + [lead_usermark_id],
+                                    )
+
+                            # Skip individual inserts for BlockRange for these incoming UserMarks in this component
+                            if "BlockRange" not in skipped_pks:
+                                skipped_pks["BlockRange"] = set()
+                            for hl in comp_highlights:
+                                if hl["source"] == "incoming":
+                                    source_cursor.execute(
+                                        "SELECT BlockRangeId FROM BlockRange WHERE UserMarkId = ?",
+                                        (hl["usermark_id"],),
+                                    )
+                                    for (br_id,) in source_cursor.fetchall():
+                                        skipped_pks["BlockRange"].add(br_id)
+
+                        continue  # Done with UserMark table for this file loc_id
+
+                    continue  # Done with UserMark table for this file
+
                 for row in rows:
                     # Map source row to target schema
                     row_dict_source = dict(zip(cols_source, row))
@@ -454,345 +919,8 @@ class JwlBackupProcessor:
                         if res:
                             existing_new_pk = res[0]
 
-                    # Pre-Check for Overlaps (UserMark specific)
-                    overlap_pks = []
-                    inc_ranges = []
-                    inc_br_rows = []
-                    inc_color = None
-                    if table_target == "UserMark":
-                        # Fetch incoming ranges
-                        source_cursor.execute(
-                            "SELECT BlockRangeId, BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                            (old_pk,),
-                        )
-                        inc_br_rows = source_cursor.fetchall()
-                        inc_ranges = sorted([r[1:] for r in inc_br_rows])
-                        inc_color = row_dict.get("ColorIndex")
-
-                        # Check overlap excluding current match
-                        overlap_pks = self.check_overlap(
-                            merged_cursor,
-                            row_dict.get("LocationId"),
-                            inc_ranges,
-                            exclude_usermark_id=existing_new_pk,
-                        )
-
-                        if existing_new_pk is None and overlap_pks:
-                            # Adopt the first overlapping highlight as the target
-                            existing_new_pk = overlap_pks.pop(0)
-
                     if existing_new_pk is not None:
-                        # Handle conflicts for specific tables
-                        if table_target == "UserMark":
-                            # Collect all matching/overlapping highlights at this location
-                            loc_id = row_dict.get("LocationId")
-
-                            # Gather all highlights that match or overlap
-                            all_highlights = []
-
-                            # Add current highlight if it exists
-                            if existing_new_pk:
-                                merged_cursor.execute(
-                                    f"SELECT ColorIndex FROM [{table}] WHERE UserMarkId = ?",
-                                    (existing_new_pk,),
-                                )
-                                curr_res = merged_cursor.fetchone()
-                                if curr_res:
-                                    curr_color = curr_res[0]
-                                    merged_cursor.execute(
-                                        "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                        (existing_new_pk,),
-                                    )
-                                    curr_ranges = sorted(merged_cursor.fetchall())
-                                    all_highlights.append(
-                                        {
-                                            "usermark_id": existing_new_pk,
-                                            "color": curr_color,
-                                            "ranges": curr_ranges,
-                                            "source": "current",
-                                        }
-                                    )
-
-                            # Add incoming highlight
-                            all_highlights.append(
-                                {
-                                    "usermark_id": old_pk,  # Temporary, will be remapped
-                                    "color": inc_color,
-                                    "ranges": inc_ranges,
-                                    "source": "incoming",
-                                }
-                            )
-
-                            # Add all overlapping highlights
-                            for ov_pk in overlap_pks:
-                                merged_cursor.execute(
-                                    "SELECT ColorIndex FROM UserMark WHERE UserMarkId = ?",
-                                    (ov_pk,),
-                                )
-                                ov_res = merged_cursor.fetchone()
-                                if ov_res:
-                                    ov_color = ov_res[0]
-                                    merged_cursor.execute(
-                                        "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                        (ov_pk,),
-                                    )
-                                    ov_ranges = sorted(merged_cursor.fetchall())
-                                    all_highlights.append(
-                                        {
-                                            "usermark_id": ov_pk,
-                                            "color": ov_color,
-                                            "ranges": ov_ranges,
-                                            "source": "overlap",
-                                        }
-                                    )
-
-                            # Group by unique signature (color + ranges)
-                            signature_groups = {}  # {(color, tuple(ranges)): [highlight_dicts]}
-                            for hl in all_highlights:
-                                sig = (hl["color"], tuple(hl["ranges"]))
-                                if sig not in signature_groups:
-                                    signature_groups[sig] = []
-                                signature_groups[sig].append(hl)
-
-                            # Check if we need user input
-                            needs_user_input = len(signature_groups) > 1
-
-                            if needs_user_input:
-                                # Show automerge statistics once before first conflict
-                                if not automerge_stats_shown and table_automerged > 0:
-                                    print(
-                                        f"\n  Automerged {table_automerged} identical highlight(s)"
-                                    )
-                                    print(
-                                        f"  {table_conflicts} conflict(s) require your input\n"
-                                    )
-                                    automerge_stats_shown = True
-
-                                # Display conflict
-                                table_conflict_index += 1
-                                loc_info = self.get_location_info(merged_cursor, loc_id)
-                                print(
-                                    f"\nConflict {table_conflict_index}/{table_conflicts} in Highlight at {loc_info}:"
-                                )
-                                print(
-                                    f"  Found {len(all_highlights)} highlight(s) with {len(signature_groups)} unique variant(s)"
-                                )
-
-                                color_names = {
-                                    1: "yellow",
-                                    2: "green",
-                                    3: "blue",
-                                    4: "red",
-                                    5: "orange",
-                                    6: "purple",
-                                }
-                                color_codes = {
-                                    1: "\033[93m",  # bright yellow
-                                    2: "\033[92m",  # bright green
-                                    3: "\033[94m",  # bright blue
-                                    4: "\033[91m",  # bright red
-                                    5: "\033[38;5;208m",  # orange (256 color)
-                                    6: "\033[95m",  # bright magenta/purple
-                                }
-                                RESET = "\033[0m"
-
-                                # Fetch document info for text extraction
-                                doc_id, lang = None, None
-                                try:
-                                    merged_cursor.execute(
-                                        "SELECT DocumentId, MepsLanguage FROM Location WHERE LocationId = ?",
-                                        (loc_id,),
-                                    )
-                                    loc_res = merged_cursor.fetchone()
-                                    if loc_res and loc_res[0]:
-                                        doc_id, lang = loc_res
-                                        print("  Fetching text context from JW.org...")
-                                except Exception as e:
-                                    print(f"Error fetching document info: {e}")
-                                    pass
-
-                                # Display each unique variant
-                                options = []
-                                for idx, (sig, group) in enumerate(
-                                    signature_groups.items(), 1
-                                ):
-                                    color, ranges = sig
-                                    usermark_ids = [hl["usermark_id"] for hl in group]
-                                    sources = [hl["source"] for hl in group]
-
-                                    # Get color name and ANSI code
-                                    color_name = color_names.get(
-                                        color, f"color_{color}"
-                                    )
-                                    color_code = color_codes.get(color, "")
-
-                                    print(
-                                        f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
-                                    )
-
-                                    # Try to fetch text
-                                    text = None
-                                    if doc_id:
-                                        try:
-                                            full_text = []
-                                            for r in ranges:
-                                                txt = self.get_highlighted_text(
-                                                    doc_id, r[1], r[2], r[3], lang
-                                                )
-                                                if txt is None:
-                                                    text = None
-                                                    break
-                                                full_text.append(txt)
-                                            if full_text and None not in full_text:
-                                                text = " [...] ".join(full_text)
-                                        except Exception as e:
-                                            print(f"Error fetching text: {e}")
-                                            text = None
-
-                                    if text:
-                                        print(f"    Text: {color_code}'{text}'{RESET}")
-                                    else:
-                                        print("    (Text unavailable)")
-                                        print(f"    Ranges: {list(ranges)}")
-
-                                    options.append(
-                                        {
-                                            "color": color,
-                                            "ranges": ranges,
-                                            "usermark_ids": usermark_ids,
-                                            "text": text,
-                                        }
-                                    )
-
-                                # Get user choice
-                                choice_idx = None
-                                while choice_idx is None:
-                                    try:
-                                        choice_str = input(
-                                            f"\n  Choose option (1-{len(options)}): "
-                                        ).strip()
-                                        choice_idx = int(choice_str)
-                                        if choice_idx < 1 or choice_idx > len(options):
-                                            print(
-                                                f"  Invalid choice. Please enter a number between 1 and {len(options)}."
-                                            )
-                                            choice_idx = None
-                                    except ValueError:
-                                        print("  Invalid input. Please enter a number.")
-
-                                chosen_option = options[choice_idx - 1]
-                            else:
-                                # Auto-merge: all highlights are identical
-                                table_automerged += 1
-                                chosen_option = list(signature_groups.values())[0][0]
-                                chosen_option = {
-                                    "color": chosen_option["color"],
-                                    "ranges": chosen_option["ranges"],
-                                    "usermark_ids": [
-                                        hl["usermark_id"]
-                                        for hl in list(signature_groups.values())[0]
-                                    ],
-                                }
-
-                            # Apply the chosen option
-                            # Determine which UserMarkId to keep (prefer existing_new_pk if it's in the chosen group)
-                            chosen_usermark_id = None
-                            if (
-                                existing_new_pk
-                                and existing_new_pk in chosen_option["usermark_ids"]
-                            ):
-                                chosen_usermark_id = existing_new_pk
-                            else:
-                                # Use the first non-incoming ID, or create new from incoming
-                                for um_id in chosen_option["usermark_ids"]:
-                                    if (
-                                        um_id != old_pk
-                                    ):  # Not the incoming (temporary) ID
-                                        chosen_usermark_id = um_id
-                                        break
-
-                            # If chosen option only contains incoming, we need to insert it or update existing
-                            if (
-                                chosen_usermark_id is None
-                                or chosen_usermark_id == old_pk
-                            ):
-                                if existing_new_pk:
-                                    # Update existing to match chosen option
-                                    chosen_usermark_id = existing_new_pk
-                                    merged_cursor.execute(
-                                        f"UPDATE [{table}] SET ColorIndex = ? WHERE UserMarkId = ?",
-                                        (chosen_option["color"], chosen_usermark_id),
-                                    )
-                                    merged_cursor.execute(
-                                        "DELETE FROM BlockRange WHERE UserMarkId = ?",
-                                        (chosen_usermark_id,),
-                                    )
-                                    for br in inc_br_rows:
-                                        br_dict = dict(
-                                            zip(
-                                                [
-                                                    "BlockRangeId",
-                                                    "BlockType",
-                                                    "Identifier",
-                                                    "StartToken",
-                                                    "EndToken",
-                                                ],
-                                                br,
-                                            )
-                                        )
-                                        br_dict["UserMarkId"] = chosen_usermark_id
-                                        del br_dict["BlockRangeId"]
-                                        cols = ", ".join(
-                                            [f"[{k}]" for k in br_dict.keys()]
-                                        )
-                                        places = ", ".join(["?"] * len(br_dict))
-                                        merged_cursor.execute(
-                                            f"INSERT INTO BlockRange ({cols}) VALUES ({places})",
-                                            list(br_dict.values()),
-                                        )
-                                else:
-                                    # Will be inserted as new below
-                                    chosen_usermark_id = None
-
-                            # Update all FK references from non-chosen highlights to chosen one
-                            if chosen_usermark_id:
-                                all_usermark_ids = set()
-                                for hl in all_highlights:
-                                    if (
-                                        hl["usermark_id"] != old_pk
-                                    ):  # Skip incoming temporary ID
-                                        all_usermark_ids.add(hl["usermark_id"])
-
-                                non_chosen_ids = all_usermark_ids - {chosen_usermark_id}
-
-                                for um_id in non_chosen_ids:
-                                    # Update Note references
-                                    merged_cursor.execute(
-                                        "UPDATE Note SET UserMarkId = ? WHERE UserMarkId = ?",
-                                        (chosen_usermark_id, um_id),
-                                    )
-                                    # Delete BlockRanges
-                                    merged_cursor.execute(
-                                        "DELETE FROM BlockRange WHERE UserMarkId = ?",
-                                        (um_id,),
-                                    )
-                                    # Delete UserMark
-                                    merged_cursor.execute(
-                                        "DELETE FROM UserMark WHERE UserMarkId = ?",
-                                        (um_id,),
-                                    )
-
-                                # Map incoming PK to chosen PK
-                                self.pk_map[table][old_pk] = chosen_usermark_id
-
-                                # Mark all incoming BlockRanges as skipped
-                                if "BlockRange" not in skipped_pks:
-                                    skipped_pks["BlockRange"] = set()
-                                for br in inc_br_rows:
-                                    skipped_pks["BlockRange"].add(br[0])
-                            # else: will be inserted as new highlight below (no existing_new_pk)
-
-                        elif table_target in ["Bookmark", "InputField"]:
+                        if table_target in ["Bookmark", "InputField"]:
                             # Get existing data
                             merged_cursor.execute(
                                 f"SELECT * FROM [{table}] WHERE {self.primary_keys[table][0]} = ?",
@@ -838,8 +966,39 @@ class JwlBackupProcessor:
                                 if "m" in options:
                                     prompt = "Keep (c)urrent, (i)ncoming, or (m)erged?"
 
-                                while choice not in options:
-                                    choice = input(f"{prompt} ").lower()
+                                # Caching logic
+                                # Get canonical location info
+                                merged_cursor.execute(
+                                    "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+                                    (loc_id,),
+                                )
+                                loc_res = merged_cursor.fetchone()
+                                # Identity field
+                                id_field = (
+                                    "Slot" if table_target == "Bookmark" else "TextTag"
+                                )
+                                id_val = current_row.get(id_field)
+
+                                conflict_key = (
+                                    table_target,
+                                    loc_res,
+                                    id_val,
+                                    tuple(sorted(diffs.items())),
+                                )
+
+                                choice = self.conflict_cache[table_target].get(
+                                    conflict_key, ""
+                                )
+                                if choice:
+                                    print(
+                                        f"  (Using previously resolved choice: {choice})"
+                                    )
+                                else:
+                                    while choice not in options:
+                                        choice = input(f"{prompt} ").lower()
+                                    self.conflict_cache[table_target][conflict_key] = (
+                                        choice
+                                    )
 
                                 if choice == "i":
                                     update_cols = ", ".join(
@@ -910,11 +1069,33 @@ class JwlBackupProcessor:
                                 print("  [i]ncoming")
                                 print("  [m]erged")
 
-                                choice = ""
-                                while choice not in ["c", "i", "m"]:
-                                    choice = input(
-                                        "\nKeep (c)urrent, (i)ncoming, or (m)erged? "
-                                    ).lower()
+                                # Caching logic
+                                # Get canonical location info
+                                merged_cursor.execute(
+                                    "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+                                    (loc_id,),
+                                )
+                                loc_res = merged_cursor.fetchone()
+                                conflict_key = (
+                                    guid,
+                                    loc_res,
+                                    (curr_title, curr_content),
+                                    (inc_title, inc_content),
+                                )
+
+                                choice = self.conflict_cache["Note"].get(
+                                    conflict_key, ""
+                                )
+                                if choice:
+                                    print(
+                                        f"  (Using previously resolved choice: {choice})"
+                                    )
+                                else:
+                                    while choice not in ["c", "i", "m"]:
+                                        choice = input(
+                                            "\nKeep (c)urrent, (i)ncoming, or (m)erged? "
+                                        ).lower()
+                                    self.conflict_cache["Note"][conflict_key] = choice
 
                                 final_title, final_content = curr_title, curr_content
                                 if choice == "i":
@@ -1176,7 +1357,15 @@ class JwlBackupProcessor:
                 print(line)
 
     def get_highlighted_text(
-        self, docid, identifier, start_token, end_token, meps_lang_code="0"
+        self,
+        docid,
+        identifier,
+        start_token,
+        end_token,
+        meps_lang_code="0",
+        keysym=None,
+        book=None,
+        chapter=None,
     ):
         """Fetch content from JW.org and extract highlighted text based on tokens."""
         # Convert to int for dictionary lookup
@@ -1191,9 +1380,127 @@ class JwlBackupProcessor:
             return None
 
         lang_code = lang_info.get("Symbol")
+        ietf_code = lang_info.get("PrimaryIetfCode") or "en"
         if lang_code is None:
             print(f"No symbol found for language code: {meps_lang_code}")
             return None
+
+        # Bible logic branch
+        if (
+            keysym
+            and "nwt" in keysym.lower()
+            and book is not None
+            and chapter is not None
+        ):
+            api_path = self.bible_api_cache.get(lang_code)
+            if api_path == "None":
+                api_path = None
+
+            if not api_path:
+                # Try to discover API path from language home page
+                try:
+                    home_url = f"https://www.jw.org/{ietf_code}"
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    }
+                    r = requests.get(home_url, headers=headers, timeout=5)
+                    r.raise_for_status()
+
+                    # Search for data-bible_data_api in pageConfig
+                    # Prioritize specific versions if keysym is available
+                    match = None
+                    if keysym:
+                        # e.g. data-bible_data_api_nwtsty or data-bible_data_api_nwt
+                        match = re.search(
+                            f'data-bible_data_api_{re.escape(keysym.lower())}="([^"]+)"',
+                            r.text,
+                        )
+
+                    if not match:
+                        match = re.search(
+                            r'data-bible_data_api(_nwtsty|_nwt)?="([^"]+)"', r.text
+                        )
+
+                    if not match:
+                        match = re.search(r'data-bible_data_api="([^"]+)"', r.text)
+
+                    if match:
+                        api_path = match.groups()[-1]
+                        self.bible_api_cache[lang_code] = api_path
+                    else:
+                        self.bible_api_cache[lang_code] = "None"
+
+                except Exception as e:
+                    if self.debug:
+                        print(f"Error discovering Bible API for {ietf_code}: {e}")
+
+            if api_path and api_path != "None":
+                # Construct Bible API URL
+                # The ID format is [BookNumber*10][ChapterNumber(2)][000]
+                # Example: Matthew (40) * 10 = 400. Chapter 10 -> 40010000
+                book_id = book * 10
+                range_start = f"{book_id}{chapter:02d}000"
+                range_id = f"{range_start}-{book_id}{chapter:02d}999"
+                url = f"https://www.jw.org{api_path}{range_id}"
+
+                try:
+                    data = None
+                    if url in self.doc_cache:
+                        data = self.doc_cache[url]
+                    else:
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        }
+                        r = requests.get(url, headers=headers, timeout=10)
+                        r.raise_for_status()
+                        data = r.json()
+
+                        self.doc_cache[url] = data
+
+                    if data:
+                        # Extract verse text using confirmed pattern: [Book*10][Chapter(2)][Verse(3)]
+                        # Example: Matthew 10:1 (Identifier=1) -> 40010001
+                        ranges_data = data.get("ranges", {})
+
+                        # Find the correct range object. It key matches range_id.
+                        range_content = ranges_data.get(range_id)
+
+                        if not range_content:
+                            # Fallback: maybe the first range in the dict?
+                            if ranges_data:
+                                range_content = list(ranges_data.values())[0]
+
+                        if range_content:
+                            verses = range_content.get("verses", [])
+                            # Find the specific verse in the list
+                            target_verse = next(
+                                (
+                                    v
+                                    for v in verses
+                                    if v.get("verseNumber") == int(identifier)
+                                ),
+                                None,
+                            )
+
+                            if target_verse:
+                                content = target_verse.get("content", "")
+
+                                # Use PExtractor to strip tags and discard chapter/verse numbers
+                                parser = (
+                                    PExtractor()
+                                )  # No pid means it processes everything
+                                parser.feed(content)
+                                text = " ".join(parser.text.split())
+
+                                # Tokenize consistently with PExtractor branch
+                                tokens = re.findall(
+                                    r"\w+(?:['’.:-]\w+)*|[^\s\w" + "\u200b" + r"]", text
+                                )
+                                subset = tokens[start_token : end_token + 1]
+                                return " ".join(subset)
+                except Exception as e:
+                    if self.debug:
+                        print(f"Error fetching Bible text from {url}: {e}")
 
         if (docid, lang_code) in self.doc_cache:
             html_content = self.doc_cache[(docid, lang_code)]
@@ -1214,35 +1521,6 @@ class JwlBackupProcessor:
             except Exception as e:
                 print(f"Error fetching content: {e}")
                 return None
-
-        class PExtractor(HTMLParser):
-            def __init__(self, pid):
-                super().__init__()
-                self.pid = str(pid)
-                self.found = False
-                self.in_parNum = False
-                self.text = ""
-                self.pending_data = []
-
-            def handle_starttag(self, tag, attrs):
-                d = dict(attrs)
-                if tag == "p":
-                    # data-pid matches Identifier
-                    if d.get("data-pid") == self.pid:
-                        self.found = True
-                elif self.found:
-                    if tag == "span" and "parNum" in d.get("class", "").split():
-                        self.in_parNum = True
-
-            def handle_endtag(self, tag):
-                if tag == "p" and self.found:
-                    self.found = False
-                elif tag == "span" and self.in_parNum:
-                    self.in_parNum = False
-
-            def handle_data(self, data):
-                if self.found and not self.in_parNum:
-                    self.text += data
 
         parser = PExtractor(identifier)
         parser.feed(html_content)
@@ -1266,109 +1544,8 @@ class JwlBackupProcessor:
         if end_token > len(tokens):
             end_token = len(tokens)
 
-        # print(tokens)
-        # print(start_token)
-        # print(end_token)
-
         subset = tokens[start_token : end_token + 1]
         return " ".join(subset)
-
-    def get_all_matching_highlights(
-        self, cursor, location_id, target_ranges, usermark_ids_to_include=None
-    ):
-        """
-        Get all highlights at a location that overlap with the given ranges.
-
-        Args:
-            cursor: Database cursor
-            location_id: LocationId to check
-            target_ranges: List of (BlockType, Identifier, StartToken, EndToken) tuples
-            usermark_ids_to_include: List of specific UserMarkIds to always include
-
-        Returns:
-            List of dicts with keys: usermark_id, color, ranges, text
-        """
-        if not location_id:
-            return []
-
-        # Get all UserMarks for this location
-        cursor.execute(
-            "SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?",
-            (location_id,),
-        )
-        all_usermarks = cursor.fetchall()
-
-        result = []
-        color_names = {
-            1: "yellow",
-            2: "green",
-            3: "blue",
-            4: "red",
-            5: "orange",
-            6: "purple",
-        }
-
-        for um_id, color in all_usermarks:
-            # Get ranges for this UserMark
-            cursor.execute(
-                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                (um_id,),
-            )
-            ranges = sorted(cursor.fetchall())
-
-            # Check if this highlight overlaps with target_ranges
-            is_overlap = False
-            for nr in target_ranges:
-                for er in ranges:
-                    if (
-                        nr[0] == er[0] and nr[1] == er[1]
-                    ):  # Same BlockType and Identifier
-                        if nr[2] < er[3] and er[2] < nr[3]:  # Token overlap
-                            is_overlap = True
-                            break
-                if is_overlap:
-                    break
-
-            # Include if it overlaps OR if it's in the explicit include list
-            if is_overlap or (
-                usermark_ids_to_include and um_id in usermark_ids_to_include
-            ):
-                # Try to fetch text
-                text = None
-                try:
-                    cursor.execute(
-                        "SELECT DocumentId, MepsLanguage FROM Location WHERE LocationId = ?",
-                        (location_id,),
-                    )
-                    loc_res = cursor.fetchone()
-                    if loc_res and loc_res[0]:
-                        doc_id, lang = loc_res
-                        full_text = []
-                        for r in ranges:
-                            txt = self.get_highlighted_text(
-                                doc_id, r[1], r[2], r[3], lang
-                            )
-                            if txt is None:
-                                text = None
-                                break
-                            full_text.append(txt)
-                        if text is not None:
-                            text = " [...] ".join(full_text)
-                except Exception as e:
-                    print(f"Error fetching text: {e}")
-                    text = None
-
-                result.append(
-                    {
-                        "usermark_id": um_id,
-                        "color": color,
-                        "color_name": color_names.get(color, f"color_{color}"),
-                        "ranges": ranges,
-                        "text": text,
-                    }
-                )
-
-        return result
 
     def check_overlap(self, cursor, location_id, new_ranges, exclude_usermark_id=None):
         """Check if new ranges overlap with existing highlights at the same location."""
