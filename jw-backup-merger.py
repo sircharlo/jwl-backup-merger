@@ -456,17 +456,44 @@ class JwlBackupProcessor:
             f"  Found {sum(len(v) for v in sig_groups.values())} highlight(s) with {len(sig_groups)} unique variant(s)"
         )
 
+        color_names = {
+            1: "yellow",
+            2: "green",
+            3: "blue",
+            4: "red",
+            5: "orange",
+            6: "purple",
+        }
+        color_codes = {
+            1: "\033[93m",
+            2: "\033[92m",
+            3: "\033[94m",
+            4: "\033[91m",
+            5: "\033[38;5;208m",
+            6: "\033[95m",
+        }
+        RESET = "\033[0m"
+
         # Fetch context
         merged_cursor.execute(
             "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
             (loc_id,),
         )
         loc_res = merged_cursor.fetchone()
+        if loc_res:
+            print("  Fetching text context from JW.org...")
 
         options = []
         for idx, (sig, group) in enumerate(sig_groups.items(), 1):
             color, ranges = sig
-            print(f"\n  Option {idx}: color {color} ({len(group)} instance(s))")
+            sources = sorted(list(set(hl["source"] for hl in group)))
+
+            color_name = color_names.get(color, f"color_{color}")
+            color_code = color_codes.get(color, "")
+
+            print(
+                f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
+            )
             # Fetch and display text
             text = None
             if loc_res:
@@ -489,14 +516,16 @@ class JwlBackupProcessor:
                         text = " [...] ".join(full_text)
                 except Exception:
                     pass
-            print(f"    Text: {text if text else '(Text unavailable)'}")
+            print(
+                f"    Text: {color_code}{text if text else '(Text unavailable)'}{RESET}"
+            )
             options.append({"color": color, "ranges": ranges, "highlights": group})
 
         conflict_key = (loc_res, tuple(sorted(sig_groups.keys())))
         choice_sig = self.conflict_cache["UserMark"].get(conflict_key)
 
         if choice_sig:
-            print(f"  (Using previously resolved choice)")
+            print("  (Using previously resolved choice)")
             return next(
                 o for o in options if (o["color"], tuple(o["ranges"])) == choice_sig
             )
