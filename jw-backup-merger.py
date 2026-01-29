@@ -22,6 +22,7 @@ parser = ArgumentParser()
 parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 parser.add_argument("--folder", type=str, help="Folder containing JWL files to merge")
 parser.add_argument("--file", type=str, help="JWL file to merge", action="append")
+parser.add_argument("--test", action="store_true", help="Run automated tests")
 args = parser.parse_args()
 
 
@@ -117,6 +118,56 @@ class JwlBackupProcessor:
             "Bookmark": {},  # {conflict_key: choice}
             "InputField": {},  # {conflict_key: choice}
         }
+        self.table_order = [
+            "Location",
+            "IndependentMedia",
+            "Tag",
+            "PlaylistItemAccuracy",
+            "PlaylistItem",
+            "UserMark",
+            "BlockRange",
+            "Note",
+            "Bookmark",
+            "TagMap",
+            "InputField",
+            "PlaylistItemIndependentMediaMap",
+            "PlaylistItemLocationMap",
+            "PlaylistItemMarker",
+            "PlaylistItemMarkerBibleVerseMap",
+            "PlaylistItemMarkerParagraphMap",
+        ]
+        self.identity_keys = {
+            "Location": [
+                "BookNumber",
+                "ChapterNumber",
+                "DocumentId",
+                "Track",
+                "IssueTagNumber",
+                "KeySymbol",
+                "MepsLanguage",
+                "Type",
+                "Title",
+            ],
+            "Tag": ["Type", "Name"],
+            "IndependentMedia": ["Hash"],
+            "PlaylistItemAccuracy": ["Description"],
+            "PlaylistItem": ["Label", "ThumbnailFilePath"],
+            "UserMark": ["UserMarkGuid"],
+            "Note": ["Guid"],
+            "Bookmark": ["PublicationLocationId", "Slot"],
+            "BlockRange": ["BlockType", "Identifier", "UserMarkId"],
+            "InputField": ["LocationId", "TextTag"],
+            "TagMap": ["TagId", "PlaylistItemId", "LocationId", "NoteId"],
+            "PlaylistItemIndependentMediaMap": ["PlaylistItemId", "IndependentMediaId"],
+            "PlaylistItemLocationMap": ["PlaylistItemId", "LocationId"],
+            "PlaylistItemMarkerBibleVerseMap": ["PlaylistItemMarkerId", "VerseId"],
+            "PlaylistItemMarkerParagraphMap": [
+                "PlaylistItemMarkerId",
+                "MepsDocumentId",
+                "ParagraphIndex",
+                "MarkerIndexWithinParagraph",
+            ],
+        }
 
     def get_table_info(self, db):
         """Get table info from database
@@ -154,6 +205,683 @@ class JwlBackupProcessor:
                     self.fk_map[table_lower] = {}
                 self.fk_map[table_lower][from_col.lower()] = (to_table, to_col)
 
+    def _initialize_merge(self, database_files):
+        """Initialize the merged database from the first source file"""
+        self.start_time = time()
+        self.note_bases = {}
+
+        first_db = database_files[0]
+        copy2(first_db, self.merged_db_path)
+        merged_conn = sqlite3.connect(self.merged_db_path)
+        self.get_table_info(merged_conn)
+
+        # Empty all tables in merged_db
+        cursor = merged_conn.cursor()
+        for table in self.primary_keys.keys():
+            if table not in ["grdb_migrations", "LastModified"]:
+                cursor.execute(f"DELETE FROM [{table}];")
+        merged_conn.commit()
+        return merged_conn
+
+    def _finalize_merge(self, merged_conn):
+        """Finalize the merge process: update LastModified and collect media files"""
+        cursor = merged_conn.cursor()
+        cursor.execute(
+            "UPDATE LastModified SET LastModified = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');"
+        )
+        merged_conn.commit()
+
+        # Collect files for archive
+        for table, col in [
+            ("IndependentMedia", "FilePath"),
+            ("PlaylistItem", "ThumbnailFilePath"),
+        ]:
+            try:
+                cursor.execute(
+                    f"SELECT [{col}] FROM [{table}] WHERE [{col}] IS NOT NULL"
+                )
+                self.files_to_include_in_archive.extend(
+                    [r[0] for r in cursor.fetchall()]
+                )
+            except sqlite3.Error:
+                pass
+
+        self.files_to_include_in_archive = list(set(self.files_to_include_in_archive))
+        merged_conn.close()
+
+    def _merge_database(self, file_path, merged_conn, table_order, identity_keys):
+        """Process a single source database file and merge its tables"""
+        source_conn = sqlite3.connect(file_path)
+        source_cursor = source_conn.cursor()
+        merged_cursor = merged_conn.cursor()
+        skipped_pks = {}
+        self.pk_map = {}
+
+        for table_target in table_order:
+            self._process_table(
+                table_target, source_cursor, merged_cursor, identity_keys, skipped_pks
+            )
+
+        source_conn.close()
+        merged_conn.commit()
+
+    def _process_table(
+        self, table_target, source_cursor, merged_cursor, identity_keys, skipped_pks
+    ):
+        """Standard entry point for processing a table during merge"""
+        table = self.table_name_map.get(table_target.lower())
+        if not table or table not in self.primary_keys:
+            return
+
+        try:
+            source_cursor.execute(f"SELECT * FROM [{table}]")
+        except sqlite3.Error:
+            return
+
+        cols_source = [d[0] for d in source_cursor.description]
+        rows = source_cursor.fetchall()
+        self.pk_map.setdefault(table, {})
+        skipped_pks.setdefault(table, set())
+
+        merged_cursor.execute(f"PRAGMA table_info([{table}])")
+        cols_target = [col[1] for col in merged_cursor.fetchall()]
+
+        if table_target == "UserMark":
+            self._process_usermark_table(
+                table, source_cursor, merged_cursor, skipped_pks, cols_target
+            )
+        else:
+            self._process_generic_table(
+                table,
+                table_target,
+                source_cursor,
+                merged_cursor,
+                identity_keys,
+                skipped_pks,
+                cols_source,
+                rows,
+                cols_target,
+            )
+
+    def _process_usermark_table(
+        self, table, source_cursor, merged_cursor, skipped_pks, cols_target
+    ):
+        """Process UserMark table with overlap detection and connected component analysis"""
+        source_cursor.execute(f"SELECT * FROM [{table}]")
+        rows = source_cursor.fetchall()
+        cols_source = [d[0] for d in source_cursor.description]
+
+        loc_to_usermarks = {}
+        for row in rows:
+            row_dict = dict(zip(cols_source, row))
+            loc_to_usermarks.setdefault(row_dict.get("LocationId"), []).append(row_dict)
+
+        source_cursor.execute("SELECT LocationId, KeySymbol FROM Location")
+        loc_symbol_map = {r[0]: (r[1] or "") for r in source_cursor.fetchall()}
+        sorted_loc_ids = sorted(
+            loc_to_usermarks.keys(), key=lambda lid: loc_symbol_map.get(lid, "")
+        )
+
+        for loc_id in sorted_loc_ids:
+            all_highlights = self._gather_highlights(
+                loc_id,
+                loc_to_usermarks[loc_id],
+                table,
+                source_cursor,
+                merged_cursor,
+                cols_target,
+            )
+            comp_list = self._find_highlight_components(all_highlights)
+
+            for comp in comp_list:
+                sig_groups = {}
+                for hl in comp:
+                    sig_groups.setdefault(
+                        (hl["color"], tuple(hl["ranges"])), []
+                    ).append(hl)
+
+                if len(sig_groups) > 1:
+                    chosen_option = self._resolve_usermark_conflict(
+                        loc_id, sig_groups, merged_cursor
+                    )
+                else:
+                    proto = list(sig_groups.values())[0][0]
+                    chosen_option = {
+                        "color": proto["color"],
+                        "ranges": proto["ranges"],
+                        "highlights": list(sig_groups.values())[0],
+                    }
+
+                self._apply_usermark_choice(
+                    table,
+                    comp,
+                    chosen_option,
+                    merged_cursor,
+                    source_cursor,
+                    skipped_pks,
+                )
+
+    def _gather_highlights(
+        self, loc_id, incoming_rows, table, source_cursor, merged_cursor, cols_target
+    ):
+        """Gather all existing and incoming highlights for a specific location"""
+        all_highlights = []
+        merged_cursor.execute(
+            "SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?",
+            (loc_id,),
+        )
+        for um_id, color in merged_cursor.fetchall():
+            merged_cursor.execute(
+                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                (um_id,),
+            )
+            all_highlights.append(
+                {
+                    "usermark_id": um_id,
+                    "color": color,
+                    "ranges": sorted(merged_cursor.fetchall()),
+                    "source": "current",
+                }
+            )
+
+        for row_src in incoming_rows:
+            old_pk = row_src.get(self.primary_keys[table][0])
+            source_cursor.execute(
+                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                (old_pk,),
+            )
+            row_dict = {
+                ct: row_src.get(
+                    next((ks for ks in row_src if ks.lower() == ct.lower()), None)
+                )
+                for ct in cols_target
+            }
+            all_highlights.append(
+                {
+                    "usermark_id": old_pk,
+                    "color": row_dict.get("ColorIndex"),
+                    "ranges": sorted(source_cursor.fetchall()),
+                    "source": "incoming",
+                    "row_dict": row_dict,
+                }
+            )
+        return all_highlights
+
+    def _find_highlight_components(self, all_highlights):
+        """Find connected components of highlights based on token overlap or identical signatures"""
+        num_hl = len(all_highlights)
+        adj = {i: set() for i in range(num_hl)}
+        for i in range(num_hl):
+            for j in range(i + 1, num_hl):
+                h1, h2 = all_highlights[i], all_highlights[j]
+                same_sig = h1["color"] == h2["color"] and h1["ranges"] == h2["ranges"]
+                overlap = False
+                if not same_sig:
+                    for r1 in h1["ranges"]:
+                        for r2 in h2["ranges"]:
+                            if r1[0] == r2[0] and r1[1] == r2[1]:
+                                if r1[2] < r2[3] and r2[2] < r1[3]:
+                                    overlap = True
+                                    break
+                        if overlap:
+                            break
+                if same_sig or overlap:
+                    adj[i].add(j)
+                    adj[j].add(i)
+
+        visited = set()
+        hl_components = []
+        for i in range(num_hl):
+            if i not in visited:
+                comp = []
+                stack = [i]
+                visited.add(i)
+                while stack:
+                    curr = stack.pop()
+                    comp.append(all_highlights[curr])
+                    for neighbor in adj[curr]:
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            stack.append(neighbor)
+                hl_components.append(comp)
+        return hl_components
+
+    def _resolve_usermark_conflict(self, loc_id, sig_groups, merged_cursor):
+        """Prompt user for highlight variant choice or use cached decision"""
+        loc_info = self.get_location_info(merged_cursor, loc_id)
+
+        # Display options and fetch context info from JW.org
+        print(f"\nConflict in Highlight at {loc_info}:")
+        print(
+            f"  Found {sum(len(v) for v in sig_groups.values())} highlight(s) with {len(sig_groups)} unique variant(s)"
+        )
+
+        # Fetch context
+        merged_cursor.execute(
+            "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+            (loc_id,),
+        )
+        loc_res = merged_cursor.fetchone()
+
+        options = []
+        for idx, (sig, group) in enumerate(sig_groups.items(), 1):
+            color, ranges = sig
+            print(f"\n  Option {idx}: color {color} ({len(group)} instance(s))")
+            # Fetch and display text
+            text = None
+            if loc_res:
+                try:
+                    full_text = []
+                    for r in ranges:
+                        txt = self.get_highlighted_text(
+                            loc_res[0],
+                            r[1],
+                            r[2],
+                            r[3],
+                            loc_res[1],
+                            loc_res[2],
+                            loc_res[3],
+                            loc_res[4],
+                        )
+                        if txt:
+                            full_text.append(txt)
+                    if full_text:
+                        text = " [...] ".join(full_text)
+                except Exception:
+                    pass
+            print(f"    Text: {text if text else '(Text unavailable)'}")
+            options.append({"color": color, "ranges": ranges, "highlights": group})
+
+        conflict_key = (loc_res, tuple(sorted(sig_groups.keys())))
+        choice_sig = self.conflict_cache["UserMark"].get(conflict_key)
+
+        if choice_sig:
+            print(f"  (Using previously resolved choice)")
+            return next(
+                o for o in options if (o["color"], tuple(o["ranges"])) == choice_sig
+            )
+
+        choice_idx = None
+        while choice_idx is None:
+            try:
+                choice_idx = int(
+                    input(f"\n  Choose option (1-{len(options)}): ").strip()
+                )
+                if choice_idx < 1 or choice_idx > len(options):
+                    choice_idx = None
+            except ValueError:
+                pass
+
+        chosen = options[choice_idx - 1]
+        self.conflict_cache["UserMark"][conflict_key] = (
+            chosen["color"],
+            tuple(chosen["ranges"]),
+        )
+        return chosen
+
+    def _apply_usermark_choice(
+        self, table, comp, chosen_option, merged_cursor, source_cursor, skipped_pks
+    ):
+        """Apply the chosen variant and remap primary keys for dependent tables"""
+        # 1. Lead UserMarkId selection (prefer current if available)
+        lead_id = next(
+            (
+                h["usermark_id"]
+                for h in chosen_option["highlights"]
+                if h["source"] == "current"
+            ),
+            None,
+        )
+        if not lead_id:
+            lead_id = chosen_option["highlights"][0]["usermark_id"]
+
+        # 2. Remap incoming highlight IDs
+        for hl in comp:
+            if hl["source"] == "incoming":
+                self.pk_map[table][hl["usermark_id"]] = lead_id
+
+        # 3. Cleanup other variants from merged DB
+        comp_existing = [h["usermark_id"] for h in comp if h["source"] == "current"]
+        for um_id in comp_existing:
+            if um_id != lead_id:
+                merged_cursor.execute(
+                    "UPDATE Note SET UserMarkId = ? WHERE UserMarkId = ?",
+                    (lead_id, um_id),
+                )
+                merged_cursor.execute(
+                    "DELETE FROM BlockRange WHERE UserMarkId = ?", (um_id,)
+                )
+                merged_cursor.execute(
+                    "DELETE FROM UserMark WHERE UserMarkId = ?", (um_id,)
+                )
+
+        # 4. Insert lead if it's new, otherwise sync existing lead
+        if lead_id not in comp_existing:
+            chosen_hl = next(
+                h for h in chosen_option["highlights"] if h["usermark_id"] == lead_id
+            )
+            row_dict = chosen_hl["row_dict"].copy()
+            if isinstance(row_dict.get(self.primary_keys[table][0]), int):
+                del row_dict[self.primary_keys[table][0]]
+
+            cols = ", ".join([f"[{k}]" for k in row_dict.keys()])
+            merged_cursor.execute(
+                f"INSERT INTO [{table}] ({cols}) VALUES ({', '.join(['?'] * len(row_dict))})",
+                list(row_dict.values()),
+            )
+            new_pk = merged_cursor.lastrowid
+
+            # Re-map all pointing to previously selected lead_id
+            for hl_id, mapped_id in list(self.pk_map[table].items()):
+                if mapped_id == lead_id:
+                    self.pk_map[table][hl_id] = new_pk
+            lead_id = new_pk
+
+            for r in chosen_option["ranges"]:
+                merged_cursor.execute(
+                    "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
+                    list(r) + [lead_id],
+                )
+        else:
+            merged_cursor.execute(
+                "UPDATE UserMark SET ColorIndex = ? WHERE UserMarkId = ?",
+                (chosen_option["color"], lead_id),
+            )
+            merged_cursor.execute(
+                "DELETE FROM BlockRange WHERE UserMarkId = ?", (lead_id,)
+            )
+            for r in chosen_option["ranges"]:
+                merged_cursor.execute(
+                    "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
+                    list(r) + [lead_id],
+                )
+
+        # Mark BlockRanges to be skipped for these incoming UserMarks
+        skipped_pks.setdefault("BlockRange", set())
+        for hl in comp:
+            if hl["source"] == "incoming":
+                source_cursor.execute(
+                    "SELECT BlockRangeId FROM BlockRange WHERE UserMarkId = ?",
+                    (hl["usermark_id"],),
+                )
+                for (br_id,) in source_cursor.fetchall():
+                    skipped_pks["BlockRange"].add(br_id)
+
+    def _process_generic_table(
+        self,
+        table,
+        table_target,
+        source_cursor,
+        merged_cursor,
+        identity_keys,
+        skipped_pks,
+        cols_source,
+        rows,
+        cols_target,
+    ):
+        """Process rows for a standard table with deduplication and conflict handling"""
+        for row in rows:
+            row_dict_src = dict(zip(cols_source, row))
+            old_pk = row_dict_src.get(self.primary_keys[table][0])
+            if old_pk in skipped_pks.get(table, set()):
+                continue
+
+            row_dict = {
+                ct: row_dict_src.get(
+                    next((ks for ks in row_dict_src if ks.lower() == ct.lower()), None)
+                )
+                for ct in cols_target
+            }
+            self._remap_fks(table, row_dict)
+
+            existing_pk = self._find_existing_pk(
+                table, table_target, row_dict, identity_keys, merged_cursor
+            )
+
+            if existing_pk is not None:
+                if table_target in ["Bookmark", "InputField", "Note"]:
+                    self._resolve_generic_conflict(
+                        table,
+                        table_target,
+                        merged_cursor,
+                        existing_pk,
+                        row_dict,
+                        cols_target,
+                    )
+                if old_pk is not None:
+                    self.pk_map[table][old_pk] = existing_pk
+            else:
+                new_pk = self._insert_row(table, table_target, row_dict, merged_cursor)
+                if old_pk is not None and new_pk is not None:
+                    self.pk_map[table][old_pk] = new_pk
+
+    def _remap_fks(self, table, row_dict):
+        """Remap foreign keys in the row_dict based on pk_map"""
+        table_lower = table.lower()
+        if table_lower in self.fk_map:
+            for col_name, val in row_dict.items():
+                col_lower = col_name.lower()
+                if col_lower in self.fk_map[table_lower]:
+                    to_table, to_col = self.fk_map[table_lower][col_lower]
+                    to_table_canonical = self.table_name_map.get(
+                        to_table.lower(), to_table
+                    )
+                    if val in self.pk_map.get(to_table_canonical, {}):
+                        row_dict[col_name] = self.pk_map[to_table_canonical][val]
+
+    def _find_existing_pk(
+        self, table, table_target, row_dict, identity_keys, merged_cursor
+    ):
+        """Find an existing row in the merged database with the same identity"""
+        id_cols = identity_keys.get(table_target)
+        if not id_cols:
+            return None
+
+        conditions = []
+        vals = []
+        for c in id_cols:
+            if row_dict.get(c) is None:
+                conditions.append(f"[{c}] IS ?")
+            elif table_target == "Tag" and c == "Name":
+                conditions.append(f"[{c}] = ? COLLATE NOCASE")
+            else:
+                conditions.append(f"[{c}] = ?")
+            vals.append(row_dict.get(c))
+
+        query = f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE {' AND '.join(conditions)}"
+        merged_cursor.execute(query, vals)
+        res = merged_cursor.fetchone()
+        return res[0] if res else None
+
+    def _insert_row(self, table, table_target, row_dict, merged_cursor):
+        """Insert a row into the merged database, handling special cases like TagMap positions"""
+        insert_dict = row_dict.copy()
+        if table_target == "Note":
+            self.note_bases[row_dict.get("Guid")] = {
+                "title": row_dict.get("Title"),
+                "content": row_dict.get("Content"),
+            }
+
+        pk_name = self.primary_keys[table][0]
+        if len(self.primary_keys[table]) == 1 and isinstance(
+            insert_dict.get(pk_name), int
+        ):
+            del insert_dict[pk_name]
+
+        cols = ", ".join([f"[{k}]" for k in insert_dict.keys()])
+        placeholders = ", ".join(["?"] * len(insert_dict))
+        query = f"INSERT INTO [{table}] ({cols}) VALUES ({placeholders})"
+
+        try:
+            merged_cursor.execute(query, list(insert_dict.values()))
+            return merged_cursor.lastrowid
+        except sqlite3.IntegrityError as e:
+            if table_target == "TagMap" and "TagMap.TagId, TagMap.Position" in str(e):
+                tag_id, position = insert_dict.get("TagId"), insert_dict.get("Position")
+                merged_cursor.execute(
+                    f"SELECT TagMapId, Position FROM [{table}] WHERE TagId = ? AND Position >= ? ORDER BY Position DESC",
+                    (tag_id, position),
+                )
+                for tid, pos in merged_cursor.fetchall():
+                    merged_cursor.execute(
+                        f"UPDATE [{table}] SET Position = ? WHERE TagMapId = ?",
+                        (pos + 1, tid),
+                    )
+                merged_cursor.execute(query, list(insert_dict.values()))
+                return merged_cursor.lastrowid
+            else:
+                self.output["errors"].append((table, query, e))
+        except sqlite3.Error as e:
+            self.output["errors"].append((table, query, e))
+        return None
+
+    def _resolve_generic_conflict(
+        self, table, table_target, merged_cursor, existing_pk, row_dict, cols_target
+    ):
+        """Handle conflicts for Bookmark, InputField, and Note via 3-way merge or user prompt"""
+        merged_cursor.execute(
+            f"SELECT * FROM [{table}] WHERE {self.primary_keys[table][0]} = ?",
+            (existing_pk,),
+        )
+        current_row = dict(zip(cols_target, merged_cursor.fetchone()))
+
+        diffs = {
+            c: (current_row.get(c), row_dict[c])
+            for c in row_dict
+            if c not in self.primary_keys[table] and row_dict[c] != current_row.get(c)
+        }
+        if not diffs:
+            return
+
+        if table_target == "Note":
+            return self._handle_note_merge(
+                table, merged_cursor, existing_pk, row_dict, current_row, diffs
+            )
+
+        loc_info = self.get_location_info(merged_cursor, current_row.get("LocationId"))
+        print(f"\nConflict in {table_target} at {loc_info}:")
+        for col, (old_v, new_v) in diffs.items():
+            print(f"  {col}: current='{old_v}' vs incoming='{new_v}'")
+
+        options = ["c", "i"]
+        merged_val = None
+        if table_target == "InputField":
+            options.append("m")
+            merged_val = self.merge_text(
+                None, current_row.get("Value"), row_dict.get("Value")
+            )
+            print(f"  Merged value: '{merged_val}'")
+
+        # Caching and Choice
+        merged_cursor.execute(
+            "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+            (current_row.get("LocationId"),),
+        )
+        loc_res = merged_cursor.fetchone()
+        conflict_key = (
+            table_target,
+            loc_res,
+            current_row.get("Slot" if table_target == "Bookmark" else "TextTag"),
+            tuple(sorted(diffs.items())),
+        )
+
+        choice = self.conflict_cache[table_target].get(conflict_key, "")
+        if choice:
+            print(f"  (Using previously resolved choice: {choice})")
+        else:
+            while choice not in options:
+                choice = input(
+                    f"Keep (c)urrent, (i)ncoming{', or (m)erged' if 'm' in options else ''}? "
+                ).lower()
+            self.conflict_cache[table_target][conflict_key] = choice
+
+        if choice == "i":
+            set_clause = ", ".join([f"[{k}] = ?" for k in diffs.keys()])
+            merged_cursor.execute(
+                f"UPDATE [{table}] SET {set_clause} WHERE {self.primary_keys[table][0]} = ?",
+                list(row_dict[k] for k in diffs.keys()) + [existing_pk],
+            )
+        elif choice == "m" and table_target == "InputField":
+            merged_cursor.execute(
+                f"UPDATE [{table}] SET Value = ? WHERE {self.primary_keys[table][0]} = ?",
+                (merged_val, existing_pk),
+            )
+
+    def _handle_note_merge(
+        self, table, merged_cursor, existing_pk, row_dict, current_row, diffs
+    ):
+        """Specific 3-way merge logic for Note content and title"""
+        guid = row_dict.get("Guid")
+        base = self.note_bases.get(
+            guid,
+            {"title": current_row.get("Title"), "content": current_row.get("Content")},
+        )
+
+        merged_title = self.merge_text(
+            base.get("title"),
+            current_row.get("Title") or "",
+            row_dict.get("Title") or "",
+        )
+        merged_content = self.merge_text(
+            base.get("content"),
+            current_row.get("Content") or "",
+            row_dict.get("Content") or "",
+        )
+
+        if row_dict.get("Title") == current_row.get("Title") and row_dict.get(
+            "Content"
+        ) == current_row.get("Content"):
+            return
+
+        loc_info = self.get_location_info(merged_cursor, current_row.get("LocationId"))
+        print(f"\nConflict in Note at {loc_info} (GUID: {guid}):")
+
+        merged_cursor.execute(
+            "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+            (current_row.get("LocationId"),),
+        )
+        loc_res = merged_cursor.fetchone()
+        conflict_key = (
+            guid,
+            loc_res,
+            (current_row.get("Title"), current_row.get("Content")),
+            (row_dict.get("Title"), row_dict.get("Content")),
+        )
+
+        choice = self.conflict_cache["Note"].get(conflict_key, "")
+        if choice:
+            print(f"  (Using previously resolved choice: {choice})")
+        else:
+            if row_dict.get("Title") != current_row.get("Title"):
+                print("\n--- Title Diff ---")
+                self.print_diff(
+                    current_row.get("Title") or "", row_dict.get("Title") or ""
+                )
+                print(f"Merged: {merged_title}")
+            if row_dict.get("Content") != current_row.get("Content"):
+                print("\n--- Content Diff ---")
+                self.print_diff(
+                    current_row.get("Content") or "", row_dict.get("Content") or ""
+                )
+                print(f"Merged: {merged_content}")
+            while choice not in ["c", "i", "m"]:
+                choice = input("Keep (c)urrent, (i)ncoming, or (m)erged? ").lower()
+            self.conflict_cache["Note"][conflict_key] = choice
+
+        final_t, final_c = current_row.get("Title"), current_row.get("Content")
+        if choice == "i":
+            final_t, final_c = row_dict.get("Title"), row_dict.get("Content")
+        elif choice == "m":
+            final_t, final_c = merged_title, merged_content
+
+        latest_ts = max(
+            row_dict.get("LastModified") or "", current_row.get("LastModified") or ""
+        )
+        merged_cursor.execute(
+            f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE {self.primary_keys[table][0]} = ?",
+            (final_t, final_c, latest_ts, existing_pk),
+        )
+
     def process_databases(self, database_files):
         """Process databases
 
@@ -163,1061 +891,14 @@ class JwlBackupProcessor:
         Returns:
             None
         """
-        self.start_time = time()
-        self.note_bases = {}
-
-        # Initialize merged_db from first file
-        first_db = database_files[0]
-        copy2(first_db, self.merged_db_path)
-        merged_conn = sqlite3.connect(self.merged_db_path)
-        merged_cursor = merged_conn.cursor()
-        self.get_table_info(merged_conn)
-
-        # Empty all tables in merged_db
-        for table in self.primary_keys.keys():
-            if table not in ["grdb_migrations", "LastModified"]:
-                merged_cursor.execute(f"DELETE FROM {table};")
-        merged_conn.commit()
-
-        # Table processing order (dependencies first)
-        table_order = [
-            "Location",
-            "IndependentMedia",
-            "Tag",
-            "PlaylistItemAccuracy",
-            "PlaylistItem",
-            "UserMark",
-            "BlockRange",
-            "Note",
-            "Bookmark",
-            "TagMap",
-            "InputField",
-            "PlaylistItemIndependentMediaMap",
-            "PlaylistItemLocationMap",
-            "PlaylistItemMarker",
-            "PlaylistItemMarkerBibleVerseMap",
-            "PlaylistItemMarkerParagraphMap",
-        ]
-
-        # Deduplication Identity Keys
-        identity_keys = {
-            "Location": [
-                "BookNumber",
-                "ChapterNumber",
-                "DocumentId",
-                "Track",
-                "IssueTagNumber",
-                "KeySymbol",
-                "MepsLanguage",
-                "Type",
-                "Title",
-            ],
-            "Tag": ["Type", "Name"],
-            "IndependentMedia": ["Hash"],
-            "PlaylistItemAccuracy": ["Description"],
-            "PlaylistItem": ["Label", "ThumbnailFilePath"],
-            "UserMark": ["UserMarkGuid"],
-            "Note": ["Guid"],
-            "Bookmark": ["PublicationLocationId", "Slot"],
-            "BlockRange": ["BlockType", "Identifier", "UserMarkId"],
-            "InputField": ["LocationId", "TextTag"],
-            "TagMap": ["TagId", "PlaylistItemId", "LocationId", "NoteId"],
-            "PlaylistItemIndependentMediaMap": ["PlaylistItemId", "IndependentMediaId"],
-            "PlaylistItemLocationMap": ["PlaylistItemId", "LocationId"],
-            "PlaylistItemMarkerBibleVerseMap": ["PlaylistItemMarkerId", "VerseId"],
-            "PlaylistItemMarkerParagraphMap": [
-                "PlaylistItemMarkerId",
-                "MepsDocumentId",
-                "ParagraphIndex",
-                "MarkerIndexWithinParagraph",
-            ],
-        }
+        merged_conn = self._initialize_merge(database_files)
 
         for file_path in tqdm(database_files, desc="Merging databases"):
-            source_conn = sqlite3.connect(file_path)
-            source_cursor = source_conn.cursor()
-            skipped_pks = {}  # {table: set(old_pk)}
-            self.pk_map = {}  # Clear for each file to avoid old PK collisions!
-
-            for table_target in table_order:
-                table = self.table_name_map.get(table_target.lower())
-                if not table or table not in self.primary_keys:
-                    continue
-
-                # Get data from source
-                try:
-                    source_cursor.execute(f"SELECT * FROM [{table}]")
-                except sqlite3.Error:
-                    continue  # Table might not exist in this database
-
-                cols_source = [
-                    description[0] for description in source_cursor.description
-                ]
-                rows = source_cursor.fetchall()
-
-                if table not in self.pk_map:
-                    self.pk_map[table] = {}
-                if table not in skipped_pks:
-                    skipped_pks[table] = set()
-
-                # Get target column names for consistency
-                merged_cursor.execute(f"PRAGMA table_info([{table}])")
-                cols_target = [col[1] for col in merged_cursor.fetchall()]
-
-                # Pre-scan this table for conflicts
-                table_conflicts = 0
-                table_automerged = 0
-
-                # Pre-scan (non-UserMark tables)
-                if table_target in ["Bookmark", "InputField", "Note"]:
-                    for row in rows:
-                        # Temporary dict to check identity
-                        temp_row = dict(zip(cols_source, row))
-                        temp_dict = {}
-                        for ct in cols_target:
-                            cs = next(
-                                (k for k in temp_row if k.lower() == ct.lower()), None
-                            )
-                            temp_dict[ct] = temp_row[cs] if cs else None
-
-                        # Remap FKs for identity check
-                        table_lower = table.lower()
-                        if table_lower in self.fk_map:
-                            for c_name, val in temp_dict.items():
-                                c_lower = c_name.lower()
-                                if c_lower in self.fk_map[table_lower]:
-                                    t_table, t_col = self.fk_map[table_lower][c_lower]
-                                    t_canonical = self.table_name_map.get(
-                                        t_table.lower(), t_table
-                                    )
-                                    if val in self.pk_map.get(t_canonical, {}):
-                                        temp_dict[c_name] = self.pk_map[t_canonical][
-                                            val
-                                        ]
-
-                        # Check identity
-                        id_cols = identity_keys.get(table_target)
-                        if id_cols:
-                            query = (
-                                f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE "
-                                + " AND ".join([f"[{k}] IS ?" for k in id_cols])
-                            )
-                            merged_cursor.execute(
-                                query, [temp_dict.get(k) for k in id_cols]
-                            )
-                            res = merged_cursor.fetchone()
-                            if res:
-                                # Conflict check
-                                merged_cursor.execute(
-                                    f"SELECT * FROM [{table}] WHERE {self.primary_keys[table][0]} = ?",
-                                    (res[0],),
-                                )
-                                curr = dict(zip(cols_target, merged_cursor.fetchone()))
-                                is_diff = False
-                                for c in temp_dict:
-                                    if c in self.primary_keys[table]:
-                                        continue
-                                    if table_target == "Note" and c in [
-                                        "Title",
-                                        "Content",
-                                    ]:
-                                        if (temp_dict[c] or "") != (curr.get(c) or ""):
-                                            is_diff = True
-                                            break
-                                    elif temp_dict[c] != curr.get(c):
-                                        is_diff = True
-                                        break
-
-                                if is_diff:
-                                    table_conflicts += 1
-
-                table_conflict_index = 0
-                automerge_stats_shown = False
-
-                # Special handling for UserMark: process location by location
-                if table_target == "UserMark":
-                    # Group incoming UserMarks by LocationId
-                    loc_to_usermarks = {}
-                    for row in rows:
-                        row_dict_source = dict(zip(cols_source, row))
-                        loc_id = row_dict_source.get("LocationId")
-                        if loc_id not in loc_to_usermarks:
-                            loc_to_usermarks[loc_id] = []
-                        loc_to_usermarks[loc_id].append(row_dict_source)
-
-                    for loc_id, incoming_rows in loc_to_usermarks.items():
-                        # We need to simulate the grouping to get counts
-                        # 1. Get existing
-                        merged_cursor.execute(
-                            "SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?",
-                            (loc_id,),
-                        )
-                        existing_usermarks = merged_cursor.fetchall()
-                        all_highlights = []
-                        for um_id, color in existing_usermarks:
-                            merged_cursor.execute(
-                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                (um_id,),
-                            )
-                            ranges = sorted(merged_cursor.fetchall())
-                            all_highlights.append(
-                                {"color": color, "ranges": ranges, "source": "current"}
-                            )
-                        # 2. Add incoming
-                        for row_dict_source in incoming_rows:
-                            old_pk = row_dict_source.get(self.primary_keys[table][0])
-                            source_cursor.execute(
-                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                (old_pk,),
-                            )
-                            inc_ranges = sorted(source_cursor.fetchall())
-                            inc_color = row_dict_source.get("ColorIndex")
-                            all_highlights.append(
-                                {
-                                    "color": inc_color,
-                                    "ranges": inc_ranges,
-                                    "source": "incoming",
-                                }
-                            )
-
-                        # 3. Find components
-                        num_hl = len(all_highlights)
-                        adj = {i: set() for i in range(num_hl)}
-                        for i in range(num_hl):
-                            for j in range(i + 1, num_hl):
-                                h1, h2 = all_highlights[i], all_highlights[j]
-                                same_sig = (
-                                    h1["color"] == h2["color"]
-                                    and h1["ranges"] == h2["ranges"]
-                                )
-                                overlap = False
-                                if not same_sig:
-                                    for r1 in h1["ranges"]:
-                                        for r2 in h2["ranges"]:
-                                            if r1[0] == r2[0] and r1[1] == r2[1]:
-                                                if r1[2] < r2[3] and r2[2] < r1[3]:
-                                                    overlap = True
-                                                    break
-                                        if overlap:
-                                            break
-                                if same_sig or overlap:
-                                    adj[i].add(j)
-                                    adj[j].add(i)
-
-                        visited = set()
-                        for i in range(num_hl):
-                            if i not in visited:
-                                comp = []
-                                stack = [i]
-                                visited.add(i)
-                                sigs = set()
-                                has_current = False
-                                while stack:
-                                    curr = stack.pop()
-                                    hl = all_highlights[curr]
-                                    sigs.add((hl["color"], tuple(hl["ranges"])))
-                                    if hl["source"] == "current":
-                                        has_current = True
-                                    for neighbor in adj[curr]:
-                                        if neighbor not in visited:
-                                            visited.add(neighbor)
-                                            stack.append(neighbor)
-                                if len(sigs) > 1:
-                                    table_conflicts += 1
-                                elif len(all_highlights) > 1 and has_current:
-                                    # This logic is a bit simplified but good enough for counting automerge
-                                    # (multiple highlights in component but all same signature)
-                                    # Wait, if sigs is 1 but we have multiple highlights, it's automerge
-                                    # IF there's at least one current to merge into.
-                                    table_automerged += 1
-
-                    # Sort locations (optional, but keep it ordered like before if possible)
-                    source_cursor.execute("SELECT LocationId, KeySymbol FROM Location")
-                    loc_symbol_map = {
-                        r[0]: (r[1] or "") for r in source_cursor.fetchall()
-                    }
-                    sorted_loc_ids = sorted(
-                        loc_to_usermarks.keys(),
-                        key=lambda lid: loc_symbol_map.get(lid, ""),
-                    )
-
-                    for loc_id in sorted_loc_ids:
-                        incoming_rows = loc_to_usermarks[loc_id]
-
-                        # Get all existing highlights at this location in merged DB
-                        merged_cursor.execute(
-                            "SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?",
-                            (loc_id,),
-                        )
-                        existing_usermarks = merged_cursor.fetchall()
-                        all_highlights = []
-
-                        # Add existing highlights
-                        for um_id, color in existing_usermarks:
-                            merged_cursor.execute(
-                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                (um_id,),
-                            )
-                            ranges = sorted(merged_cursor.fetchall())
-                            all_highlights.append(
-                                {
-                                    "usermark_id": um_id,
-                                    "color": color,
-                                    "ranges": ranges,
-                                    "source": "current",
-                                }
-                            )
-
-                        # Add all incoming highlights for this location
-                        for row_dict_source in incoming_rows:
-                            # Map source row to target schema
-                            row_dict = {}
-                            source_cols_lower = {
-                                k.lower(): k for k in row_dict_source.keys()
-                            }
-                            for col_target in cols_target:
-                                col_source = source_cols_lower.get(col_target.lower())
-                                row_dict[col_target] = (
-                                    row_dict_source[col_source] if col_source else None
-                                )
-
-                            old_pk = row_dict_source.get(self.primary_keys[table][0])
-
-                            # Fetch incoming ranges
-                            source_cursor.execute(
-                                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                (old_pk,),
-                            )
-                            inc_ranges = sorted(source_cursor.fetchall())
-                            inc_color = row_dict.get("ColorIndex")
-
-                            all_highlights.append(
-                                {
-                                    "usermark_id": old_pk,
-                                    "color": inc_color,
-                                    "ranges": inc_ranges,
-                                    "source": "incoming",
-                                    "row_dict": row_dict,
-                                }
-                            )
-
-                        # Group by actual overlap or identical signature within this location
-                        # Two highlights have an edge if they overlap OR have same signature
-                        num_hl = len(all_highlights)
-                        adj = {i: set() for i in range(num_hl)}
-                        for i in range(num_hl):
-                            for j in range(i + 1, num_hl):
-                                h1, h2 = all_highlights[i], all_highlights[j]
-                                # Check identical signature
-                                same_sig = (
-                                    h1["color"] == h2["color"]
-                                    and h1["ranges"] == h2["ranges"]
-                                )
-                                # Check overlap
-                                overlap = False
-                                if not same_sig:
-                                    for r1 in h1["ranges"]:
-                                        for r2 in h2["ranges"]:
-                                            # BlockType, Identifier match
-                                            if r1[0] == r2[0] and r1[1] == r2[1]:
-                                                # Token overlap
-                                                if r1[2] < r2[3] and r2[2] < r1[3]:
-                                                    overlap = True
-                                                    break
-                                        if overlap:
-                                            break
-                                if same_sig or overlap:
-                                    adj[i].add(j)
-                                    adj[j].add(i)
-
-                        # Find connected components
-                        visited = set()
-                        hl_components = []
-                        for i in range(num_hl):
-                            if i not in visited:
-                                comp = []
-                                stack = [i]
-                                visited.add(i)
-                                while stack:
-                                    curr = stack.pop()
-                                    comp.append(all_highlights[curr])
-                                    for neighbor in adj[curr]:
-                                        if neighbor not in visited:
-                                            visited.add(neighbor)
-                                            stack.append(neighbor)
-                                hl_components.append(comp)
-
-                        for comp_highlights in hl_components:
-                            # Group by unique signature (color + ranges) within this component
-                            signature_groups = {}  # {(color, tuple(ranges)): [highlight_dicts]}
-                            for hl in comp_highlights:
-                                sig = (hl["color"], tuple(hl["ranges"]))
-                                if sig not in signature_groups:
-                                    signature_groups[sig] = []
-                                signature_groups[sig].append(hl)
-
-                            # Check if we need user input
-                            needs_user_input = len(signature_groups) > 1
-
-                            if needs_user_input:
-                                # Show automerge statistics once
-                                if not automerge_stats_shown and table_automerged > 0:
-                                    print(
-                                        f"\n  Automerged {table_automerged} identical highlight(s)"
-                                    )
-                                    print(
-                                        f"  {table_conflicts} conflict(s) require your input\n"
-                                    )
-                                    automerge_stats_shown = True
-
-                                table_conflict_index += 1
-                                loc_info = self.get_location_info(merged_cursor, loc_id)
-                                print(
-                                    f"\nConflict {table_conflict_index}/{table_conflicts} in Highlight at {loc_info}:"
-                                )
-                                print(
-                                    f"  Found {len(comp_highlights)} highlight(s) with {len(signature_groups)} unique variant(s)"
-                                )
-
-                                color_names = {
-                                    1: "yellow",
-                                    2: "green",
-                                    3: "blue",
-                                    4: "red",
-                                    5: "orange",
-                                    6: "purple",
-                                }
-                                color_codes = {
-                                    1: "\033[93m",
-                                    2: "\033[92m",
-                                    3: "\033[94m",
-                                    4: "\033[91m",
-                                    5: "\033[38;5;208m",
-                                    6: "\033[95m",
-                                }
-                                RESET = "\033[0m"
-
-                                # Fetch text context info
-                                doc_id, lang, keysym, book, chapter = (
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                try:
-                                    merged_cursor.execute(
-                                        "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
-                                        (loc_id,),
-                                    )
-                                    loc_res = merged_cursor.fetchone()
-                                    if loc_res:
-                                        doc_id, lang, keysym, book, chapter = loc_res
-                                        print("  Fetching text context from JW.org...")
-                                except Exception as e:
-                                    print(f"Error fetching text context: {e}")
-                                    pass
-
-                                # Display options
-                                options = []
-                                for idx, (sig, group) in enumerate(
-                                    signature_groups.items(), 1
-                                ):
-                                    color, ranges = sig
-                                    sources = []
-                                    for hl in group:
-                                        if hl["source"] not in sources:
-                                            sources.append(hl["source"])
-
-                                    color_name = color_names.get(
-                                        color, f"color_{color}"
-                                    )
-                                    color_code = color_codes.get(color, "")
-
-                                    print(
-                                        f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
-                                    )
-
-                                    # Fetch text
-                                    text = None
-                                    if doc_id or (keysym and book and chapter):
-                                        try:
-                                            full_text = []
-                                            for r in ranges:
-                                                txt = self.get_highlighted_text(
-                                                    doc_id,
-                                                    r[1],
-                                                    r[2],
-                                                    r[3],
-                                                    lang,
-                                                    keysym,
-                                                    book,
-                                                    chapter,
-                                                )
-                                                if txt is None:
-                                                    text = None
-                                                    break
-                                                full_text.append(txt)
-                                            if full_text and None not in full_text:
-                                                text = " [...] ".join(full_text)
-                                        except Exception as e:
-                                            print(f"Error fetching text: {e}")
-                                            text = None
-
-                                    if text:
-                                        print(f"    Text: {color_code}'{text}'{RESET}")
-                                    else:
-                                        print("    (Text unavailable)")
-                                        print(f"    Ranges: {list(ranges)}")
-
-                                    options.append(
-                                        {
-                                            "color": color,
-                                            "ranges": ranges,
-                                            "highlights": group,
-                                        }
-                                    )
-
-                                conflict_key = (
-                                    (doc_id, lang, keysym, book, chapter),
-                                    tuple(sorted(signature_groups.keys())),
-                                )
-                                chosen_option = None
-                                if conflict_key in self.conflict_cache["UserMark"]:
-                                    chosen_sig = self.conflict_cache["UserMark"][
-                                        conflict_key
-                                    ]
-                                    chosen_option = next(
-                                        (
-                                            o
-                                            for o in options
-                                            if (o["color"], tuple(o["ranges"]))
-                                            == chosen_sig
-                                        ),
-                                        None,
-                                    )
-                                    if chosen_option:
-                                        print(
-                                            f"  (Using previously resolved choice: Option {options.index(chosen_option) + 1})"
-                                        )
-
-                                if not chosen_option:
-                                    choice_idx = None
-                                    while choice_idx is None:
-                                        try:
-                                            choice_str = input(
-                                                f"\n  Choose option (1-{len(options)}): "
-                                            ).strip()
-                                            choice_idx = int(choice_str)
-                                            if choice_idx < 1 or choice_idx > len(
-                                                options
-                                            ):
-                                                choice_idx = None
-                                        except ValueError:
-                                            pass
-
-                                    chosen_option = options[choice_idx - 1]
-                                    self.conflict_cache["UserMark"][conflict_key] = (
-                                        chosen_option["color"],
-                                        tuple(chosen_option["ranges"]),
-                                    )
-                            else:
-                                # Auto-merge or single variant
-                                if len(comp_highlights) > 1 and any(
-                                    h["source"] == "current" for h in comp_highlights
-                                ):
-                                    table_automerged += 1
-                                chosen_hl_proto = list(signature_groups.values())[0][0]
-                                chosen_option = {
-                                    "color": chosen_hl_proto["color"],
-                                    "ranges": chosen_hl_proto["ranges"],
-                                    "highlights": list(signature_groups.values())[0],
-                                }
-
-                            # Apply the chosen option
-                            # 1. Choose a lead UserMarkId from the chosen group
-                            lead_usermark_id = None
-                            # Prefer existing highlight if it's in the chosen group
-                            for hl in chosen_option["highlights"]:
-                                if hl["source"] == "current":
-                                    lead_usermark_id = hl["usermark_id"]
-                                    break
-                            if not lead_usermark_id:
-                                # If no existing highlight matches, we'll need to create/keep one incoming
-                                lead_usermark_id = chosen_option["highlights"][0][
-                                    "usermark_id"
-                                ]
-
-                            # 2. Remap ALL highlights in this component to the lead_usermark_id in our map
-                            for hl in comp_highlights:
-                                if hl["source"] == "incoming":
-                                    self.pk_map[table][hl["usermark_id"]] = (
-                                        lead_usermark_id
-                                    )
-
-                            # 3. Handle Merged DB cleanup and update
-                            # Remove all existing UserMarks in this COMPONENT that were NOT chosen
-                            comp_existing_ids = [
-                                hl["usermark_id"]
-                                for hl in comp_highlights
-                                if hl["source"] == "current"
-                            ]
-                            for um_id in comp_existing_ids:
-                                if um_id != lead_usermark_id:
-                                    # Remap references in Note table
-                                    merged_cursor.execute(
-                                        "UPDATE Note SET UserMarkId = ? WHERE UserMarkId = ?",
-                                        (lead_usermark_id, um_id),
-                                    )
-                                    # Delete BlockRanges
-                                    merged_cursor.execute(
-                                        "DELETE FROM BlockRange WHERE UserMarkId = ?",
-                                        (um_id,),
-                                    )
-                                    # Delete UserMark
-                                    merged_cursor.execute(
-                                        "DELETE FROM UserMark WHERE UserMarkId = ?",
-                                        (um_id,),
-                                    )
-
-                            # 4. If lead is incoming, we need to insert it (if not already there)
-                            if lead_usermark_id not in comp_existing_ids:
-                                # Insert the chosen incoming highlight
-                                chosen_hl = next(
-                                    hl
-                                    for hl in chosen_option["highlights"]
-                                    if hl["usermark_id"] == lead_usermark_id
-                                )
-                                row_dict = chosen_hl["row_dict"]
-
-                                # Clean PK
-                                insert_dict = row_dict.copy()
-                                pk_name = self.primary_keys[table][0]
-                                if isinstance(insert_dict.get(pk_name), int):
-                                    del insert_dict[pk_name]
-
-                                columns_str = ", ".join(
-                                    [f"[{k}]" for k in insert_dict.keys()]
-                                )
-                                placeholders = ", ".join(["?"] * len(insert_dict))
-                                merged_cursor.execute(
-                                    f"INSERT INTO [{table}] ({columns_str}) VALUES ({placeholders})",
-                                    list(insert_dict.values()),
-                                )
-                                new_pk = merged_cursor.lastrowid
-                                # Re-map all that were pointing to the temporary old_pk in this component
-                                for hl in comp_highlights:
-                                    if (
-                                        hl["source"] == "incoming"
-                                        and self.pk_map[table][hl["usermark_id"]]
-                                        == lead_usermark_id
-                                    ):
-                                        self.pk_map[table][hl["usermark_id"]] = new_pk
-
-                                lead_usermark_id = new_pk
-
-                                # Insert ranges for the new lead
-                                source_cursor.execute(
-                                    "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
-                                    (chosen_hl["usermark_id"],),
-                                )
-                                for br in source_cursor.fetchall():
-                                    merged_cursor.execute(
-                                        "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
-                                        list(br) + [lead_usermark_id],
-                                    )
-                            else:
-                                # Lead is already in DB, just ensure its color matches (in case we chose an incoming variant color)
-                                merged_cursor.execute(
-                                    "UPDATE UserMark SET ColorIndex = ? WHERE UserMarkId = ?",
-                                    (chosen_option["color"], lead_usermark_id),
-                                )
-                                # And ensure ranges match (delete and re-insert for simplicity)
-                                merged_cursor.execute(
-                                    "DELETE FROM BlockRange WHERE UserMarkId = ?",
-                                    (lead_usermark_id,),
-                                )
-                                # Get ranges from the chosen variant
-                                ranges = chosen_option["ranges"]
-                                for r in ranges:
-                                    merged_cursor.execute(
-                                        "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
-                                        list(r) + [lead_usermark_id],
-                                    )
-
-                            # Skip individual inserts for BlockRange for these incoming UserMarks in this component
-                            if "BlockRange" not in skipped_pks:
-                                skipped_pks["BlockRange"] = set()
-                            for hl in comp_highlights:
-                                if hl["source"] == "incoming":
-                                    source_cursor.execute(
-                                        "SELECT BlockRangeId FROM BlockRange WHERE UserMarkId = ?",
-                                        (hl["usermark_id"],),
-                                    )
-                                    for (br_id,) in source_cursor.fetchall():
-                                        skipped_pks["BlockRange"].add(br_id)
-
-                        continue  # Done with UserMark table for this file loc_id
-
-                    continue  # Done with UserMark table for this file
-
-                for row in rows:
-                    # Map source row to target schema
-                    row_dict_source = dict(zip(cols_source, row))
-                    row_dict = {}
-                    source_cols_lower = {k.lower(): k for k in row_dict_source.keys()}
-
-                    for col_target in cols_target:
-                        col_source = source_cols_lower.get(col_target.lower())
-                        row_dict[col_target] = (
-                            row_dict_source[col_source] if col_source else None
-                        )
-
-                    old_pk = (
-                        row_dict.get(self.primary_keys[table][0])
-                        if self.primary_keys[table]
-                        else None
-                    )
-
-                    if old_pk is not None and old_pk in skipped_pks.get(table, set()):
-                        continue
-
-                    # Remap Foreign Keys
-                    table_lower = table.lower()
-                    if table_lower in self.fk_map:
-                        for col_name, val in row_dict.items():
-                            col_lower = col_name.lower()
-                            if col_lower in self.fk_map[table_lower]:
-                                to_table, to_col = self.fk_map[table_lower][col_lower]
-                                to_table_canonical = self.table_name_map.get(
-                                    to_table.lower(), to_table
-                                )
-                                if val in self.pk_map.get(to_table_canonical, {}):
-                                    row_dict[col_name] = self.pk_map[
-                                        to_table_canonical
-                                    ][val]
-
-                    # Check for duplicates in merged_db
-                    identity_cols = identity_keys.get(table_target)
-                    existing_new_pk = None
-                    if identity_cols:
-                        conditions = []
-                        vals = []
-                        for c in identity_cols:
-                            if row_dict.get(c) is None:
-                                conditions.append(f"[{c}] IS ?")
-                            elif table_target == "Tag" and c == "Name":
-                                conditions.append(f"[{c}] = ? COLLATE NOCASE")
-                            else:
-                                conditions.append(f"[{c}] = ?")
-                            vals.append(row_dict.get(c))
-
-                        where_clause = " AND ".join(conditions)
-                        query = f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE {where_clause}"
-                        merged_cursor.execute(query, vals)
-                        res = merged_cursor.fetchone()
-                        if res:
-                            existing_new_pk = res[0]
-
-                    if existing_new_pk is not None:
-                        if table_target in ["Bookmark", "InputField"]:
-                            # Get existing data
-                            merged_cursor.execute(
-                                f"SELECT * FROM [{table}] WHERE {self.primary_keys[table][0]} = ?",
-                                (existing_new_pk,),
-                            )
-                            current_row = dict(
-                                zip(cols_target, merged_cursor.fetchone())
-                            )
-
-                            # Compare relevant fields
-                            diffs = {}
-                            for col in row_dict:
-                                if col in self.primary_keys[table]:
-                                    continue
-                                if row_dict[col] != current_row.get(col):
-                                    diffs[col] = (current_row.get(col), row_dict[col])
-
-                            if diffs:
-                                table_conflict_index += 1
-                                # Fetch context for the user
-                                loc_id = current_row.get("LocationId")
-                                loc_info = self.get_location_info(merged_cursor, loc_id)
-                                print(
-                                    f"\nConflict {table_conflict_index}/{table_conflicts} in {table_target} at {loc_info}:"
-                                )
-                                for col, (old_val, new_val) in diffs.items():
-                                    print(
-                                        f"  {col}: current='{old_val}' vs incoming='{new_val}'"
-                                    )
-
-                                choice = ""
-                                options = ["c", "i"]
-                                if table_target == "InputField":
-                                    options.append("m")
-                                    merged_val = self.merge_text(
-                                        None,
-                                        current_row.get("Value"),
-                                        row_dict.get("Value"),
-                                    )
-                                    print(f"  Merged value: '{merged_val}'")
-
-                                prompt = "Keep (c)urrent, (i)ncoming?"
-                                if "m" in options:
-                                    prompt = "Keep (c)urrent, (i)ncoming, or (m)erged?"
-
-                                # Caching logic
-                                # Get canonical location info
-                                merged_cursor.execute(
-                                    "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
-                                    (loc_id,),
-                                )
-                                loc_res = merged_cursor.fetchone()
-                                # Identity field
-                                id_field = (
-                                    "Slot" if table_target == "Bookmark" else "TextTag"
-                                )
-                                id_val = current_row.get(id_field)
-
-                                conflict_key = (
-                                    table_target,
-                                    loc_res,
-                                    id_val,
-                                    tuple(sorted(diffs.items())),
-                                )
-
-                                choice = self.conflict_cache[table_target].get(
-                                    conflict_key, ""
-                                )
-                                if choice:
-                                    print(
-                                        f"  (Using previously resolved choice: {choice})"
-                                    )
-                                else:
-                                    while choice not in options:
-                                        choice = input(f"{prompt} ").lower()
-                                    self.conflict_cache[table_target][conflict_key] = (
-                                        choice
-                                    )
-
-                                if choice == "i":
-                                    update_cols = ", ".join(
-                                        [f"[{k}] = ?" for k in diffs.keys()]
-                                    )
-                                    merged_cursor.execute(
-                                        f"UPDATE [{table}] SET {update_cols} WHERE {self.primary_keys[table][0]} = ?",
-                                        list(row_dict[k] for k in diffs.keys())
-                                        + [existing_new_pk],
-                                    )
-                                elif choice == "m" and table_target == "InputField":
-                                    merged_cursor.execute(
-                                        f"UPDATE [{table}] SET Value = ? WHERE {self.primary_keys[table][0]} = ?",
-                                        (merged_val, existing_new_pk),
-                                    )
-
-                        elif table_target == "Note":
-                            # Perform interactive 3-way merge for notes
-                            merged_cursor.execute(
-                                f"SELECT Title, Content, LastModified, LocationId FROM [{table}] WHERE {self.primary_keys[table][0]} = ?",
-                                (existing_new_pk,),
-                            )
-                            current_merged = merged_cursor.fetchone()
-                            curr_title, curr_content, m_ts, loc_id = current_merged
-
-                            guid = row_dict.get("Guid")
-                            base = self.note_bases.get(
-                                guid, {"title": curr_title, "content": curr_content}
-                            )
-
-                            inc_title = row_dict.get("Title") or ""
-                            inc_content = row_dict.get("Content") or ""
-                            curr_title = curr_title or ""
-                            curr_content = curr_content or ""
-
-                            merged_title = self.merge_text(
-                                base.get("title"), curr_title, inc_title
-                            )
-                            merged_content = self.merge_text(
-                                base.get("content"), curr_content, inc_content
-                            )
-
-                            if inc_title != curr_title or inc_content != curr_content:
-                                table_conflict_index += 1
-                                loc_info = self.get_location_info(merged_cursor, loc_id)
-                                print(
-                                    f"\nConflict {table_conflict_index}/{table_conflicts} in Note at {loc_info} (GUID: {guid}):"
-                                )
-
-                                if inc_title != curr_title:
-                                    print("\n--- Title Diff (current vs incoming) ---")
-                                    self.print_diff(curr_title, inc_title)
-
-                                    print("\n--- Auto-merged title ---")
-                                    print(merged_title)
-
-                                if inc_content != curr_content:
-                                    print(
-                                        "\n--- Content Diff (current vs incoming) ---"
-                                    )
-                                    self.print_diff(curr_content, inc_content)
-
-                                    print("\n--- Auto-merged content ---")
-                                    print(merged_content)
-
-                                print("\nOptions:")
-                                print("  [c]urrent")
-                                print("  [i]ncoming")
-                                print("  [m]erged")
-
-                                # Caching logic
-                                # Get canonical location info
-                                merged_cursor.execute(
-                                    "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
-                                    (loc_id,),
-                                )
-                                loc_res = merged_cursor.fetchone()
-                                conflict_key = (
-                                    guid,
-                                    loc_res,
-                                    (curr_title, curr_content),
-                                    (inc_title, inc_content),
-                                )
-
-                                choice = self.conflict_cache["Note"].get(
-                                    conflict_key, ""
-                                )
-                                if choice:
-                                    print(
-                                        f"  (Using previously resolved choice: {choice})"
-                                    )
-                                else:
-                                    while choice not in ["c", "i", "m"]:
-                                        choice = input(
-                                            "\nKeep (c)urrent, (i)ncoming, or (m)erged? "
-                                        ).lower()
-                                    self.conflict_cache["Note"][conflict_key] = choice
-
-                                final_title, final_content = curr_title, curr_content
-                                if choice == "i":
-                                    final_title, final_content = inc_title, inc_content
-                                elif choice == "m":
-                                    final_title, final_content = (
-                                        merged_title,
-                                        merged_content,
-                                    )
-
-                                # Determine latest LastModified
-                                s_ts = row_dict.get("LastModified")
-                                latest_ts = (
-                                    s_ts
-                                    if (not m_ts or (s_ts and s_ts > m_ts))
-                                    else m_ts
-                                )
-
-                                merged_cursor.execute(
-                                    f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE {self.primary_keys[table][0]} = ?",
-                                    (
-                                        final_title,
-                                        final_content,
-                                        latest_ts,
-                                        existing_new_pk,
-                                    ),
-                                )
-
-                        if old_pk is not None:
-                            self.pk_map[table][old_pk] = existing_new_pk
-                    else:
-                        # Insert new row
-                        insert_dict = row_dict.copy()
-                        if table_target == "Note":
-                            self.note_bases[row_dict.get("Guid")] = {
-                                "title": row_dict.get("Title"),
-                                "content": row_dict.get("Content"),
-                            }
-
-                        if len(self.primary_keys[table]) == 1:
-                            pk_name = self.primary_keys[table][0]
-                            if isinstance(insert_dict.get(pk_name), int):
-                                del insert_dict[pk_name]
-
-                        columns = ", ".join([f"[{k}]" for k in insert_dict.keys()])
-                        placeholders = ", ".join(["?"] * len(insert_dict))
-                        insert_query = (
-                            f"INSERT INTO [{table}] ({columns}) VALUES ({placeholders})"
-                        )
-
-                        try:
-                            merged_cursor.execute(
-                                insert_query, list(insert_dict.values())
-                            )
-                            new_pk = merged_cursor.lastrowid
-                            if old_pk is not None:
-                                self.pk_map[table][old_pk] = new_pk
-                        except sqlite3.IntegrityError as e:
-                            # Special handling for TagMap position conflicts
-                            if (
-                                table_target == "TagMap"
-                                and "TagMap.TagId, TagMap.Position" in str(e)
-                            ):
-                                tag_id = insert_dict.get("TagId")
-                                position = insert_dict.get("Position")
-                                # Shift existing items forward manually to avoid "ORDER BY" syntax requirements in UPDATE
-                                merged_cursor.execute(
-                                    f"SELECT TagMapId, Position FROM [{table}] WHERE TagId = ? AND Position >= ? ORDER BY Position DESC",
-                                    (tag_id, position),
-                                )
-                                for tid, pos in merged_cursor.fetchall():
-                                    merged_cursor.execute(
-                                        f"UPDATE [{table}] SET Position = ? WHERE TagMapId = ?",
-                                        (pos + 1, tid),
-                                    )
-                                # Retry insertion
-                                merged_cursor.execute(
-                                    insert_query, list(insert_dict.values())
-                                )
-                                new_pk = merged_cursor.lastrowid
-                                if old_pk is not None:
-                                    self.pk_map[table][old_pk] = new_pk
-                            else:
-                                self.output["errors"].append((table, insert_query, e))
-                        except sqlite3.Error as e:
-                            self.output["errors"].append((table, insert_query, e))
-
-            source_conn.close()
-            merged_conn.commit()
-
-        # Update LastModified
-        merged_cursor.execute(
-            "UPDATE LastModified SET LastModified = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');"
-        )
-        merged_conn.commit()
-
-        # Collect files for archive
-        try:
-            merged_cursor.execute(
-                "SELECT FilePath FROM IndependentMedia WHERE FilePath IS NOT NULL"
+            self._merge_database(
+                file_path, merged_conn, self.table_order, self.identity_keys
             )
-            self.files_to_include_in_archive.extend(
-                [r[0] for r in merged_cursor.fetchall()]
-            )
-        except Exception as e:
-            print(f"Error fetching file paths: {e}")
-            pass
-        try:
-            merged_cursor.execute(
-                "SELECT ThumbnailFilePath FROM PlaylistItem WHERE ThumbnailFilePath IS NOT NULL"
-            )
-            self.files_to_include_in_archive.extend(
-                [r[0] for r in merged_cursor.fetchall()]
-            )
-        except Exception as e:
-            print(f"Error fetching thumbnail file paths: {e}")
-            pass
-        self.files_to_include_in_archive = list(set(self.files_to_include_in_archive))
 
-        merged_conn.close()
-
-        merged_conn.close()
+        self._finalize_merge(merged_conn)
 
     def createJwlFile(self):
         """Create JWL file from the merged database in the working folder
@@ -1321,7 +1002,7 @@ class JwlBackupProcessor:
             output_jwl_file_path,
         )
 
-        processor.cleanTempFiles()
+        self.cleanTempFiles()
 
         print()
         end_time = time()
@@ -1796,7 +1477,7 @@ class JwlBackupProcessor:
                     )
                 )
             exit()
-        processor.cleanTempFiles(force=True)
+        self.cleanTempFiles(force=True)
         print(
             "JW Library backup files to be merged:\n"
             + "\n".join(["- " + file_path for file_path in file_paths])
@@ -1828,9 +1509,258 @@ class JwlBackupProcessor:
                 hash_sha256.update(chunk)
         return hash_sha256.hexdigest()
 
+    def _create_test_db(self, db_path, data_ops=None):
+        """Create a test database with schema and optional data"""
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Define Schema (Simplified based on usage)
+        schema = [
+            "CREATE TABLE IF NOT EXISTS Location (LocationId INTEGER PRIMARY KEY, BookNumber INTEGER, ChapterNumber INTEGER, DocumentId INTEGER, Track INTEGER, IssueTagNumber INTEGER, KeySymbol TEXT, MepsLanguage INTEGER, Type INTEGER, Title TEXT)",
+            "CREATE TABLE IF NOT EXISTS Tag (TagId INTEGER PRIMARY KEY, Type INTEGER, Name TEXT)",
+            "CREATE TABLE IF NOT EXISTS UserMark (UserMarkId INTEGER PRIMARY KEY, ColorIndex INTEGER, LocationId INTEGER, UserMarkGuid TEXT)",
+            "CREATE TABLE IF NOT EXISTS BlockRange (BlockRangeId INTEGER PRIMARY KEY, BlockType INTEGER, Identifier INTEGER, StartToken INTEGER, EndToken INTEGER, UserMarkId INTEGER)",
+            "CREATE TABLE IF NOT EXISTS Note (NoteId INTEGER PRIMARY KEY, Guid TEXT, Title TEXT, Content TEXT, LastModified TEXT, LocationId INTEGER, UserMarkId INTEGER)",
+            "CREATE TABLE IF NOT EXISTS Bookmark (BookmarkId INTEGER PRIMARY KEY, PublicationLocationId INTEGER, Slot INTEGER, Title TEXT, Snippet TEXT, LocationId INTEGER)",
+            "CREATE TABLE IF NOT EXISTS InputField (InputFieldId INTEGER PRIMARY KEY, LocationId INTEGER, TextTag TEXT, Value TEXT)",
+            "CREATE TABLE IF NOT EXISTS TagMap (TagMapId INTEGER PRIMARY KEY, TagId INTEGER, PlaylistItemId INTEGER, LocationId INTEGER, NoteId INTEGER, Position INTEGER)",
+            "CREATE TABLE IF NOT EXISTS PlaylistItem (PlaylistItemId INTEGER PRIMARY KEY, Label TEXT, ThumbnailFilePath TEXT, StoragePath TEXT)",
+            "CREATE TABLE IF NOT EXISTS IndependentMedia (IndependentMediaId INTEGER PRIMARY KEY, Hash TEXT, FilePath TEXT)",
+            "CREATE TABLE IF NOT EXISTS PlaylistItemAccuracy (PlaylistItemAccuracyId INTEGER PRIMARY KEY, Description TEXT)",
+            "CREATE TABLE IF NOT EXISTS PlaylistItemIndependentMediaMap (PlaylistItemId INTEGER, IndependentMediaId INTEGER)",
+            "CREATE TABLE IF NOT EXISTS PlaylistItemLocationMap (PlaylistItemId INTEGER, LocationId INTEGER)",
+            "CREATE TABLE IF NOT EXISTS PlaylistItemMarker (PlaylistItemMarkerId INTEGER PRIMARY KEY, PlaylistItemId INTEGER, Label TEXT, StartTime TEXT, Duration TEXT)",
+            "CREATE TABLE IF NOT EXISTS PlaylistItemMarkerBibleVerseMap (PlaylistItemMarkerId INTEGER, VerseId INTEGER)",
+            "CREATE TABLE IF NOT EXISTS PlaylistItemMarkerParagraphMap (PlaylistItemMarkerId INTEGER, MepsDocumentId INTEGER, ParagraphIndex INTEGER, MarkerIndexWithinParagraph INTEGER)",
+            "CREATE TABLE IF NOT EXISTS LastModified (LastModified TEXT)",
+            "INSERT INTO LastModified (LastModified) VALUES ('2026-01-29T00:00:00Z')",
+        ]
+
+        for statement in schema:
+            cursor.execute(statement)
+
+        if data_ops:
+            for table, rows in data_ops.items():
+                if not rows:
+                    continue
+                cols = ", ".join(rows[0].keys())
+                placeholders = ", ".join(["?"] * len(rows[0]))
+                for row in rows:
+                    cursor.execute(
+                        f"INSERT INTO {table} ({cols}) VALUES ({placeholders})",
+                        list(row.values()),
+                    )
+
+        conn.commit()
+        conn.close()
+
+    def run_tests(self):
+        """Run automated tests"""
+        print("\n=== Running Automated Tests ===\n")
+        import tempfile
+        import shutil
+
+        test_dir = tempfile.mkdtemp(prefix="jwl_test_")
+        try:
+            db1_path = path.join(test_dir, "db1.db")
+            db2_path = path.join(test_dir, "db2.db")
+            db3_path = path.join(test_dir, "db3.db")
+
+            # --- Case 1: Deduplication and Simple Merge ---
+            print("Test 1: Simple Deduplication...")
+            data1 = {
+                "Tag": [{"Type": 1, "Name": "Favorites"}],
+                "Location": [{"LocationId": 1, "KeySymbol": "nwt", "Title": "Psalm 1"}],
+            }
+            data2 = {
+                "Tag": [{"Type": 1, "Name": "Favorites"}],  # Duplicate
+                "Location": [
+                    {"LocationId": 1, "KeySymbol": "nwt", "Title": "Psalm 2"}
+                ],  # Different Title, should merge (if identity allows) or add
+            }
+            self._create_test_db(db1_path, data1)
+            self._create_test_db(db2_path, data2)
+
+            # Clear previous state
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            if not path.exists(self.working_folder):
+                makedirs(self.working_folder)
+
+            self.process_databases([db1_path, db2_path])
+
+            # Verify Tag
+            conn = sqlite3.connect(self.merged_db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM Tag")
+            tag_count = cursor.fetchone()[0]
+            conn.close()
+            assert tag_count == 1, f"Expected 1 tag, got {tag_count}"
+            print("  ✓ Tag deduplicated")
+
+            # --- Case 2: Note 3-way Merge (Simulated) ---
+            print("\nTest 2: Note 3-way Merge...")
+            # We'll use mocked input to bypass the blocking input() call
+            import builtins
+
+            original_input = builtins.input
+            builtins.input = lambda _: "m"  # Always choose 'merged'
+
+            data1_note = {
+                "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                "Note": [
+                    {
+                        "Guid": "note-123",
+                        "Title": "Base Title",
+                        "Content": "Base Content",
+                        "LocationId": 10,
+                    }
+                ],
+            }
+            data2_note = {
+                "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                "Note": [
+                    {
+                        "Guid": "note-123",
+                        "Title": "User A Title",
+                        "Content": "Base Content",
+                        "LocationId": 10,
+                    }
+                ],
+            }
+            data3_note = {
+                "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                "Note": [
+                    {
+                        "Guid": "note-123",
+                        "Title": "Base Title",
+                        "Content": "User B Content",
+                        "LocationId": 10,
+                    }
+                ],
+            }
+
+            # Note: process_databases uses the first file as base.
+            # To simulate 3-way, we need to populate note_bases which usually happens when a note is first seen.
+            # But here we are merging db1, then db2, then db3.
+
+            self._create_test_db(db1_path, data1_note)
+            self._create_test_db(db2_path, data2_note)
+            self._create_test_db(db3_path, data3_note)
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path, db3_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT Title, Content FROM Note WHERE Guid = 'note-123'")
+            res = cursor.fetchone()
+            conn.close()
+            assert res[0] == "User A Title", f"Expected 'User A Title', got '{res[0]}'"
+            assert res[1] == "User B Content", (
+                f"Expected 'User B Content', got '{res[1]}'"
+            )
+            print("  ✓ Note 3-way merge successful (with mocked input)")
+
+            builtins.input = original_input
+
+            # --- Case 3: UserMark Overlap detection ---
+            print("\nTest 3: UserMark Overlap (Identity matching)...")
+            builtins.input = lambda _: "1"  # Choose Option 1
+
+            data1_um = {
+                "Location": [{"LocationId": 20, "DocumentId": 123, "MepsLanguage": 0}],
+                "UserMark": [
+                    {
+                        "UserMarkId": 100,
+                        "ColorIndex": 1,
+                        "LocationId": 20,
+                        "UserMarkGuid": "um-1",
+                    }
+                ],
+                "BlockRange": [
+                    {
+                        "BlockType": 1,
+                        "Identifier": 1,
+                        "StartToken": 0,
+                        "EndToken": 10,
+                        "UserMarkId": 100,
+                    }
+                ],
+            }
+            data2_um = {
+                "Location": [{"LocationId": 20, "DocumentId": 123, "MepsLanguage": 0}],
+                "UserMark": [
+                    {
+                        "UserMarkId": 200,
+                        "ColorIndex": 1,
+                        "LocationId": 20,
+                        "UserMarkGuid": "um-2",
+                    }
+                ],
+                "BlockRange": [
+                    {
+                        "BlockType": 1,
+                        "Identifier": 1,
+                        "StartToken": 0,
+                        "EndToken": 10,
+                        "UserMarkId": 200,
+                    }
+                ],
+            }
+            self._create_test_db(db1_path, data1_um)
+            self._create_test_db(db2_path, data2_um)
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM UserMark")
+            um_count = cursor.fetchone()[0]
+            conn.close()
+            assert um_count == 1, (
+                f"Expected 1 UserMark due to identical signature merging, got {um_count}"
+            )
+            print("  ✓ UserMark identical signature merged")
+
+            builtins.input = original_input
+
+            print("\n=== All Tests Passed! ===\n")
+
+        finally:
+            import time
+
+            def secure_delete(path_to_del, is_dir=False):
+                for _ in range(5):
+                    try:
+                        if is_dir:
+                            if path.exists(path_to_del):
+                                shutil.rmtree(path_to_del)
+                        else:
+                            if path.exists(path_to_del):
+                                remove(path_to_del)
+                        return
+                    except PermissionError:
+                        time.sleep(0.1)
+                    except Exception:
+                        break
+
+            secure_delete(test_dir, True)
+            secure_delete(self.merged_db_path)
+            secure_delete(self.working_folder, True)
+
 
 if __name__ == "__main__":
     processor = JwlBackupProcessor()
-    selected_paths = processor.getJwlFiles()
-    processor.process_databases(selected_paths)
-    processor.createJwlFile()
+    if args.test:
+        processor.run_tests()
+    else:
+        selected_paths = processor.getJwlFiles()
+        if selected_paths:
+            processor.process_databases(selected_paths)
+            processor.createJwlFile()
+        else:
+            print("No JWL files selected for merge.")
