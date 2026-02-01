@@ -25,6 +25,9 @@ parser.add_argument("--file", type=str, help="JWL file to merge", action="append
 parser.add_argument("--test", action="store_true", help="Run automated tests")
 args = parser.parse_args()
 
+selectBlockRangeSql = "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?"
+selectLocationSql = "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?"
+
 
 class PExtractor(HTMLParser):
     def __init__(self, pid=None):
@@ -95,6 +98,7 @@ if args.file and len(args.file) == 1 and args.folder is None:
 class JwlBackupProcessor:
     def __init__(self):
         self.app_name = "jw-backup-merger"
+        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         self.debug = args.debug
         self.merged_tables = {}
         self.primary_keys = {}
@@ -294,7 +298,6 @@ class JwlBackupProcessor:
             self._process_generic_table(
                 table,
                 table_target,
-                source_cursor,
                 merged_cursor,
                 identity_keys,
                 skipped_pks,
@@ -372,7 +375,7 @@ class JwlBackupProcessor:
         )
         for um_id, color in merged_cursor.fetchall():
             merged_cursor.execute(
-                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                selectBlockRangeSql,
                 (um_id,),
             )
             all_highlights.append(
@@ -387,7 +390,7 @@ class JwlBackupProcessor:
         for row_src in incoming_rows:
             old_pk = row_src.get(self.primary_keys[table][0])
             source_cursor.execute(
-                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                selectBlockRangeSql,
                 (old_pk,),
             )
             row_dict = {
@@ -476,7 +479,7 @@ class JwlBackupProcessor:
 
         # Fetch context
         merged_cursor.execute(
-            "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+            selectLocationSql,
             (loc_id,),
         )
         loc_res = merged_cursor.fetchone()
@@ -486,7 +489,7 @@ class JwlBackupProcessor:
         options = []
         for idx, (sig, group) in enumerate(sig_groups.items(), 1):
             color, ranges = sig
-            sources = sorted(list(set(hl["source"] for hl in group)))
+            sources = sorted({hl["source"] for hl in group})
 
             color_name = color_names.get(color, f"color_{color}")
             color_code = color_codes.get(color, "")
@@ -601,7 +604,7 @@ class JwlBackupProcessor:
             new_pk = merged_cursor.lastrowid
 
             # Re-map all pointing to previously selected lead_id
-            for hl_id, mapped_id in list(self.pk_map[table].items()):
+            for hl_id, mapped_id in self.pk_map[table].items():
                 if mapped_id == lead_id:
                     self.pk_map[table][hl_id] = new_pk
             lead_id = new_pk
@@ -640,7 +643,6 @@ class JwlBackupProcessor:
         self,
         table,
         table_target,
-        source_cursor,
         merged_cursor,
         identity_keys,
         skipped_pks,
@@ -691,7 +693,7 @@ class JwlBackupProcessor:
             for col_name, val in row_dict.items():
                 col_lower = col_name.lower()
                 if col_lower in self.fk_map[table_lower]:
-                    to_table, to_col = self.fk_map[table_lower][col_lower]
+                    to_table, _ = self.fk_map[table_lower][col_lower]
                     to_table_canonical = self.table_name_map.get(
                         to_table.lower(), to_table
                     )
@@ -784,7 +786,7 @@ class JwlBackupProcessor:
 
         if table_target == "Note":
             return self._handle_note_merge(
-                table, merged_cursor, existing_pk, row_dict, current_row, diffs
+                table, merged_cursor, existing_pk, row_dict, current_row
             )
 
         loc_info = self.get_location_info(merged_cursor, current_row.get("LocationId"))
@@ -803,7 +805,7 @@ class JwlBackupProcessor:
 
         # Caching and Choice
         merged_cursor.execute(
-            "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+            selectLocationSql,
             (current_row.get("LocationId"),),
         )
         loc_res = merged_cursor.fetchone()
@@ -828,7 +830,7 @@ class JwlBackupProcessor:
             set_clause = ", ".join([f"[{k}] = ?" for k in diffs.keys()])
             merged_cursor.execute(
                 f"UPDATE [{table}] SET {set_clause} WHERE {self.primary_keys[table][0]} = ?",
-                list(row_dict[k] for k in diffs.keys()) + [existing_pk],
+                [row_dict[k] for k in diffs.keys()] + [existing_pk],
             )
         elif choice == "m" and table_target == "InputField":
             merged_cursor.execute(
@@ -837,7 +839,7 @@ class JwlBackupProcessor:
             )
 
     def _handle_note_merge(
-        self, table, merged_cursor, existing_pk, row_dict, current_row, diffs
+        self, table, merged_cursor, existing_pk, row_dict, current_row
     ):
         """Specific 3-way merge logic for Note content and title"""
         guid = row_dict.get("Guid")
@@ -866,7 +868,7 @@ class JwlBackupProcessor:
         print(f"\nConflict in Note at {loc_info} (GUID: {guid}):")
 
         merged_cursor.execute(
-            "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?",
+            selectLocationSql,
             (current_row.get("LocationId"),),
         )
         loc_res = merged_cursor.fetchone()
@@ -929,7 +931,7 @@ class JwlBackupProcessor:
 
         self._finalize_merge(merged_conn)
 
-    def createJwlFile(self):
+    def create_jwl_file(self):
         """Create JWL file from the merged database in the working folder
 
         Returns:
@@ -937,12 +939,12 @@ class JwlBackupProcessor:
         """
         merged_dir = path.join(self.working_folder, "merged")
         manifest_file_path = path.join(merged_dir, "manifest.json")
-        all_unzip_folder_names = list(
+        all_unzip_folder_names = [
             directory
             for directory in listdir(self.working_folder)
             if directory != "merged"
             and path.isdir(path.join(self.working_folder, directory))
-        )
+        ]
         first_jwl_unzip_folder_name = all_unzip_folder_names[0]
         first_jwl_unzip_folder_path = path.join(
             self.working_folder, first_jwl_unzip_folder_name
@@ -1003,14 +1005,14 @@ class JwlBackupProcessor:
 
         manifest_data["name"] = self.app_name
 
-        userDataBackup = {
+        user_data_backup = {
             "lastModifiedDate": formatted_date,
             "hash": self.calculate_sha256(database_file_path),
             "databaseName": manifest_data["userDataBackup"]["databaseName"],
             "schemaVersion": manifest_data["userDataBackup"]["schemaVersion"],
             "deviceName": self.app_name,
         }
-        manifest_data["userDataBackup"] = userDataBackup
+        manifest_data["userDataBackup"] = user_data_backup
 
         with open(manifest_file_path, "w") as file:
             json.dump(manifest_data, file, indent=2)
@@ -1031,7 +1033,7 @@ class JwlBackupProcessor:
             output_jwl_file_path,
         )
 
-        self.cleanTempFiles()
+        self.clean_temp_files()
 
         print()
         end_time = time()
@@ -1111,7 +1113,7 @@ class JwlBackupProcessor:
                 try:
                     home_url = f"https://www.jw.org/{ietf_code}"
                     headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "User-Agent": self.user_agent,
                     }
                     r = requests.get(home_url, headers=headers, timeout=5)
                     r.raise_for_status()
@@ -1159,7 +1161,7 @@ class JwlBackupProcessor:
                         data = self.doc_cache[url]
                     else:
                         headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                            "User-Agent": self.user_agent,
                         }
                         r = requests.get(url, headers=headers, timeout=10)
                         r.raise_for_status()
@@ -1218,13 +1220,13 @@ class JwlBackupProcessor:
             url = f"https://www.jw.org/open?docid={docid}&wtlocale={lang_code}&appLanguage=E&prefer=content"
             try:
                 headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "User-Agent": self.user_agent,
                 }
 
                 r = requests.get(url, headers=headers, timeout=5)
 
                 if urlparse(r.url).path.count("/") <= 2:
-                    raise Exception(f"Invalid redirect to {r.url}")
+                    raise ValueError(f"Invalid redirect to {r.url}")
 
                 html_content = r.text
                 self.doc_cache[(docid, lang_code)] = html_content
@@ -1277,7 +1279,7 @@ class JwlBackupProcessor:
         for um_id in candidate_usermarks:
             # Get ranges for this UserMark
             cursor.execute(
-                "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?",
+                selectBlockRangeSql,
                 (um_id,),
             )
             existing_ranges = cursor.fetchall()  # List of tuples
@@ -1421,7 +1423,7 @@ class JwlBackupProcessor:
 
         return prefix + merged_m + suffix
 
-    def cleanTempFiles(self, force=False):
+    def clean_temp_files(self, force=False):
         """Clean up temporary files
 
         Args:
@@ -1436,7 +1438,7 @@ class JwlBackupProcessor:
             print()
             print("Cleaned up working directory!")
 
-    def unzipFile(self, file_path):
+    def unzip_file(self, file_path):
         """Unzip a file
 
         Args:
@@ -1446,26 +1448,26 @@ class JwlBackupProcessor:
             str: Path to the unzipped file
         """
         basename = path.splitext(path.basename(file_path))[0]
-        unzipPath = path.join(self.working_folder, basename)
-        unpack_archive(file_path, extract_dir=unzipPath, format="zip")
-        return unzipPath
+        unzip_path = path.join(self.working_folder, basename)
+        unpack_archive(file_path, extract_dir=unzip_path, format="zip")
+        return unzip_path
 
-    def getFirstDBFile(self, unzipPath):
+    def get_first_db_file(self, unzip_path):
         """Get the first database file in the unzipped folder
 
         Args:
-            unzipPath (str): Path to the unzipped folder
+            unzip_path (str): Path to the unzipped folder
 
         Returns:
             str: Path to the first database file
         """
-        db_files = glob(unzipPath + "/*.db")
+        db_files = glob(unzip_path + "/*.db")
         if db_files:
             return db_files[0]
         else:
             return None
 
-    def getJwlFiles(self):
+    def get_jwl_files(self):
         """Get the list of JW Library backup files to merge
 
         Returns:
@@ -1506,7 +1508,7 @@ class JwlBackupProcessor:
                     )
                 )
             exit()
-        self.cleanTempFiles(force=True)
+        self.clean_temp_files(force=True)
         print(
             "JW Library backup files to be merged:\n"
             + "\n".join(["- " + file_path for file_path in file_paths])
@@ -1516,7 +1518,7 @@ class JwlBackupProcessor:
             remove(self.merged_db_path)
         db_paths = []
         for file_path in tqdm(file_paths, desc="Extracting databases"):
-            db_path = self.getFirstDBFile(self.unzipFile(file_path))
+            db_path = self.get_first_db_file(self.unzip_file(file_path))
             copy2(db_path, self.merged_db_path)
             db_paths.append(db_path)
         return db_paths
@@ -1635,8 +1637,10 @@ class JwlBackupProcessor:
             original_input = builtins.input
             builtins.input = lambda _: "m"  # Always choose 'merged'
 
+            note_loc_title = "Note Loc"
+
             data1_note = {
-                "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                "Location": [{"LocationId": 10, "Title": note_loc_title}],
                 "Note": [
                     {
                         "Guid": "note-123",
@@ -1647,7 +1651,7 @@ class JwlBackupProcessor:
                 ],
             }
             data2_note = {
-                "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                "Location": [{"LocationId": 10, "Title": note_loc_title}],
                 "Note": [
                     {
                         "Guid": "note-123",
@@ -1658,7 +1662,7 @@ class JwlBackupProcessor:
                 ],
             }
             data3_note = {
-                "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                "Location": [{"LocationId": 10, "Title": note_loc_title}],
                 "Note": [
                     {
                         "Guid": "note-123",
@@ -1787,9 +1791,9 @@ if __name__ == "__main__":
     if args.test:
         processor.run_tests()
     else:
-        selected_paths = processor.getJwlFiles()
+        selected_paths = processor.get_jwl_files()
         if selected_paths:
             processor.process_databases(selected_paths)
-            processor.createJwlFile()
+            processor.create_jwl_file()
         else:
             print("No JWL files selected for merge.")

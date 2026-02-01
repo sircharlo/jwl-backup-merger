@@ -1,22 +1,26 @@
 {
-    "cSpell.words": [
-        "blockrange",
-        "blockranges",
-        "cumcount",
-        "dateutil",
-        "dropna",
-        "executemany",
-        "fillna",
-        "gettz",
-        "grdb",
-        "isin",
-        "iterrows",
-        "jwlibrary",
-        "Meps",
-        "notna",
-        "tqdm",
-        "Userdata",
-        "usermark",
-        "usermarks"
-    ]
+  "cSpell.words": [
+    "blockrange",
+    "blockranges",
+    "cumcount",
+    "dateutil",
+    "dropna",
+    "executemany",
+    "fillna",
+    "gettz",
+    "grdb",
+    "isin",
+    "iterrows",
+    "jwlibrary",
+    "Meps",
+    "notna",
+    "tqdm",
+    "Userdata",
+    "usermark",
+    "usermarks"
+  ],
+  "sonarlint.connectedMode.project": {
+    "connectionId": "sircharlo",
+    "projectKey": "sircharlo_jwl-backup-merger"
+  }
 }
