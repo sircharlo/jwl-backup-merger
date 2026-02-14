@@ -15,8 +15,8 @@ from html.parser import HTMLParser
 import re
 from urllib.parse import urlparse
 import sys
-import tty
-import termios
+import importlib
+import importlib.util
 
 from langs import LANGUAGES
 
@@ -258,78 +258,39 @@ class JwlBackupProcessor:
     def _location_display_from_values(self, keysymbol):
         return str(keysymbol) if keysymbol else "(No KeySymbol)"
 
-    def _read_single_key(self):
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if ch == "\x1b":
-                ch += sys.stdin.read(1)
-                ch += sys.stdin.read(1)
-            return ch
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
     def _is_tty_interactive(self):
         return sys.stdin.isatty() and sys.stdout.isatty()
+
+    def _get_questionary(self):
+        if not self._is_tty_interactive():
+            return None
+        if importlib.util.find_spec("questionary") is None:
+            return None
+        return importlib.import_module("questionary")
 
     def _multi_select_menu(self, title, items):
         if not items:
             return []
-        if not self._is_tty_interactive():
+        questionary = self._get_questionary()
+        if questionary is None:
             return None
 
-        current = 0
-        selected = [False] * len(items)
-
-        while True:
-            print("\n" + title)
-            print("Use ↑/↓ (or j/k) to move, SPACE to toggle, ENTER to confirm, q to cancel")
-            for idx, item in enumerate(items):
-                pointer = ">" if idx == current else " "
-                mark = "x" if selected[idx] else " "
-                print(f" {pointer} [{mark}] {idx + 1}. {item}")
-
-            key = self._read_single_key()
-            if key in ("\x1b[A", "k"):
-                current = (current - 1) % len(items)
-            elif key in ("\x1b[B", "j"):
-                current = (current + 1) % len(items)
-            elif key == " ":
-                selected[current] = not selected[current]
-            elif key in ("\r", "\n"):
-                return [i for i, is_selected in enumerate(selected) if is_selected]
-            elif key.lower() == "q":
-                return []
-
-            print("\033[H\033[J", end="")
+        choices = [questionary.Choice(title=item, value=idx) for idx, item in enumerate(items)]
+        result = questionary.checkbox(title, choices=choices).ask()
+        if not result:
+            return []
+        return sorted(result)
 
     def _single_select_menu(self, title, items):
         if not items:
             return None
-        if not self._is_tty_interactive():
+        questionary = self._get_questionary()
+        if questionary is None:
             return None
 
-        current = 0
-        while True:
-            print("\n" + title)
-            print("Use ↑/↓ (or j/k) to move, SPACE or ENTER to choose, q to cancel")
-            for idx, item in enumerate(items):
-                pointer = ">" if idx == current else " "
-                print(f" {pointer} ( ) {idx + 1}. {item}")
-
-            key = self._read_single_key()
-            if key in ("\x1b[A", "k"):
-                current = (current - 1) % len(items)
-            elif key in ("\x1b[B", "j"):
-                current = (current + 1) % len(items)
-            elif key in (" ", "\r", "\n"):
-                return current
-            elif key.lower() == "q":
-                return None
-
-            print("\033[H\033[J", end="")
+        choices = [questionary.Choice(title=item, value=idx) for idx, item in enumerate(items)]
+        result = questionary.select(title, choices=choices).ask()
+        return result
 
     def _get_location_signature(self, cursor, location_id):
         cursor.execute(selectLocationPreferenceSql, (location_id,))
