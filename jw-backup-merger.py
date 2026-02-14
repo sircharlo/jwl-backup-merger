@@ -23,6 +23,18 @@ parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 parser.add_argument("--folder", type=str, help="Folder containing JWL files to merge")
 parser.add_argument("--file", type=str, help="JWL file to merge", action="append")
 parser.add_argument("--test", action="store_true", help="Run automated tests")
+parser.add_argument(
+    "--conflict-policy",
+    type=str,
+    default="prompt",
+    choices=["prompt", "current", "incoming", "merged"],
+    help="How to resolve conflicts: prompt, current, incoming, merged",
+)
+parser.add_argument(
+    "--verbose-stats",
+    action="store_true",
+    help="Print per-table merge statistics for each source DB and the merged result",
+)
 args = parser.parse_args()
 
 selectBlockRangeSql = "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?"
@@ -114,6 +126,8 @@ class JwlBackupProcessor:
         self.merged_db_path = path.join(self.working_folder, "merged.db")
 
         self.output = {"info": [], "errors": []}
+        self.conflict_policy = args.conflict_policy
+        self.verbose_stats = args.verbose_stats
         self.doc_cache = {}
         self.bible_api_cache = {}  # {lang_code: bible_data_api_path}
         self.conflict_cache = {
@@ -150,7 +164,6 @@ class JwlBackupProcessor:
                 "KeySymbol",
                 "MepsLanguage",
                 "Type",
-                "Title",
             ],
             "Tag": ["Type", "Name"],
             "IndependentMedia": ["Hash"],
@@ -172,6 +185,67 @@ class JwlBackupProcessor:
                 "MarkerIndexWithinParagraph",
             ],
         }
+        self.table_stats = {}
+        self.current_file_label = None
+
+
+    def _ensure_table_stat(self, table_target):
+        if table_target not in self.table_stats:
+            self.table_stats[table_target] = {
+                "source_counts": {},
+                "new_by_file": {},
+                "duplicates_by_file": {},
+                "identical": 0,
+                "dropped": {},
+                "merged_count": 0,
+            }
+        return self.table_stats[table_target]
+
+    def _inc_stat(self, table_target, key, subkey=None, amount=1):
+        stat = self._ensure_table_stat(table_target)
+        if subkey is None:
+            stat[key] = stat.get(key, 0) + amount
+        else:
+            bucket = stat[key]
+            bucket[subkey] = bucket.get(subkey, 0) + amount
+
+    def _record_dropped(self, table_target, reason, amount=1):
+        self._inc_stat(table_target, "dropped", reason, amount)
+
+    def _print_stats(self):
+        if not self.verbose_stats:
+            return
+
+        print("\n=== Merge Statistics ===")
+
+        for table in self.table_order:
+            stat = self.table_stats.get(table)
+            if not stat:
+                continue
+
+            print(f"\n[{table}]")
+
+            for file_label in sorted(stat["source_counts"].keys()):
+                print(f"  {file_label}: {stat['source_counts'][file_label]} records")
+            print(f"  merged: {stat.get('merged_count', 0)} records")
+            print(f"  identical duplicates: {stat.get('identical', 0)}")
+
+            if stat["duplicates_by_file"]:
+                print("  merged/deduplicated by source file:")
+                for file_label in sorted(stat["duplicates_by_file"].keys()):
+                    print(
+                        f"    {file_label}: {stat['duplicates_by_file'][file_label]} records"
+                    )
+
+            if stat["new_by_file"]:
+                print("  new records by source file:")
+                for file_label in sorted(stat["new_by_file"].keys()):
+                    print(f"    {file_label}: {stat['new_by_file'][file_label]} records")
+
+            if stat["dropped"]:
+                print("  dropped items:")
+                for reason in sorted(stat["dropped"].keys()):
+                    print(f"    {reason}: {stat['dropped'][reason]}")
 
     def get_table_info(self, db):
         """Get table info from database
@@ -213,6 +287,7 @@ class JwlBackupProcessor:
         """Initialize the merged database from the first source file"""
         self.start_time = time()
         self.note_bases = {}
+        self.table_stats = {}
 
         first_db = database_files[0]
         copy2(first_db, self.merged_db_path)
@@ -251,7 +326,19 @@ class JwlBackupProcessor:
                 pass
 
         self.files_to_include_in_archive = list(set(self.files_to_include_in_archive))
+
+        for table_target in self.table_order:
+            table = self.table_name_map.get(table_target.lower())
+            if not table:
+                continue
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM [{table}]")
+                self._ensure_table_stat(table_target)["merged_count"] = cursor.fetchone()[0]
+            except sqlite3.Error:
+                pass
+
         merged_conn.close()
+        self._print_stats()
 
     def _merge_database(self, file_path, merged_conn, table_order, identity_keys):
         """Process a single source database file and merge its tables"""
@@ -260,8 +347,19 @@ class JwlBackupProcessor:
         merged_cursor = merged_conn.cursor()
         skipped_pks = {}
         self.pk_map = {}
+        self.current_file_label = path.basename(file_path)
 
         for table_target in table_order:
+            table = self.table_name_map.get(table_target.lower())
+            if table:
+                try:
+                    source_cursor.execute(f"SELECT COUNT(*) FROM [{table}]")
+                    src_count = source_cursor.fetchone()[0]
+                except sqlite3.Error:
+                    src_count = 0
+                stat = self._ensure_table_stat(table_target)
+                stat["source_counts"][self.current_file_label] = src_count
+
             self._process_table(
                 table_target, source_cursor, merged_cursor, identity_keys, skipped_pks
             )
@@ -357,6 +455,7 @@ class JwlBackupProcessor:
 
                 self._apply_usermark_choice(
                     table,
+                    "UserMark",
                     comp,
                     chosen_option,
                     merged_cursor,
@@ -532,17 +631,36 @@ class JwlBackupProcessor:
             return next(
                 o for o in options if (o["color"], tuple(o["ranges"])) == choice_sig
             )
+        if self.conflict_policy == "current":
+            choice_idx = next(
+                (
+                    i
+                    for i, o in enumerate(options, 1)
+                    if any(h["source"] == "current" for h in o["highlights"])
+                ),
+                1,
+            )
+        elif self.conflict_policy in ("incoming", "merged"):
+            choice_idx = next(
+                (
+                    i
+                    for i, o in enumerate(options, 1)
+                    if any(h["source"] == "incoming" for h in o["highlights"])
+                ),
+                1,
+            )
+        else:
+            choice_idx = None
+            while choice_idx is None:
+                try:
+                    choice_idx = int(
+                        input(f"\n  Choose option (1-{len(options)}): ").strip()
 
-        choice_idx = None
-        while choice_idx is None:
-            try:
-                choice_idx = int(
-                    input(f"\n  Choose option (1-{len(options)}): ").strip()
-                )
-                if choice_idx < 1 or choice_idx > len(options):
-                    choice_idx = None
-            except ValueError:
-                pass
+                    )
+                    if choice_idx < 1 or choice_idx > len(options):
+                        choice_idx = None
+                except ValueError:
+                    pass
 
         chosen = options[choice_idx - 1]
         self.conflict_cache["UserMark"][conflict_key] = (
@@ -552,7 +670,14 @@ class JwlBackupProcessor:
         return chosen
 
     def _apply_usermark_choice(
-        self, table, comp, chosen_option, merged_cursor, source_cursor, skipped_pks
+        self,
+        table,
+        table_target,
+        comp,
+        chosen_option,
+        merged_cursor,
+        source_cursor,
+        skipped_pks,
     ):
         """Apply the chosen variant and remap primary keys for dependent tables"""
         # 1. Lead UserMarkId selection (prefer current if available)
@@ -567,10 +692,11 @@ class JwlBackupProcessor:
         if not lead_id:
             lead_id = chosen_option["highlights"][0]["usermark_id"]
 
+        incoming_hls = [h for h in comp if h["source"] == "incoming"]
+
         # 2. Remap incoming highlight IDs
-        for hl in comp:
-            if hl["source"] == "incoming":
-                self.pk_map[table][hl["usermark_id"]] = lead_id
+        for hl in incoming_hls:
+            self.pk_map[table][hl["usermark_id"]] = lead_id
 
         # 3. Cleanup other variants from merged DB
         comp_existing = [h["usermark_id"] for h in comp if h["source"] == "current"]
@@ -628,16 +754,28 @@ class JwlBackupProcessor:
                     list(r) + [lead_id],
                 )
 
+        # Stats for incoming highlights in this component
+        inserted_new = 1 if lead_id not in comp_existing else 0
+        deduped = max(0, len(incoming_hls) - inserted_new)
+        if inserted_new:
+            self._inc_stat(table_target, "new_by_file", self.current_file_label, inserted_new)
+        if deduped:
+            self._inc_stat(table_target, "duplicates_by_file", self.current_file_label, deduped)
+            self._record_dropped(
+                table_target,
+                "Merged with existing/overlapping highlight variant",
+                deduped,
+            )
+
         # Mark BlockRanges to be skipped for these incoming UserMarks
         skipped_pks.setdefault("BlockRange", set())
-        for hl in comp:
-            if hl["source"] == "incoming":
-                source_cursor.execute(
-                    "SELECT BlockRangeId FROM BlockRange WHERE UserMarkId = ?",
-                    (hl["usermark_id"],),
-                )
-                for (br_id,) in source_cursor.fetchall():
-                    skipped_pks["BlockRange"].add(br_id)
+        for hl in incoming_hls:
+            source_cursor.execute(
+                "SELECT BlockRangeId FROM BlockRange WHERE UserMarkId = ?",
+                (hl["usermark_id"],),
+            )
+            for (br_id,) in source_cursor.fetchall():
+                skipped_pks["BlockRange"].add(br_id)
 
     def _process_generic_table(
         self,
@@ -655,6 +793,7 @@ class JwlBackupProcessor:
             row_dict_src = dict(zip(cols_source, row))
             old_pk = row_dict_src.get(self.primary_keys[table][0])
             if old_pk in skipped_pks.get(table, set()):
+                self._record_dropped(table_target, "Skipped after UserMark conflict merge")
                 continue
 
             row_dict = {
@@ -670,8 +809,9 @@ class JwlBackupProcessor:
             )
 
             if existing_pk is not None:
+                resolution = "deduped"
                 if table_target in ["Bookmark", "InputField", "Note"]:
-                    self._resolve_generic_conflict(
+                    resolution = self._resolve_generic_conflict(
                         table,
                         table_target,
                         merged_cursor,
@@ -679,12 +819,29 @@ class JwlBackupProcessor:
                         row_dict,
                         cols_target,
                     )
+                self._inc_stat(
+                    table_target,
+                    "duplicates_by_file",
+                    self.current_file_label,
+                )
+                if resolution == "identical":
+                    self._inc_stat(table_target, "identical")
+                    self._record_dropped(table_target, "Duplicate (identical)")
+                elif resolution == "kept_current":
+                    self._record_dropped(table_target, "Conflict resolved: kept current")
+                elif resolution == "used_incoming":
+                    self._record_dropped(table_target, "Conflict resolved: used incoming update")
+                elif resolution == "merged":
+                    self._record_dropped(table_target, "Conflict resolved: merged values")
+                else:
+                    self._record_dropped(table_target, "Duplicate (deduplicated)")
                 if old_pk is not None:
                     self.pk_map[table][old_pk] = existing_pk
             else:
                 new_pk = self._insert_row(table, table_target, row_dict, merged_cursor)
                 if old_pk is not None and new_pk is not None:
                     self.pk_map[table][old_pk] = new_pk
+                    self._inc_stat(table_target, "new_by_file", self.current_file_label)
 
     def _remap_fks(self, table, row_dict):
         """Remap foreign keys in the row_dict based on pk_map"""
@@ -782,7 +939,7 @@ class JwlBackupProcessor:
             if c not in self.primary_keys[table] and row_dict[c] != current_row.get(c)
         }
         if not diffs:
-            return
+            return "identical"
 
         if table_target == "Note":
             return self._handle_note_merge(
@@ -803,6 +960,15 @@ class JwlBackupProcessor:
             )
             print(f"  Merged value: '{merged_val}'")
 
+        if self.conflict_policy == "current":
+            choice = "c"
+        elif self.conflict_policy == "incoming":
+            choice = "i"
+        elif self.conflict_policy == "merged" and "m" in options:
+            choice = "m"
+        else:
+            choice = ""
+
         # Caching and Choice
         merged_cursor.execute(
             selectLocationSql,
@@ -816,7 +982,8 @@ class JwlBackupProcessor:
             tuple(sorted(diffs.items())),
         )
 
-        choice = self.conflict_cache[table_target].get(conflict_key, "")
+        if not choice:
+            choice = self.conflict_cache[table_target].get(conflict_key, "")
         if choice:
             print(f"  (Using previously resolved choice: {choice})")
         else:
@@ -832,11 +999,14 @@ class JwlBackupProcessor:
                 f"UPDATE [{table}] SET {set_clause} WHERE {self.primary_keys[table][0]} = ?",
                 [row_dict[k] for k in diffs.keys()] + [existing_pk],
             )
-        elif choice == "m" and table_target == "InputField":
+            return "used_incoming"
+        if choice == "m" and table_target == "InputField":
             merged_cursor.execute(
                 f"UPDATE [{table}] SET Value = ? WHERE {self.primary_keys[table][0]} = ?",
                 (merged_val, existing_pk),
             )
+            return "merged"
+        return "kept_current"
 
     def _handle_note_merge(
         self, table, merged_cursor, existing_pk, row_dict, current_row
@@ -862,7 +1032,7 @@ class JwlBackupProcessor:
         if row_dict.get("Title") == current_row.get("Title") and row_dict.get(
             "Content"
         ) == current_row.get("Content"):
-            return
+            return "identical"
 
         loc_info = self.get_location_info(merged_cursor, current_row.get("LocationId"))
         print(f"\nConflict in Note at {loc_info} (GUID: {guid}):")
@@ -879,7 +1049,15 @@ class JwlBackupProcessor:
             (row_dict.get("Title"), row_dict.get("Content")),
         )
 
-        choice = self.conflict_cache["Note"].get(conflict_key, "")
+        if self.conflict_policy == "current":
+            choice = "c"
+        elif self.conflict_policy == "incoming":
+            choice = "i"
+        elif self.conflict_policy == "merged":
+            choice = "m"
+        else:
+            choice = self.conflict_cache["Note"].get(conflict_key, "")
+
         if choice:
             print(f"  (Using previously resolved choice: {choice})")
         else:
@@ -912,6 +1090,12 @@ class JwlBackupProcessor:
             f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE {self.primary_keys[table][0]} = ?",
             (final_t, final_c, latest_ts, existing_pk),
         )
+
+        if choice == "i":
+            return "used_incoming"
+        if choice == "m":
+            return "merged"
+        return "kept_current"
 
     def process_databases(self, database_files):
         """Process databases
@@ -1478,10 +1662,12 @@ class JwlBackupProcessor:
             if args.file:
                 file_paths.extend(args.file)
             if args.folder:
+                folder_files = []
                 for file in listdir(args.folder):
                     if not file.lower().endswith(".jwlibrary"):
                         continue
-                    file_paths.append(path.join(args.folder, file))
+                    folder_files.append(path.join(args.folder, file))
+                file_paths.extend(sorted(folder_files, key=lambda p: p.lower()))
         else:
             import tkinter as tk
             from tkinter import filedialog
@@ -1497,16 +1683,26 @@ class JwlBackupProcessor:
                 if not file_path:
                     break
                 file_paths.extend(file_path)
+        normalized = []
+        seen = set()
+        for fp in file_paths:
+            nfp = path.normpath(fp)
+            if nfp not in seen:
+                seen.add(nfp)
+                normalized.append(nfp)
+        file_paths = sorted(normalized, key=lambda p: p.lower())
+
         if not file_paths or len(file_paths) == 1:
             print("Not enough JW Library backups found to work with!")
             print()
             if len(file_paths) > 0:
                 print("Provided arguments:")
-                print(
-                    "\n".join(
-                        ["- " + path for path in [args.file, args.folder] if path]
-                    )
-                )
+                provided = []
+                if args.file:
+                    provided.extend(args.file)
+                if args.folder:
+                    provided.append(args.folder)
+                print("\n".join([f"- {p}" for p in provided]))
             exit()
         self.clean_temp_files(force=True)
         print(

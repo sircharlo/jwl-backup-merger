@@ -17,7 +17,7 @@ Please note that this project is not affiliated with jw.org or the official JW L
 
 Pre-requisites:
 
-    pip install pandas tqdm tk
+    pip install tqdm tk python-dateutil requests
 
 Running the app:
 
@@ -27,7 +27,9 @@ Running the app:
 
 - `--folder FOLDER_PATH`: Folder containing JW Library backups to merge.
 - `--file FILE_PATH`: JW Library backup to add to the list of backups to merge. You can specify multiple `--file` arguments to merge multiple backups.
-- `--debug`: Enable verbose output and Excel file creation to help with debugging; also prevents deletion of temporary files.
+- `--debug`: Enable verbose output and keep temporary working files for debugging.
+- `--conflict-policy prompt|current|incoming|merged`: Choose interactive or automatic conflict resolution behavior.
+- `--verbose-stats`: Print per-table counts for each input DB, merged counts, dedup stats, and dropped-item reasons.
 
 ### Example usage
 
