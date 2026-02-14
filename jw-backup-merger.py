@@ -614,6 +614,8 @@ class JwlBackupProcessor:
                         )
                         if txt:
                             full_text.append(txt)
+                        else:
+                            full_text.append(self._format_highlight_marker(r))
                     if full_text:
                         text = " [...] ".join(full_text)
                 except Exception:
@@ -1252,6 +1254,12 @@ class JwlBackupProcessor:
             else:
                 print(line)
 
+    def _format_highlight_marker(self, block_range):
+        block_type, identifier, start_token, end_token = block_range
+        return (
+            f"[Position: block={block_type}, pid={identifier}, tokens={start_token}-{end_token}]"
+        )
+
     def get_highlighted_text(
         self,
         docid,
@@ -1423,7 +1431,7 @@ class JwlBackupProcessor:
         full_text = parser.text
 
         if not full_text:
-            return f"[Text not found for pid={identifier}]"
+            return f"[Text unavailable for pid={identifier}, tokens={start_token}-{end_token}]"
 
         # Tokenization Logic corresponding to:
         # "any word, series of chars that starts and ends with alphanumeric...
