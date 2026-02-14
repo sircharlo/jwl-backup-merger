@@ -31,7 +31,7 @@ Running the app:
 - `--conflict-policy prompt|current|incoming|merged`: Choose interactive or automatic conflict resolution behavior.
 - `--verbose-stats`: Print per-table counts for each input DB, merged counts, dedup stats, and dropped-item reasons.
 
-When using `--conflict-policy prompt`, you can optionally configure source preferences at runtime (for highlights, notes, bookmarks, and input fields) by publication group (`MepsLanguage + KeySymbol + IssueTagNumber`) and assign a preferred input backup file to auto-resolve conflicts for matching records.
+When using `--conflict-policy prompt`, you can optionally configure source preferences at runtime (for highlights, notes, bookmarks, and input fields) by `KeySymbol` and assign a preferred input backup file to auto-resolve conflicts for matching records.
 
 ### Example usage
 

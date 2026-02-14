@@ -39,7 +39,7 @@ args = parser.parse_args()
 
 selectBlockRangeSql = "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?"
 selectLocationSql = "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?"
-selectLocationPreferenceSql = "SELECT MepsLanguage, KeySymbol, IssueTagNumber FROM Location WHERE LocationId = ?"
+selectLocationPreferenceSql = "SELECT KeySymbol FROM Location WHERE LocationId = ?"
 
 
 class PExtractor(HTMLParser):
@@ -249,32 +249,25 @@ class JwlBackupProcessor:
                 for reason in sorted(stat["dropped"].keys()):
                     print(f"    {reason}: {stat['dropped'][reason]}")
 
-    def _location_signature_from_values(self, meps_language, keysymbol, issue_tag_number):
-        return (meps_language, keysymbol, issue_tag_number)
+    def _location_signature_from_values(self, keysymbol):
+        return keysymbol
 
-    def _location_display_from_values(self, meps_language, keysymbol, issue_tag_number):
-        parts = []
-        if meps_language is not None:
-            parts.append(f"Lang {meps_language}")
-        if keysymbol:
-            parts.append(str(keysymbol))
-        if issue_tag_number:
-            parts.append(str(issue_tag_number))
-        return " ".join(parts) if parts else "Unknown Location"
+    def _location_display_from_values(self, keysymbol):
+        return str(keysymbol) if keysymbol else "(No KeySymbol)"
 
     def _get_location_signature(self, cursor, location_id):
         cursor.execute(selectLocationPreferenceSql, (location_id,))
         row = cursor.fetchone()
         if not row:
             return None
-        return self._location_signature_from_values(row[0], row[1], row[2])
+        return self._location_signature_from_values(row[0])
 
     def _maybe_configure_location_preferences(self, database_files):
         if self.conflict_policy != "prompt":
             return
 
         answer = input(
-            "\nDo you want to prioritize highlights/notes/bookmarks/input fields from a specific input file for specific publication groups (MepsLanguage + KeySymbol + IssueTagNumber)? (y/N): "
+            "\nDo you want to prioritize highlights/notes/bookmarks/input fields from a specific input file for specific KeySymbol values? (y/N): "
         ).strip().lower()
         if answer not in ("y", "yes"):
             return
@@ -286,14 +279,14 @@ class JwlBackupProcessor:
             cur = conn.cursor()
             try:
                 cur.execute(
-                    "SELECT MepsLanguage, KeySymbol, IssueTagNumber FROM Location"
+                    "SELECT KeySymbol FROM Location"
                 )
                 for row in cur.fetchall():
-                    sig = self._location_signature_from_values(row[0], row[1], row[2])
+                    sig = self._location_signature_from_values(row[0])
                     item = location_catalog.setdefault(
                         sig,
                         {
-                            "display": self._location_display_from_values(row[0], row[1], row[2]),
+                            "display": self._location_display_from_values(row[0]),
                             "files": set(),
                         },
                     )
@@ -309,13 +302,13 @@ class JwlBackupProcessor:
             location_catalog.items(), key=lambda x: (x[1]["display"].lower(), str(x[0]))
         )
 
-        print("\nAvailable publication groups across input files:")
+        print("\nAvailable KeySymbol groups across input files:")
         for idx, (_, info) in enumerate(indexed_locations, 1):
             files_str = ", ".join(sorted(info["files"]))
             print(f"  {idx}. {info['display']}  [files: {files_str}]")
 
         raw_selection = input(
-            "\nEnter one or more publication-group numbers to prioritize (comma-separated), or press Enter to skip: "
+            "\nEnter one or more KeySymbol-group numbers to prioritize (comma-separated), or press Enter to skip: "
         ).strip()
         if not raw_selection:
             return
@@ -340,7 +333,7 @@ class JwlBackupProcessor:
         for sel_idx in selected_indexes:
             sig, info = indexed_locations[sel_idx - 1]
             files = sorted(info["files"])
-            print(f"\nPublication group: {info['display']}")
+            print(f"\nKeySymbol group: {info['display']}")
             for i, f in enumerate(files, 1):
                 print(f"  {i}. {f}")
 
