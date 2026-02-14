@@ -14,6 +14,9 @@ import requests
 from html.parser import HTMLParser
 import re
 from urllib.parse import urlparse
+import sys
+import tty
+import termios
 
 from langs import LANGUAGES
 
@@ -255,6 +258,79 @@ class JwlBackupProcessor:
     def _location_display_from_values(self, keysymbol):
         return str(keysymbol) if keysymbol else "(No KeySymbol)"
 
+    def _read_single_key(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                ch += sys.stdin.read(1)
+                ch += sys.stdin.read(1)
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def _is_tty_interactive(self):
+        return sys.stdin.isatty() and sys.stdout.isatty()
+
+    def _multi_select_menu(self, title, items):
+        if not items:
+            return []
+        if not self._is_tty_interactive():
+            return None
+
+        current = 0
+        selected = [False] * len(items)
+
+        while True:
+            print("\n" + title)
+            print("Use ↑/↓ (or j/k) to move, SPACE to toggle, ENTER to confirm, q to cancel")
+            for idx, item in enumerate(items):
+                pointer = ">" if idx == current else " "
+                mark = "x" if selected[idx] else " "
+                print(f" {pointer} [{mark}] {idx + 1}. {item}")
+
+            key = self._read_single_key()
+            if key in ("\x1b[A", "k"):
+                current = (current - 1) % len(items)
+            elif key in ("\x1b[B", "j"):
+                current = (current + 1) % len(items)
+            elif key == " ":
+                selected[current] = not selected[current]
+            elif key in ("\r", "\n"):
+                return [i for i, is_selected in enumerate(selected) if is_selected]
+            elif key.lower() == "q":
+                return []
+
+            print("\033[H\033[J", end="")
+
+    def _single_select_menu(self, title, items):
+        if not items:
+            return None
+        if not self._is_tty_interactive():
+            return None
+
+        current = 0
+        while True:
+            print("\n" + title)
+            print("Use ↑/↓ (or j/k) to move, SPACE or ENTER to choose, q to cancel")
+            for idx, item in enumerate(items):
+                pointer = ">" if idx == current else " "
+                print(f" {pointer} ( ) {idx + 1}. {item}")
+
+            key = self._read_single_key()
+            if key in ("\x1b[A", "k"):
+                current = (current - 1) % len(items)
+            elif key in ("\x1b[B", "j"):
+                current = (current + 1) % len(items)
+            elif key in (" ", "\r", "\n"):
+                return current
+            elif key.lower() == "q":
+                return None
+
+            print("\033[H\033[J", end="")
+
     def _get_location_signature(self, cursor, location_id):
         cursor.execute(selectLocationPreferenceSql, (location_id,))
         row = cursor.fetchone()
@@ -307,45 +383,54 @@ class JwlBackupProcessor:
             files_str = ", ".join(sorted(info["files"]))
             print(f"  {idx}. {info['display']}  [files: {files_str}]")
 
-        raw_selection = input(
-            "\nEnter one or more KeySymbol-group numbers to prioritize (comma-separated), or press Enter to skip: "
-        ).strip()
-        if not raw_selection:
-            return
+        selected_indexes = self._multi_select_menu(
+            "Select KeySymbol groups to prioritize", [info["display"] for _, info in indexed_locations]
+        )
+        if selected_indexes is None:
+            raw_selection = input(
+                "\nEnter one or more KeySymbol-group numbers to prioritize (comma-separated), or press Enter to skip: "
+            ).strip()
+            if not raw_selection:
+                return
 
-        selected_indexes = []
-        for token in raw_selection.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            try:
-                parsed = int(token)
-                if 1 <= parsed <= len(indexed_locations):
-                    selected_indexes.append(parsed)
-            except ValueError:
-                continue
+            selected_indexes = []
+            for token in raw_selection.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    parsed = int(token)
+                    if 1 <= parsed <= len(indexed_locations):
+                        selected_indexes.append(parsed - 1)
+                except ValueError:
+                    continue
+            selected_indexes = sorted(set(selected_indexes))
 
-        selected_indexes = sorted(set(selected_indexes))
         if not selected_indexes:
             print("No valid locations selected. Skipping location preferences.")
             return
 
         for sel_idx in selected_indexes:
-            sig, info = indexed_locations[sel_idx - 1]
+            sig, info = indexed_locations[sel_idx]
             files = sorted(info["files"])
             print(f"\nKeySymbol group: {info['display']}")
-            for i, f in enumerate(files, 1):
-                print(f"  {i}. {f}")
-
-            choice = None
-            while choice is None:
-                raw_choice = input("Choose source file number for this location: ").strip()
-                try:
-                    parsed_choice = int(raw_choice)
-                    if 1 <= parsed_choice <= len(files):
-                        choice = files[parsed_choice - 1]
-                except ValueError:
-                    pass
+            choice_index = self._single_select_menu(
+                f"Choose source file for KeySymbol '{info['display']}'", files
+            )
+            if choice_index is None:
+                for i, f in enumerate(files, 1):
+                    print(f"  {i}. {f}")
+                choice = None
+                while choice is None:
+                    raw_choice = input("Choose source file number for this location: ").strip()
+                    try:
+                        parsed_choice = int(raw_choice)
+                        if 1 <= parsed_choice <= len(files):
+                            choice = files[parsed_choice - 1]
+                    except ValueError:
+                        pass
+            else:
+                choice = files[choice_index]
 
             self.location_preferences[sig] = choice
 

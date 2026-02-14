@@ -33,6 +33,8 @@ Running the app:
 
 When using `--conflict-policy prompt`, you can optionally configure source preferences at runtime (for highlights, notes, bookmarks, and input fields) by `KeySymbol` and assign a preferred input backup file to auto-resolve conflicts for matching records.
 
+In a TTY terminal, KeySymbol and file selection supports interactive keyboard navigation (arrow keys + space/enter). In non-interactive environments, it falls back to number-based prompts.
+
 ### Example usage
 
     python jwl-backup-merger.py --folder /path/to/folder-with-jwl-backups
