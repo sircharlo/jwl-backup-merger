@@ -31,6 +31,8 @@ Running the app:
 - `--conflict-policy prompt|current|incoming|merged`: Choose interactive or automatic conflict resolution behavior.
 - `--verbose-stats`: Print per-table counts for each input DB, merged counts, dedup stats, and dropped-item reasons.
 
+When using `--conflict-policy prompt`, you can optionally configure location-level source preferences at runtime (for highlights, notes, bookmarks, and input fields): choose one or more locations/publications and assign a preferred input backup file to auto-resolve conflicts for those locations.
+
 ### Example usage
 
     python jwl-backup-merger.py --folder /path/to/folder-with-jwl-backups

@@ -39,6 +39,7 @@ args = parser.parse_args()
 
 selectBlockRangeSql = "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?"
 selectLocationSql = "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?"
+selectLocationPreferenceSql = "SELECT DocumentId, MepsLanguage, KeySymbol, IssueTagNumber, BookNumber, ChapterNumber, Track, Type, Title FROM Location WHERE LocationId = ?"
 
 
 class PExtractor(HTMLParser):
@@ -187,6 +188,7 @@ class JwlBackupProcessor:
         }
         self.table_stats = {}
         self.current_file_label = None
+        self.location_preferences = {}
 
 
     def _ensure_table_stat(self, table_target):
@@ -246,6 +248,169 @@ class JwlBackupProcessor:
                 print("  dropped items:")
                 for reason in sorted(stat["dropped"].keys()):
                     print(f"    {reason}: {stat['dropped'][reason]}")
+
+    def _location_signature_from_values(
+        self,
+        document_id,
+        meps_language,
+        keysymbol,
+        issue_tag_number,
+        book_number,
+        chapter_number,
+        track,
+        loc_type,
+    ):
+        return (
+            document_id,
+            meps_language,
+            keysymbol,
+            issue_tag_number,
+            book_number,
+            chapter_number,
+            track,
+            loc_type,
+        )
+
+    def _location_display_from_values(
+        self,
+        document_id,
+        meps_language,
+        keysymbol,
+        issue_tag_number,
+        book_number,
+        chapter_number,
+        title,
+    ):
+        parts = []
+        if title:
+            parts.append(str(title))
+        if keysymbol:
+            parts.append(str(keysymbol))
+        if issue_tag_number:
+            parts.append(str(issue_tag_number))
+        if meps_language is not None:
+            parts.append(f"Lang {meps_language}")
+        if book_number:
+            parts.append(f"Book {book_number}")
+        if chapter_number:
+            parts.append(f"Ch. {chapter_number}")
+        if not keysymbol and document_id:
+            parts.append(f"Doc {document_id}")
+        return " ".join(parts) if parts else "Unknown Location"
+
+    def _get_location_signature(self, cursor, location_id):
+        cursor.execute(selectLocationPreferenceSql, (location_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._location_signature_from_values(
+            row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+        )
+
+    def _maybe_configure_location_preferences(self, database_files):
+        if self.conflict_policy != "prompt":
+            return
+
+        answer = input(
+            "\nDo you want to prioritize highlights/notes/bookmarks/input fields from a specific input file for specific publications/locations? (y/N): "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            return
+
+        location_catalog = {}
+        for db_path in database_files:
+            file_label = path.basename(path.dirname(db_path)) or path.basename(db_path)
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT DocumentId, MepsLanguage, KeySymbol, IssueTagNumber, BookNumber, ChapterNumber, Track, Type, Title FROM Location"
+                )
+                for row in cur.fetchall():
+                    sig = self._location_signature_from_values(
+                        row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+                    )
+                    item = location_catalog.setdefault(
+                        sig,
+                        {
+                            "display": self._location_display_from_values(
+                                row[0], row[1], row[2], row[3], row[4], row[5], row[8]
+                            ),
+                            "files": set(),
+                        },
+                    )
+                    item["files"].add(file_label)
+            finally:
+                conn.close()
+
+        if not location_catalog:
+            print("No locations found for preference selection.")
+            return
+
+        indexed_locations = sorted(
+            location_catalog.items(), key=lambda x: (x[1]["display"].lower(), str(x[0]))
+        )
+
+        print("\nAvailable locations across input files:")
+        for idx, (_, info) in enumerate(indexed_locations, 1):
+            files_str = ", ".join(sorted(info["files"]))
+            print(f"  {idx}. {info['display']}  [files: {files_str}]")
+
+        raw_selection = input(
+            "\nEnter one or more location numbers to prioritize (comma-separated), or press Enter to skip: "
+        ).strip()
+        if not raw_selection:
+            return
+
+        selected_indexes = []
+        for token in raw_selection.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                parsed = int(token)
+                if 1 <= parsed <= len(indexed_locations):
+                    selected_indexes.append(parsed)
+            except ValueError:
+                continue
+
+        selected_indexes = sorted(set(selected_indexes))
+        if not selected_indexes:
+            print("No valid locations selected. Skipping location preferences.")
+            return
+
+        for sel_idx in selected_indexes:
+            sig, info = indexed_locations[sel_idx - 1]
+            files = sorted(info["files"])
+            print(f"\nLocation: {info['display']}")
+            for i, f in enumerate(files, 1):
+                print(f"  {i}. {f}")
+
+            choice = None
+            while choice is None:
+                raw_choice = input("Choose source file number for this location: ").strip()
+                try:
+                    parsed_choice = int(raw_choice)
+                    if 1 <= parsed_choice <= len(files):
+                        choice = files[parsed_choice - 1]
+                except ValueError:
+                    pass
+
+            self.location_preferences[sig] = choice
+
+        if self.location_preferences:
+            print("\nConfigured location preferences:")
+            for sig, source_file in self.location_preferences.items():
+                print(f"  - {location_catalog[sig]['display']}: {source_file}")
+
+    def _preferred_choice_for_location(self, cursor, location_id):
+        loc_sig = self._get_location_signature(cursor, location_id)
+        if not loc_sig:
+            return None
+        preferred_file = self.location_preferences.get(loc_sig)
+        if not preferred_file:
+            return None
+        return "incoming" if self.current_file_label == preferred_file else "current"
 
     def get_table_info(self, db):
         """Get table info from database
@@ -347,7 +512,9 @@ class JwlBackupProcessor:
         merged_cursor = merged_conn.cursor()
         skipped_pks = {}
         self.pk_map = {}
-        self.current_file_label = path.basename(file_path)
+        self.current_file_label = path.basename(path.dirname(file_path)) or path.basename(
+            file_path
+        )
 
         for table_target in table_order:
             table = self.table_name_map.get(table_target.lower())
@@ -633,6 +800,33 @@ class JwlBackupProcessor:
             return next(
                 o for o in options if (o["color"], tuple(o["ranges"])) == choice_sig
             )
+
+        preferred_choice = self._preferred_choice_for_location(merged_cursor, loc_id)
+        if preferred_choice:
+            if preferred_choice == "incoming":
+                preferred_option = next(
+                    (
+                        o
+                        for o in options
+                        if any(h["source"] == "incoming" for h in o["highlights"])
+                    ),
+                    None,
+                )
+            else:
+                preferred_option = next(
+                    (
+                        o
+                        for o in options
+                        if any(h["source"] == "current" for h in o["highlights"])
+                    ),
+                    None,
+                )
+            if preferred_option:
+                print(
+                    f"  (Auto-selected by location preference: {preferred_choice} from {self.current_file_label})"
+                )
+                return preferred_option
+
         if self.conflict_policy == "current":
             choice_idx = next(
                 (
@@ -962,7 +1156,18 @@ class JwlBackupProcessor:
             )
             print(f"  Merged value: '{merged_val}'")
 
-        if self.conflict_policy == "current":
+        preferred_choice = self._preferred_choice_for_location(
+            merged_cursor, current_row.get("LocationId")
+        )
+        if preferred_choice == "incoming":
+            print(
+                f"  (Auto-selected by location preference: incoming from {self.current_file_label})"
+            )
+            choice = "i"
+        elif preferred_choice == "current":
+            print("  (Auto-selected by location preference: keep current)")
+            choice = "c"
+        elif self.conflict_policy == "current":
             choice = "c"
         elif self.conflict_policy == "incoming":
             choice = "i"
@@ -1060,6 +1265,18 @@ class JwlBackupProcessor:
         else:
             choice = self.conflict_cache["Note"].get(conflict_key, "")
 
+        preferred_choice = self._preferred_choice_for_location(
+            merged_cursor, current_row.get("LocationId")
+        )
+        if preferred_choice == "incoming":
+            print(
+                f"  (Auto-selected by location preference: incoming from {self.current_file_label})"
+            )
+            choice = "i"
+        elif preferred_choice == "current":
+            print("  (Auto-selected by location preference: keep current)")
+            choice = "c"
+
         if choice:
             print(f"  (Using previously resolved choice: {choice})")
         else:
@@ -1109,6 +1326,8 @@ class JwlBackupProcessor:
             None
         """
         merged_conn = self._initialize_merge(database_files)
+        self.location_preferences = {}
+        self._maybe_configure_location_preferences(database_files)
 
         for file_path in tqdm(database_files, desc="Merging databases"):
             self._merge_database(
