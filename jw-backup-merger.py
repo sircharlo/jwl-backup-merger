@@ -141,6 +141,7 @@ class JwlBackupProcessor:
             "Bookmark": {},  # {conflict_key: choice}
             "InputField": {},  # {conflict_key: choice}
         }
+        self.highlight_preview_cache = {}  # {(loc_tuple, ranges_tuple): preview_text}
         self.table_order = [
             "Location",
             "IndependentMedia",
@@ -686,7 +687,9 @@ class JwlBackupProcessor:
             choices = []
             for opt in ranked:
                 ranges = "; ".join([f"{r[2]}-{r[3]}" for r in opt["ranges"]])
-                title = f"{color_names.get(opt['color'], opt['color'])} | UserMarkId={opt['usermark_id']} | tokens={ranges}"
+                preview = self._get_highlight_preview_text(opt.get("loc_res"), opt["ranges"])
+                preview_short = (preview[:120] + "...") if len(preview) > 120 else preview
+                title = f"{color_names.get(opt['color'], opt['color'])} | UserMarkId={opt['usermark_id']} | tokens={ranges} | {preview_short}"
                 choices.append(questionary.Choice(title=title, value=opt["usermark_id"]))
             chosen_id = questionary.select(
                 "Select highlight to keep for overlapping ranges", choices=choices
@@ -698,7 +701,9 @@ class JwlBackupProcessor:
         print("Overlapping highlights detected. Choose winner:")
         for idx, opt in enumerate(ranked, 1):
             ranges = "; ".join([f"{r[2]}-{r[3]}" for r in opt["ranges"]])
+            preview = self._get_highlight_preview_text(opt.get("loc_res"), opt["ranges"])
             print(f"  {idx}. color={opt['color']} usermark={opt['usermark_id']} tokens={ranges}")
+            print(f"     text: {preview}")
         try:
             chosen_idx = int(input("Pick option number: ").strip())
             if 1 <= chosen_idx <= len(ranked):
@@ -710,12 +715,39 @@ class JwlBackupProcessor:
     def _highlight_token_signature(self, ranges):
         return tuple(sorted((r[2], r[3]) for r in ranges))
 
+    def _get_highlight_preview_text(self, loc_res, ranges):
+        if not loc_res:
+            return "(Text unavailable: missing location)"
+
+        cache_key = (tuple(loc_res), tuple(ranges))
+        if cache_key in self.highlight_preview_cache:
+            return self.highlight_preview_cache[cache_key]
+
+        full_text = []
+        for r in ranges:
+            txt = self.get_highlighted_text(
+                loc_res[0],
+                r[1],
+                r[2],
+                r[3],
+                loc_res[1],
+                loc_res[2],
+                loc_res[3],
+                loc_res[4],
+            )
+            full_text.append(txt or self._format_highlight_marker(r))
+        preview = " [...] ".join(full_text) if full_text else "(Text unavailable)"
+        self.highlight_preview_cache[cache_key] = preview
+        return preview
+
     def _dedupe_highlights_post_merge(self, merged_conn):
         cursor = merged_conn.cursor()
         cursor.execute("SELECT DISTINCT LocationId FROM UserMark WHERE LocationId IS NOT NULL")
         location_ids = [r[0] for r in cursor.fetchall()]
 
         for loc_id in location_ids:
+            cursor.execute(selectLocationSql, (loc_id,))
+            loc_res = cursor.fetchone()
             cursor.execute("SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?", (loc_id,))
             usermarks = []
             for um_id, color in cursor.fetchall():
@@ -727,6 +759,7 @@ class JwlBackupProcessor:
                         "color": color,
                         "ranges": ranges,
                         "source": "current",
+                        "loc_res": loc_res,
                     }
                 )
 
