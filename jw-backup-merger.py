@@ -660,8 +660,12 @@ class JwlBackupProcessor:
                 if not from_col:
                     continue
                 cursor.execute(
-                    f"UPDATE [{from_table}] SET [{from_col}] = ? WHERE [{from_col}] = ?",
+                    f"UPDATE OR IGNORE [{from_table}] SET [{from_col}] = ? WHERE [{from_col}] = ?",
                     (new_pk, old_pk),
+                )
+                cursor.execute(
+                    f"DELETE FROM [{from_table}] WHERE [{from_col}] = ?",
+                    (old_pk,),
                 )
 
     def _choose_highlight_winner(self, options, allow_prompt=True):
