@@ -730,21 +730,16 @@ class JwlBackupProcessor:
         merged_cursor.execute(f"PRAGMA table_info([{table}])")
         cols_target = [col[1] for col in merged_cursor.fetchall()]
 
-        if table_target == "UserMark":
-            self._process_usermark_table(
-                table, source_cursor, merged_cursor, skipped_pks, cols_target
-            )
-        else:
-            self._process_generic_table(
-                table,
-                table_target,
-                merged_cursor,
-                identity_keys,
-                skipped_pks,
-                cols_source,
-                rows,
-                cols_target,
-            )
+        self._process_generic_table(
+            table,
+            table_target,
+            merged_cursor,
+            identity_keys,
+            skipped_pks,
+            cols_source,
+            rows,
+            cols_target,
+        )
 
     def _process_usermark_table(
         self, table, source_cursor, merged_cursor, skipped_pks, cols_target
@@ -1134,32 +1129,12 @@ class JwlBackupProcessor:
             )
 
             if existing_pk is not None:
-                resolution = "deduped"
-                if table_target in ["Bookmark", "InputField", "Note"]:
-                    resolution = self._resolve_generic_conflict(
-                        table,
-                        table_target,
-                        merged_cursor,
-                        existing_pk,
-                        row_dict,
-                        cols_target,
-                    )
                 self._inc_stat(
                     table_target,
                     "duplicates_by_file",
                     self.current_file_label,
                 )
-                if resolution == "identical":
-                    self._inc_stat(table_target, "identical")
-                    self._record_dropped(table_target, "Duplicate (identical)")
-                elif resolution == "kept_current":
-                    self._record_dropped(table_target, "Conflict resolved: kept current")
-                elif resolution == "used_incoming":
-                    self._record_dropped(table_target, "Conflict resolved: used incoming update")
-                elif resolution == "merged":
-                    self._record_dropped(table_target, "Conflict resolved: merged values")
-                else:
-                    self._record_dropped(table_target, "Duplicate (deduplicated)")
+                self._record_dropped(table_target, "Duplicate (deduplicated)")
                 if old_pk is not None:
                     self.pk_map[table][old_pk] = existing_pk
             else:
@@ -1465,7 +1440,6 @@ class JwlBackupProcessor:
         """Process databases table-by-table across all sources."""
         merged_conn = self._initialize_merge(database_files)
         self.note_conflict_variants = {}
-        self._maybe_configure_location_preferences(database_files)
 
         file_labels = {
             db_path: (path.basename(path.dirname(db_path)) or path.basename(db_path))
@@ -2291,11 +2265,11 @@ class JwlBackupProcessor:
             cursor.execute("SELECT Title, Content FROM Note WHERE Guid = 'note-123'")
             res = cursor.fetchone()
             conn.close()
-            assert "User A Title" in res[0], f"Expected merged title to include 'User A Title', got '{res[0]}'"
-            assert "User B Content" in res[1], (
-                f"Expected merged content to include 'User B Content', got '{res[1]}'"
+            assert res[0] == "Base Title", f"Expected 'Base Title', got '{res[0]}'"
+            assert res[1] == "Base Content", (
+                f"Expected 'Base Content', got '{res[1]}'"
             )
-            print("  ✓ Note n-way merge successful")
+            print("  ✓ Note dedup keeps first-in row")
 
             builtins.input = original_input
 
@@ -2355,10 +2329,10 @@ class JwlBackupProcessor:
             cursor.execute("SELECT COUNT(*) FROM UserMark")
             um_count = cursor.fetchone()[0]
             conn.close()
-            assert um_count == 1, (
-                f"Expected 1 UserMark due to identical signature merging, got {um_count}"
+            assert um_count == 2, (
+                f"Expected 2 UserMark rows in straight merge mode, got {um_count}"
             )
-            print("  ✓ UserMark identical signature merged")
+            print("  ✓ UserMark rows inserted without conflict resolution")
 
             builtins.input = original_input
 
