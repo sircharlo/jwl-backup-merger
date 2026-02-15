@@ -1008,12 +1008,32 @@ class JwlBackupProcessor:
                 row_dict = lead["row_dict"].copy()
                 if isinstance(row_dict.get(self.primary_keys[table][0]), int):
                     del row_dict[self.primary_keys[table][0]]
-                cols = ", ".join([f"[{k}]" for k in row_dict.keys()])
-                merged_cursor.execute(
-                    f"INSERT INTO [{table}] ({cols}) VALUES ({', '.join(['?'] * len(row_dict))})",
-                    list(row_dict.values()),
-                )
-                lead_id = merged_cursor.lastrowid
+
+                existing_guid_pk = None
+                if row_dict.get("UserMarkGuid"):
+                    merged_cursor.execute(
+                        f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE UserMarkGuid = ?",
+                        (row_dict.get("UserMarkGuid"),),
+                    )
+                    row = merged_cursor.fetchone()
+                    if row:
+                        existing_guid_pk = row[0]
+
+                if existing_guid_pk is not None:
+                    lead_id = existing_guid_pk
+                    merged_cursor.execute(
+                        f"UPDATE [{table}] SET ColorIndex = ?, LocationId = ? WHERE {self.primary_keys[table][0]} = ?",
+                        (row_dict.get("ColorIndex"), row_dict.get("LocationId"), lead_id),
+                    )
+                else:
+                    cols = ", ".join([f"[{k}]" for k in row_dict.keys()])
+                    merged_cursor.execute(
+                        f"INSERT INTO [{table}] ({cols}) VALUES ({', '.join(['?'] * len(row_dict))})",
+                        list(row_dict.values()),
+                    )
+                    lead_id = merged_cursor.lastrowid
+
+                merged_cursor.execute("DELETE FROM BlockRange WHERE UserMarkId = ?", (lead_id,))
                 for r in option["ranges"]:
                     merged_cursor.execute(
                         "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
