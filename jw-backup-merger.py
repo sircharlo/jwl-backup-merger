@@ -14,6 +14,10 @@ import requests
 from html.parser import HTMLParser
 import re
 from urllib.parse import urlparse
+import sys
+import importlib
+import importlib.util
+import json
 
 from langs import LANGUAGES
 
@@ -23,10 +27,23 @@ parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 parser.add_argument("--folder", type=str, help="Folder containing JWL files to merge")
 parser.add_argument("--file", type=str, help="JWL file to merge", action="append")
 parser.add_argument("--test", action="store_true", help="Run automated tests")
+parser.add_argument(
+    "--conflict-policy",
+    type=str,
+    default="prompt",
+    choices=["prompt", "current", "incoming", "merged"],
+    help="How to resolve conflicts: prompt, current, incoming, merged",
+)
+parser.add_argument(
+    "--verbose-stats",
+    action="store_true",
+    help="Print per-table merge statistics for each source DB and the merged result",
+)
 args = parser.parse_args()
 
 selectBlockRangeSql = "SELECT BlockType, Identifier, StartToken, EndToken FROM BlockRange WHERE UserMarkId = ?"
 selectLocationSql = "SELECT DocumentId, MepsLanguage, KeySymbol, BookNumber, ChapterNumber FROM Location WHERE LocationId = ?"
+selectLocationPreferenceSql = "SELECT KeySymbol FROM Location WHERE LocationId = ?"
 
 
 class PExtractor(HTMLParser):
@@ -114,6 +131,8 @@ class JwlBackupProcessor:
         self.merged_db_path = path.join(self.working_folder, "merged.db")
 
         self.output = {"info": [], "errors": []}
+        self.conflict_policy = args.conflict_policy
+        self.verbose_stats = args.verbose_stats
         self.doc_cache = {}
         self.bible_api_cache = {}  # {lang_code: bible_data_api_path}
         self.conflict_cache = {
@@ -122,6 +141,7 @@ class JwlBackupProcessor:
             "Bookmark": {},  # {conflict_key: choice}
             "InputField": {},  # {conflict_key: choice}
         }
+        self.highlight_preview_cache = {}  # {(loc_tuple, ranges_tuple): preview_text}
         self.table_order = [
             "Location",
             "IndependentMedia",
@@ -150,7 +170,6 @@ class JwlBackupProcessor:
                 "KeySymbol",
                 "MepsLanguage",
                 "Type",
-                "Title",
             ],
             "Tag": ["Type", "Name"],
             "IndependentMedia": ["Hash"],
@@ -172,6 +191,402 @@ class JwlBackupProcessor:
                 "MarkerIndexWithinParagraph",
             ],
         }
+        self.table_stats = {}
+        self.current_file_label = None
+        self.location_preferences = {}
+        self.source_file_priorities = {}
+        self.color_priority = [4, 3, 2, 1, 5, 6]
+        self.note_conflict_variants = {}
+        self.config_path = path.expanduser("~/.jw-backup-merger.json")
+        self._load_user_config()
+
+    def _load_user_config(self):
+        try:
+            if not path.exists(self.config_path):
+                return
+            with open(self.config_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data.get("location_preferences"), dict):
+                self.location_preferences = data["location_preferences"]
+            if isinstance(data.get("source_file_priorities"), dict):
+                self.source_file_priorities = data["source_file_priorities"]
+            colors = data.get("color_priority")
+            if isinstance(colors, list) and all(isinstance(c, int) for c in colors):
+                self.color_priority = colors
+        except Exception:
+            pass
+
+    def _save_user_config(self):
+        payload = {
+            "location_preferences": self.location_preferences,
+            "source_file_priorities": self.source_file_priorities,
+            "color_priority": self.color_priority,
+        }
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+        except Exception:
+            pass
+
+
+    def _ensure_table_stat(self, table_target):
+        if table_target not in self.table_stats:
+            self.table_stats[table_target] = {
+                "source_counts": {},
+                "new_by_file": {},
+                "duplicates_by_file": {},
+                "identical": 0,
+                "dropped": {},
+                "merged_count": 0,
+            }
+        return self.table_stats[table_target]
+
+    def _inc_stat(self, table_target, key, subkey=None, amount=1):
+        stat = self._ensure_table_stat(table_target)
+        if subkey is None:
+            stat[key] = stat.get(key, 0) + amount
+        else:
+            bucket = stat[key]
+            bucket[subkey] = bucket.get(subkey, 0) + amount
+
+    def _record_dropped(self, table_target, reason, amount=1):
+        self._inc_stat(table_target, "dropped", reason, amount)
+
+    def _print_stats(self):
+        if not self.verbose_stats:
+            return
+
+        print("\n=== Merge Statistics ===")
+
+        for table in self.table_order:
+            stat = self.table_stats.get(table)
+            if not stat:
+                continue
+
+            print(f"\n[{table}]")
+
+            for file_label in sorted(stat["source_counts"].keys()):
+                print(f"  {file_label}: {stat['source_counts'][file_label]} records")
+            print(f"  merged: {stat.get('merged_count', 0)} records")
+            print(f"  identical duplicates: {stat.get('identical', 0)}")
+
+            if stat["duplicates_by_file"]:
+                print("  merged/deduplicated by source file:")
+                for file_label in sorted(stat["duplicates_by_file"].keys()):
+                    print(
+                        f"    {file_label}: {stat['duplicates_by_file'][file_label]} records"
+                    )
+
+            if stat["new_by_file"]:
+                print("  new records by source file:")
+                for file_label in sorted(stat["new_by_file"].keys()):
+                    print(f"    {file_label}: {stat['new_by_file'][file_label]} records")
+
+            if stat["dropped"]:
+                print("  dropped items:")
+                for reason in sorted(stat["dropped"].keys()):
+                    print(f"    {reason}: {stat['dropped'][reason]}")
+
+    def _location_signature_from_values(self, keysymbol):
+        return keysymbol
+
+    def _location_display_from_values(self, keysymbol):
+        return str(keysymbol) if keysymbol else "(No KeySymbol)"
+
+    def _is_tty_interactive(self):
+        return sys.stdin.isatty() and sys.stdout.isatty()
+
+    def _get_questionary(self):
+        if not self._is_tty_interactive():
+            return None
+        if importlib.util.find_spec("questionary") is None:
+            return None
+        return importlib.import_module("questionary")
+
+    def _rank_selected_indices(self, title, selected_indices, items):
+        questionary = self._get_questionary()
+        if questionary is None or len(selected_indices) <= 1:
+            return list(selected_indices)
+
+        remaining = list(selected_indices)
+        ranked = []
+        while remaining:
+            choices = [
+                questionary.Choice(title=items[idx], value=idx) for idx in remaining
+            ]
+            chosen = questionary.select(
+                f"{title} (choose next highest priority)", choices=choices
+            ).ask()
+            if chosen is None:
+                break
+            ranked.append(chosen)
+            remaining = [idx for idx in remaining if idx != chosen]
+
+        if remaining:
+            ranked.extend(remaining)
+        return ranked
+
+    def _multi_select_menu(self, title, items):
+        if not items:
+            return []
+        questionary = self._get_questionary()
+        if questionary is None:
+            return None
+
+        choices = [questionary.Choice(title=item, value=idx) for idx, item in enumerate(items)]
+        result = questionary.checkbox(title, choices=choices).ask()
+        if not result:
+            return []
+        selected = list(result)
+        return self._rank_selected_indices(title, selected, items)
+
+    def _single_select_menu(self, title, items):
+        if not items:
+            return None
+        questionary = self._get_questionary()
+        if questionary is None:
+            return None
+
+        choices = [questionary.Choice(title=item, value=idx) for idx, item in enumerate(items)]
+        result = questionary.select(title, choices=choices).ask()
+        return result
+
+    def _get_location_signature(self, cursor, location_id):
+        cursor.execute(selectLocationPreferenceSql, (location_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._location_signature_from_values(row[0])
+
+    def _prompt_yes_no(self, message, default=False):
+        questionary = self._get_questionary()
+        if questionary is not None:
+            result = questionary.confirm(message, default=default).ask()
+            return bool(result)
+
+        answer = input(f"\n{message} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+        if not answer:
+            return default
+        return answer in ("y", "yes")
+
+    def _configure_source_priorities(self, database_files):
+        file_labels = [
+            path.basename(path.dirname(db_path)) or path.basename(db_path)
+            for db_path in database_files
+        ]
+        unique_labels = []
+        for file_label in file_labels:
+            if file_label not in unique_labels:
+                unique_labels.append(file_label)
+
+        for table_target in ["Bookmark", "InputField", "Note", "UserMark"]:
+            existing = self.source_file_priorities.get(table_target, [])
+            ordered = [x for x in existing if x in unique_labels]
+            ordered.extend([x for x in unique_labels if x not in ordered])
+
+            print(f"\nSource priority for {table_target} conflict fallbacks:")
+            for idx, item in enumerate(ordered, 1):
+                print(f"  {idx}. {item}")
+
+            selected = self._multi_select_menu(
+                f"Select sources in priority order for {table_target} (top selected = highest priority)",
+                ordered,
+            )
+
+            if selected is None:
+                raw = input(
+                    "Enter one or more source numbers in priority order (comma-separated), or press Enter to keep current order: "
+                ).strip()
+                if raw:
+                    reordered = []
+                    for token in raw.split(","):
+                        token = token.strip()
+                        if token.isdigit():
+                            idx = int(token) - 1
+                            if 0 <= idx < len(ordered):
+                                chosen = ordered[idx]
+                                if chosen not in reordered:
+                                    reordered.append(chosen)
+                    if reordered:
+                        ordered = reordered + [x for x in ordered if x not in reordered]
+            elif selected:
+                reordered = [ordered[idx] for idx in selected]
+                ordered = reordered + [x for x in ordered if x not in reordered]
+
+            self.source_file_priorities[table_target] = ordered
+
+    def _configure_color_priority(self):
+        color_names = {
+            1: "yellow",
+            2: "green",
+            3: "blue",
+            4: "red",
+            5: "orange",
+            6: "purple",
+        }
+        ordered = [c for c in self.color_priority if c in color_names]
+        ordered.extend([c for c in color_names if c not in ordered])
+
+        print("\nCurrent highlight color priority:")
+        print("  " + " > ".join(color_names[c] for c in ordered))
+
+        selected = self._multi_select_menu(
+            "Select color priority (use space to select in desired order)",
+            [f"{c}: {color_names[c]}" for c in ordered],
+        )
+        if selected is None:
+            raw = input(
+                "Enter color IDs in priority order (e.g. 4,3,1,2,5,6), or press Enter to keep: "
+            ).strip()
+            if raw:
+                reordered = []
+                for token in raw.split(","):
+                    token = token.strip()
+                    if token.isdigit():
+                        color_idx = int(token)
+                        if color_idx in color_names and color_idx not in reordered:
+                            reordered.append(color_idx)
+                if reordered:
+                    ordered = reordered + [x for x in ordered if x not in reordered]
+        elif selected:
+            reordered = [ordered[idx] for idx in selected]
+            ordered = reordered + [x for x in ordered if x not in reordered]
+
+        self.color_priority = ordered
+
+    def _maybe_configure_location_preferences(self, database_files):
+        if self.conflict_policy != "prompt":
+            return
+
+        if self._prompt_yes_no(
+            "Configure per-table source priority for automatic conflict fallback?",
+            default=True,
+        ):
+            self._configure_source_priorities(database_files)
+
+        if self._prompt_yes_no(
+            "Configure highlight color priority for identical highlight conflicts?",
+            default=True,
+        ):
+            self._configure_color_priority()
+
+        if not self._prompt_yes_no(
+            "Do you want to prioritize highlights/notes/bookmarks/input fields from a specific input file for specific KeySymbol values?",
+            default=False,
+        ):
+            self._save_user_config()
+            return
+
+        location_catalog = {}
+        for db_path in database_files:
+            file_label = path.basename(path.dirname(db_path)) or path.basename(db_path)
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT KeySymbol FROM Location")
+                for row in cur.fetchall():
+                    sig = self._location_signature_from_values(row[0])
+                    item = location_catalog.setdefault(
+                        sig,
+                        {
+                            "display": self._location_display_from_values(row[0]),
+                            "files": set(),
+                        },
+                    )
+                    item["files"].add(file_label)
+            finally:
+                conn.close()
+
+        if not location_catalog:
+            print("No locations found for preference selection.")
+            self._save_user_config()
+            return
+
+        indexed_locations = sorted(
+            location_catalog.items(), key=lambda x: (x[1]["display"].lower(), str(x[0]))
+        )
+
+        print("\nAvailable KeySymbol groups across input files:")
+        for idx, (_, info) in enumerate(indexed_locations, 1):
+            files_str = ", ".join(sorted(info["files"]))
+            print(f"  {idx}. {info['display']}  [files: {files_str}]")
+
+        selected_indexes = self._multi_select_menu(
+            "Select KeySymbol groups to prioritize",
+            [info["display"] for _, info in indexed_locations],
+        )
+        if selected_indexes is None:
+            raw_selection = input(
+                "\nEnter one or more KeySymbol-group numbers to prioritize (comma-separated), or press Enter to skip: "
+            ).strip()
+            if not raw_selection:
+                self._save_user_config()
+                return
+
+            selected_indexes = []
+            for token in raw_selection.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    parsed = int(token)
+                    if 1 <= parsed <= len(indexed_locations):
+                        selected_indexes.append(parsed - 1)
+                except ValueError:
+                    continue
+            selected_indexes = sorted(set(selected_indexes))
+
+        if not selected_indexes:
+            print("No valid locations selected. Skipping location preferences.")
+            self._save_user_config()
+            return
+
+        for sel_idx in selected_indexes:
+            sig, info = indexed_locations[sel_idx]
+            files = sorted(info["files"])
+            print(f"\nKeySymbol group: {info['display']}")
+            choice_index = self._single_select_menu(
+                f"Choose source file for KeySymbol '{info['display']}'", files
+            )
+            if choice_index is None:
+                for i, f in enumerate(files, 1):
+                    print(f"  {i}. {f}")
+                choice = None
+                while choice is None:
+                    raw_choice = input("Choose source file number for this location: ").strip()
+                    try:
+                        parsed_choice = int(raw_choice)
+                        if 1 <= parsed_choice <= len(files):
+                            choice = files[parsed_choice - 1]
+                    except ValueError:
+                        pass
+            else:
+                choice = files[choice_index]
+
+            self.location_preferences[sig] = choice
+
+        if self.location_preferences:
+            print("\nConfigured location preferences:")
+            for sig, source_file in self.location_preferences.items():
+                print(f"  - {location_catalog[sig]['display']}: {source_file}")
+
+        self._save_user_config()
+
+    def _source_rank(self, table_target, source_label):
+        priorities = self.source_file_priorities.get(table_target, [])
+        try:
+            return priorities.index(source_label)
+        except ValueError:
+            return len(priorities) + 999
+
+    def _preferred_choice_for_location(self, cursor, location_id):
+        loc_sig = self._get_location_signature(cursor, location_id)
+        if not loc_sig:
+            return None
+        preferred_file = self.location_preferences.get(loc_sig)
+        if not preferred_file:
+            return None
+        return "incoming" if self.current_file_label == preferred_file else "current"
 
     def get_table_info(self, db):
         """Get table info from database
@@ -213,6 +628,7 @@ class JwlBackupProcessor:
         """Initialize the merged database from the first source file"""
         self.start_time = time()
         self.note_bases = {}
+        self.table_stats = {}
 
         first_db = database_files[0]
         copy2(first_db, self.merged_db_path)
@@ -227,8 +643,245 @@ class JwlBackupProcessor:
         merged_conn.commit()
         return merged_conn
 
+    def _remap_references_to_pk(self, cursor, target_table, target_pk_col, old_pk, new_pk):
+        target_lower = target_table.lower()
+        for from_table_lower, fk_cols in self.fk_map.items():
+            from_table = self.table_name_map.get(from_table_lower)
+            if not from_table:
+                continue
+            for from_col_lower, (to_table, _to_col) in fk_cols.items():
+                if to_table.lower() != target_lower:
+                    continue
+                from_col = None
+                cursor.execute(f"PRAGMA table_info([{from_table}])")
+                for col in cursor.fetchall():
+                    if col[1].lower() == from_col_lower:
+                        from_col = col[1]
+                        break
+                if not from_col:
+                    continue
+                cursor.execute(
+                    f"UPDATE OR IGNORE [{from_table}] SET [{from_col}] = ? WHERE [{from_col}] = ?",
+                    (new_pk, old_pk),
+                )
+                cursor.execute(
+                    f"DELETE FROM [{from_table}] WHERE [{from_col}] = ?",
+                    (old_pk,),
+                )
+
+    def _choose_highlight_winner(self, options, allow_prompt=True):
+        color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
+        ranked = sorted(
+            options,
+            key=lambda o: (
+                self.color_priority.index(o["color"]) if o["color"] in self.color_priority else len(self.color_priority) + 99,
+                o["usermark_id"],
+            ),
+        )
+
+        if self.conflict_policy != "prompt" or not allow_prompt:
+            return ranked[0]
+
+        questionary = self._get_questionary()
+        if questionary is not None:
+            choices = []
+            for opt in ranked:
+                ranges = "; ".join([f"{r[2]}-{r[3]}" for r in opt["ranges"]])
+                preview = self._get_highlight_preview_text(opt.get("loc_res"), opt["ranges"])
+                preview_short = (preview[:120] + "...") if len(preview) > 120 else preview
+                title = f"{color_names.get(opt['color'], opt['color'])} | UserMarkId={opt['usermark_id']} | tokens={ranges} | {preview_short}"
+                choices.append(questionary.Choice(title=title, value=opt["usermark_id"]))
+            chosen_id = questionary.select(
+                "Select highlight to keep for overlapping ranges", choices=choices
+            ).ask()
+            selected = next((o for o in ranked if o["usermark_id"] == chosen_id), None)
+            if selected:
+                return selected
+
+        print("Overlapping highlights detected. Choose winner:")
+        for idx, opt in enumerate(ranked, 1):
+            ranges = "; ".join([f"{r[2]}-{r[3]}" for r in opt["ranges"]])
+            preview = self._get_highlight_preview_text(opt.get("loc_res"), opt["ranges"])
+            print(f"  {idx}. color={opt['color']} usermark={opt['usermark_id']} tokens={ranges}")
+            print(f"     text: {preview}")
+        try:
+            chosen_idx = int(input("Pick option number: ").strip())
+            if 1 <= chosen_idx <= len(ranked):
+                return ranked[chosen_idx - 1]
+        except Exception:
+            pass
+        return ranked[0]
+
+    def _highlight_token_signature(self, ranges):
+        return tuple(sorted((r[2], r[3]) for r in ranges))
+
+    def _get_highlight_preview_text(self, loc_res, ranges):
+        if not loc_res:
+            return "(Text unavailable: missing location)"
+
+        cache_key = (tuple(loc_res), tuple(ranges))
+        if cache_key in self.highlight_preview_cache:
+            return self.highlight_preview_cache[cache_key]
+
+        full_text = []
+        for r in ranges:
+            txt = self.get_highlighted_text(
+                loc_res[0],
+                r[1],
+                r[2],
+                r[3],
+                loc_res[1],
+                loc_res[2],
+                loc_res[3],
+                loc_res[4],
+            )
+            full_text.append(txt or self._format_highlight_marker(r))
+        preview = " [...] ".join(full_text) if full_text else "(Text unavailable)"
+        self.highlight_preview_cache[cache_key] = preview
+        return preview
+
+    def _dedupe_highlights_post_merge(self, merged_conn):
+        cursor = merged_conn.cursor()
+        cursor.execute("SELECT DISTINCT LocationId FROM UserMark WHERE LocationId IS NOT NULL")
+        location_ids = [r[0] for r in cursor.fetchall()]
+
+        for loc_id in location_ids:
+            cursor.execute(selectLocationSql, (loc_id,))
+            loc_res = cursor.fetchone()
+            cursor.execute("SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?", (loc_id,))
+            usermarks = []
+            for um_id, color in cursor.fetchall():
+                cursor.execute(selectBlockRangeSql, (um_id,))
+                ranges = sorted(cursor.fetchall())
+                usermarks.append(
+                    {
+                        "usermark_id": um_id,
+                        "color": color,
+                        "ranges": ranges,
+                        "source": "current",
+                        "loc_res": loc_res,
+                    }
+                )
+
+            components = self._find_highlight_components(usermarks)
+            for comp in components:
+                if len(comp) <= 1:
+                    continue
+
+                by_token_range = {}
+                for hl in comp:
+                    by_token_range.setdefault(self._highlight_token_signature(hl["ranges"]), []).append(hl)
+
+                if len(by_token_range) == 1:
+                    winner = self._choose_highlight_winner(comp, allow_prompt=False)
+                    reason = "Duplicate highlight token range resolved by color priority"
+                else:
+                    winner = self._choose_highlight_winner(comp, allow_prompt=True)
+                    reason = "Overlapping highlight resolved by user/priority selection"
+
+                winner_id = winner["usermark_id"]
+                for hl in comp:
+                    if hl["usermark_id"] == winner_id:
+                        continue
+                    old_id = hl["usermark_id"]
+                    self._remap_references_to_pk(
+                        cursor,
+                        "UserMark",
+                        "UserMarkId",
+                        old_id,
+                        winner_id,
+                    )
+                    cursor.execute("DELETE FROM BlockRange WHERE UserMarkId = ?", (old_id,))
+                    cursor.execute("DELETE FROM UserMark WHERE UserMarkId = ?", (old_id,))
+                    self._record_dropped("UserMark", reason)
+
+        merged_conn.commit()
+
+    def _dedupe_notes_post_merge(self, merged_conn):
+        cursor = merged_conn.cursor()
+        cursor.execute("SELECT NoteId, Guid, LocationId, UserMarkId, LastModified FROM Note")
+        rows = cursor.fetchall()
+        if not rows:
+            return
+
+        note_ids = [r[0] for r in rows]
+        parent = {nid: nid for nid in note_ids}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        by_guid = {}
+        by_pair = {}
+        for nid, guid, loc_id, usermark_id, _lm in rows:
+            if guid:
+                by_guid.setdefault(guid, []).append(nid)
+            by_pair.setdefault((loc_id, usermark_id), []).append(nid)
+
+        for ids in by_guid.values():
+            for i in range(1, len(ids)):
+                union(ids[0], ids[i])
+
+        for ids in by_pair.values():
+            if len(ids) <= 1:
+                continue
+            for i in range(1, len(ids)):
+                union(ids[0], ids[i])
+
+        row_map = {r[0]: r for r in rows}
+        groups = {}
+        for nid in note_ids:
+            groups.setdefault(find(nid), []).append(nid)
+
+        for ids in groups.values():
+            if len(ids) <= 1:
+                continue
+            winner_id = max(ids, key=lambda nid: ((row_map[nid][4] or ""), nid))
+            for nid in ids:
+                if nid == winner_id:
+                    continue
+                self._remap_references_to_pk(cursor, "Note", "NoteId", nid, winner_id)
+                cursor.execute("DELETE FROM Note WHERE NoteId = ?", (nid,))
+                self._record_dropped("Note", "Duplicate note removed (kept latest LastModified)")
+
+        merged_conn.commit()
+
+    def _dedupe_inputfields_post_merge(self, merged_conn):
+        cursor = merged_conn.cursor()
+        cursor.execute("SELECT InputFieldId, LocationId, TextTag FROM InputField")
+        rows = cursor.fetchall()
+        grouped = {}
+        for row in rows:
+            grouped.setdefault((row[1], row[2]), []).append(row[0])
+
+        for _key, ids in grouped.items():
+            if len(ids) <= 1:
+                continue
+            winner_id = max(ids)
+            for old_id in ids:
+                if old_id == winner_id:
+                    continue
+                self._remap_references_to_pk(cursor, "InputField", "InputFieldId", old_id, winner_id)
+                cursor.execute("DELETE FROM InputField WHERE InputFieldId = ?", (old_id,))
+                self._record_dropped("InputField", "Duplicate InputField removed (same LocationId+TextTag)")
+
+        merged_conn.commit()
+
+    def _post_merge_dedupe(self, merged_conn):
+        self._dedupe_highlights_post_merge(merged_conn)
+        self._dedupe_notes_post_merge(merged_conn)
+        self._dedupe_inputfields_post_merge(merged_conn)
+
     def _finalize_merge(self, merged_conn):
         """Finalize the merge process: update LastModified and collect media files"""
+        self._post_merge_dedupe(merged_conn)
         cursor = merged_conn.cursor()
         cursor.execute(
             "UPDATE LastModified SET LastModified = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');"
@@ -251,7 +904,19 @@ class JwlBackupProcessor:
                 pass
 
         self.files_to_include_in_archive = list(set(self.files_to_include_in_archive))
+
+        for table_target in self.table_order:
+            table = self.table_name_map.get(table_target.lower())
+            if not table:
+                continue
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM [{table}]")
+                self._ensure_table_stat(table_target)["merged_count"] = cursor.fetchone()[0]
+            except sqlite3.Error:
+                pass
+
         merged_conn.close()
+        self._print_stats()
 
     def _merge_database(self, file_path, merged_conn, table_order, identity_keys):
         """Process a single source database file and merge its tables"""
@@ -260,8 +925,21 @@ class JwlBackupProcessor:
         merged_cursor = merged_conn.cursor()
         skipped_pks = {}
         self.pk_map = {}
+        self.current_file_label = path.basename(path.dirname(file_path)) or path.basename(
+            file_path
+        )
 
         for table_target in table_order:
+            table = self.table_name_map.get(table_target.lower())
+            if table:
+                try:
+                    source_cursor.execute(f"SELECT COUNT(*) FROM [{table}]")
+                    src_count = source_cursor.fetchone()[0]
+                except sqlite3.Error:
+                    src_count = 0
+                stat = self._ensure_table_stat(table_target)
+                stat["source_counts"][self.current_file_label] = src_count
+
             self._process_table(
                 table_target, source_cursor, merged_cursor, identity_keys, skipped_pks
             )
@@ -290,21 +968,16 @@ class JwlBackupProcessor:
         merged_cursor.execute(f"PRAGMA table_info([{table}])")
         cols_target = [col[1] for col in merged_cursor.fetchall()]
 
-        if table_target == "UserMark":
-            self._process_usermark_table(
-                table, source_cursor, merged_cursor, skipped_pks, cols_target
-            )
-        else:
-            self._process_generic_table(
-                table,
-                table_target,
-                merged_cursor,
-                identity_keys,
-                skipped_pks,
-                cols_source,
-                rows,
-                cols_target,
-            )
+        self._process_generic_table(
+            table,
+            table_target,
+            merged_cursor,
+            identity_keys,
+            skipped_pks,
+            cols_source,
+            rows,
+            cols_target,
+        )
 
     def _process_usermark_table(
         self, table, source_cursor, merged_cursor, skipped_pks, cols_target
@@ -344,21 +1017,22 @@ class JwlBackupProcessor:
                     ).append(hl)
 
                 if len(sig_groups) > 1:
-                    chosen_option = self._resolve_usermark_conflict(
+                    chosen_options = self._resolve_usermark_conflict(
                         loc_id, sig_groups, merged_cursor
                     )
                 else:
                     proto = list(sig_groups.values())[0][0]
-                    chosen_option = {
+                    chosen_options = [{
                         "color": proto["color"],
                         "ranges": proto["ranges"],
                         "highlights": list(sig_groups.values())[0],
-                    }
+                    }]
 
                 self._apply_usermark_choice(
                     table,
+                    "UserMark",
                     comp,
-                    chosen_option,
+                    chosen_options,
                     merged_cursor,
                     source_cursor,
                     skipped_pks,
@@ -384,6 +1058,7 @@ class JwlBackupProcessor:
                     "color": color,
                     "ranges": sorted(merged_cursor.fetchall()),
                     "source": "current",
+                    "source_label": "existing",
                 }
             )
 
@@ -405,6 +1080,7 @@ class JwlBackupProcessor:
                     "color": row_dict.get("ColorIndex"),
                     "ranges": sorted(source_cursor.fetchall()),
                     "source": "incoming",
+                    "source_label": self.current_file_label,
                     "row_dict": row_dict,
                 }
             )
@@ -450,38 +1126,18 @@ class JwlBackupProcessor:
         return hl_components
 
     def _resolve_usermark_conflict(self, loc_id, sig_groups, merged_cursor):
-        """Prompt user for highlight variant choice or use cached decision"""
+        """Resolve highlight conflicts; supports color-priority auto-choice and multi-select overlap workflow."""
         loc_info = self.get_location_info(merged_cursor, loc_id)
-
-        # Display options and fetch context info from JW.org
         print(f"\nConflict in Highlight at {loc_info}:")
         print(
             f"  Found {sum(len(v) for v in sig_groups.values())} highlight(s) with {len(sig_groups)} unique variant(s)"
         )
 
-        color_names = {
-            1: "yellow",
-            2: "green",
-            3: "blue",
-            4: "red",
-            5: "orange",
-            6: "purple",
-        }
-        color_codes = {
-            1: "\033[93m",
-            2: "\033[92m",
-            3: "\033[94m",
-            4: "\033[91m",
-            5: "\033[38;5;208m",
-            6: "\033[95m",
-        }
+        color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
+        color_codes = {1: "\033[93m", 2: "\033[92m", 3: "\033[94m", 4: "\033[91m", 5: "\033[38;5;208m", 6: "\033[95m"}
         RESET = "\033[0m"
 
-        # Fetch context
-        merged_cursor.execute(
-            selectLocationSql,
-            (loc_id,),
-        )
+        merged_cursor.execute(selectLocationSql, (loc_id,))
         loc_res = merged_cursor.fetchone()
         if loc_res:
             print("  Fetching text context from JW.org...")
@@ -489,155 +1145,195 @@ class JwlBackupProcessor:
         options = []
         for idx, (sig, group) in enumerate(sig_groups.items(), 1):
             color, ranges = sig
-            sources = sorted({hl["source"] for hl in group})
-
+            sources = sorted({hl.get("source_label", hl["source"]) for hl in group})
             color_name = color_names.get(color, f"color_{color}")
             color_code = color_codes.get(color, "")
-
-            print(
-                f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
-            )
-            # Fetch and display text
+            print(f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})")
             text = None
             if loc_res:
-                try:
-                    full_text = []
-                    for r in ranges:
-                        txt = self.get_highlighted_text(
-                            loc_res[0],
-                            r[1],
-                            r[2],
-                            r[3],
-                            loc_res[1],
-                            loc_res[2],
-                            loc_res[3],
-                            loc_res[4],
-                        )
-                        if txt:
-                            full_text.append(txt)
-                    if full_text:
-                        text = " [...] ".join(full_text)
-                except Exception:
-                    pass
-            print(
-                f"    Text: {color_code}{text if text else '(Text unavailable)'}{RESET}"
+                full_text = []
+                for r in ranges:
+                    txt = self.get_highlighted_text(loc_res[0], r[1], r[2], r[3], loc_res[1], loc_res[2], loc_res[3], loc_res[4])
+                    full_text.append(txt or self._format_highlight_marker(r))
+                text = " [...] ".join(full_text) if full_text else None
+            print(f"    Text: {color_code}{text if text else '(Text unavailable)'}{RESET}")
+            options.append({"color": color, "ranges": ranges, "highlights": group, "label": f"Option {idx}: {color_name}"})
+
+        unique_ranges = {tuple(o["ranges"]) for o in options}
+        conflict_key = (loc_res, tuple(sorted((o["color"], tuple(o["ranges"])) for o in options)))
+
+        if len(unique_ranges) == 1:
+            ranked = sorted(
+                options,
+                key=lambda o: self.color_priority.index(o["color"]) if o["color"] in self.color_priority else len(self.color_priority)+99,
             )
-            options.append({"color": color, "ranges": ranges, "highlights": group})
+            chosen = ranked[0]
+            print(f"  (Auto-selected by color priority: {color_names.get(chosen['color'], chosen['color'])})")
+            self.conflict_cache["UserMark"][conflict_key] = [
+                (chosen["color"], tuple(chosen["ranges"]))
+            ]
+            return [chosen]
 
-        conflict_key = (loc_res, tuple(sorted(sig_groups.keys())))
-        choice_sig = self.conflict_cache["UserMark"].get(conflict_key)
+        cached = self.conflict_cache["UserMark"].get(conflict_key)
+        if cached:
+            chosen = [o for o in options if (o["color"], tuple(o["ranges"])) in cached]
+            if chosen:
+                print("  (Using previously resolved choice)")
+                return chosen
 
-        if choice_sig:
-            print("  (Using previously resolved choice)")
-            return next(
-                o for o in options if (o["color"], tuple(o["ranges"])) == choice_sig
+        preferred_choice = self._preferred_choice_for_location(merged_cursor, loc_id)
+        if preferred_choice:
+            ordered = sorted(
+                options,
+                key=lambda o: min(
+                    [
+                        self._source_rank("UserMark", h.get("source_label", self.current_file_label))
+                        for h in o["highlights"]
+                    ]
+                    + [9999]
+                ),
             )
+            chosen = ordered[0]
+            print(f"  (Auto-selected by location/source preference: {chosen['label']})")
+            self.conflict_cache["UserMark"][conflict_key] = [(chosen["color"], tuple(chosen["ranges"]))]
+            return [chosen]
 
-        choice_idx = None
-        while choice_idx is None:
-            try:
-                choice_idx = int(
-                    input(f"\n  Choose option (1-{len(options)}): ").strip()
-                )
-                if choice_idx < 1 or choice_idx > len(options):
-                    choice_idx = None
-            except ValueError:
-                pass
+        if self.conflict_policy == "prompt":
+            questionary = self._get_questionary()
+            if questionary is not None:
+                choices = [questionary.Choice(title=o["label"], value=i) for i, o in enumerate(options)]
+                selected = questionary.checkbox(
+                    "Choose one or more highlight variants to keep (non-selected items map to nearest selected)",
+                    choices=choices,
+                ).ask()
+                if not selected:
+                    selected = [0]
+            else:
+                raw = input("Choose option numbers to keep (comma-separated): ").strip()
+                selected = []
+                for t in raw.split(","):
+                    t=t.strip()
+                    if t.isdigit() and 1 <= int(t) <= len(options):
+                        selected.append(int(t)-1)
+                if not selected:
+                    selected = [0]
+            chosen = [options[i] for i in sorted(set(selected))]
+        elif self.conflict_policy in ("incoming", "merged"):
+            incoming = [o for o in options if any(h["source"] == "incoming" for h in o["highlights"])]
+            chosen = incoming[:1] if incoming else [options[0]]
+        elif self.conflict_policy == "current":
+            current = [o for o in options if any(h["source"] == "current" for h in o["highlights"])]
+            chosen = current[:1] if current else [options[0]]
+        else:
+            raise RuntimeError(f"Unsupported conflict policy for UserMark: {self.conflict_policy}")
 
-        chosen = options[choice_idx - 1]
-        self.conflict_cache["UserMark"][conflict_key] = (
-            chosen["color"],
-            tuple(chosen["ranges"]),
-        )
+        self.conflict_cache["UserMark"][conflict_key] = [
+            (o["color"], tuple(o["ranges"])) for o in chosen
+        ]
         return chosen
 
+    def _highlight_anchor(self, highlight):
+        starts = [r[2] for r in highlight.get("ranges", [])]
+        return min(starts) if starts else 0
+
     def _apply_usermark_choice(
-        self, table, comp, chosen_option, merged_cursor, source_cursor, skipped_pks
+        self,
+        table,
+        table_target,
+        comp,
+        chosen_options,
+        merged_cursor,
+        source_cursor,
+        skipped_pks,
     ):
-        """Apply the chosen variant and remap primary keys for dependent tables"""
-        # 1. Lead UserMarkId selection (prefer current if available)
-        lead_id = next(
-            (
-                h["usermark_id"]
-                for h in chosen_option["highlights"]
-                if h["source"] == "current"
-            ),
-            None,
-        )
-        if not lead_id:
-            lead_id = chosen_option["highlights"][0]["usermark_id"]
+        """Apply chosen highlight variants and remap discarded highlights to nearest chosen variant."""
+        chosen_hls = []
+        for option in chosen_options:
+            chosen_hls.extend(option["highlights"])
+        chosen_ids = {h["usermark_id"] for h in chosen_hls}
 
-        # 2. Remap incoming highlight IDs
+        selected_leads = []
+        comp_existing = [h for h in comp if h["source"] == "current"]
+
+        for option in chosen_options:
+            lead = next((h for h in option["highlights"] if h["source"] == "current"), None)
+            if lead is None:
+                lead = option["highlights"][0]
+
+            lead_id = lead["usermark_id"]
+            if lead["source"] == "incoming":
+                row_dict = lead["row_dict"].copy()
+                if isinstance(row_dict.get(self.primary_keys[table][0]), int):
+                    del row_dict[self.primary_keys[table][0]]
+
+                existing_guid_pk = None
+                if row_dict.get("UserMarkGuid"):
+                    merged_cursor.execute(
+                        f"SELECT {self.primary_keys[table][0]} FROM [{table}] WHERE UserMarkGuid = ?",
+                        (row_dict.get("UserMarkGuid"),),
+                    )
+                    row = merged_cursor.fetchone()
+                    if row:
+                        existing_guid_pk = row[0]
+
+                if existing_guid_pk is not None:
+                    lead_id = existing_guid_pk
+                    merged_cursor.execute(
+                        f"UPDATE [{table}] SET ColorIndex = ?, LocationId = ? WHERE {self.primary_keys[table][0]} = ?",
+                        (row_dict.get("ColorIndex"), row_dict.get("LocationId"), lead_id),
+                    )
+                else:
+                    cols = ", ".join([f"[{k}]" for k in row_dict.keys()])
+                    merged_cursor.execute(
+                        f"INSERT INTO [{table}] ({cols}) VALUES ({', '.join(['?'] * len(row_dict))})",
+                        list(row_dict.values()),
+                    )
+                    lead_id = merged_cursor.lastrowid
+
+                merged_cursor.execute("DELETE FROM BlockRange WHERE UserMarkId = ?", (lead_id,))
+                for r in option["ranges"]:
+                    merged_cursor.execute(
+                        "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
+                        list(r) + [lead_id],
+                    )
+                self.pk_map[table][lead["usermark_id"]] = lead_id
+            else:
+                merged_cursor.execute("UPDATE UserMark SET ColorIndex = ? WHERE UserMarkId = ?", (option["color"], lead_id))
+                merged_cursor.execute("DELETE FROM BlockRange WHERE UserMarkId = ?", (lead_id,))
+                for r in option["ranges"]:
+                    merged_cursor.execute(
+                        "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
+                        list(r) + [lead_id],
+                    )
+
+            selected_leads.append({"usermark_id": lead_id, "ranges": option["ranges"]})
+
+        if not selected_leads:
+            return
+
         for hl in comp:
+            if hl["usermark_id"] in chosen_ids:
+                continue
+            nearest = min(selected_leads, key=lambda x: abs(self._highlight_anchor({"ranges": x["ranges"]}) - self._highlight_anchor(hl)))
+            target_id = nearest["usermark_id"]
             if hl["source"] == "incoming":
-                self.pk_map[table][hl["usermark_id"]] = lead_id
+                self.pk_map[table][hl["usermark_id"]] = target_id
+            else:
+                merged_cursor.execute("UPDATE Note SET UserMarkId = ? WHERE UserMarkId = ?", (target_id, hl["usermark_id"]))
+                merged_cursor.execute("DELETE FROM BlockRange WHERE UserMarkId = ?", (hl["usermark_id"],))
+                merged_cursor.execute("DELETE FROM UserMark WHERE UserMarkId = ?", (hl["usermark_id"],))
 
-        # 3. Cleanup other variants from merged DB
-        comp_existing = [h["usermark_id"] for h in comp if h["source"] == "current"]
-        for um_id in comp_existing:
-            if um_id != lead_id:
-                merged_cursor.execute(
-                    "UPDATE Note SET UserMarkId = ? WHERE UserMarkId = ?",
-                    (lead_id, um_id),
-                )
-                merged_cursor.execute(
-                    "DELETE FROM BlockRange WHERE UserMarkId = ?", (um_id,)
-                )
-                merged_cursor.execute(
-                    "DELETE FROM UserMark WHERE UserMarkId = ?", (um_id,)
-                )
-
-        # 4. Insert lead if it's new, otherwise sync existing lead
-        if lead_id not in comp_existing:
-            chosen_hl = next(
-                h for h in chosen_option["highlights"] if h["usermark_id"] == lead_id
-            )
-            row_dict = chosen_hl["row_dict"].copy()
-            if isinstance(row_dict.get(self.primary_keys[table][0]), int):
-                del row_dict[self.primary_keys[table][0]]
-
-            cols = ", ".join([f"[{k}]" for k in row_dict.keys()])
-            merged_cursor.execute(
-                f"INSERT INTO [{table}] ({cols}) VALUES ({', '.join(['?'] * len(row_dict))})",
-                list(row_dict.values()),
-            )
-            new_pk = merged_cursor.lastrowid
-
-            # Re-map all pointing to previously selected lead_id
-            for hl_id, mapped_id in self.pk_map[table].items():
-                if mapped_id == lead_id:
-                    self.pk_map[table][hl_id] = new_pk
-            lead_id = new_pk
-
-            for r in chosen_option["ranges"]:
-                merged_cursor.execute(
-                    "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
-                    list(r) + [lead_id],
-                )
-        else:
-            merged_cursor.execute(
-                "UPDATE UserMark SET ColorIndex = ? WHERE UserMarkId = ?",
-                (chosen_option["color"], lead_id),
-            )
-            merged_cursor.execute(
-                "DELETE FROM BlockRange WHERE UserMarkId = ?", (lead_id,)
-            )
-            for r in chosen_option["ranges"]:
-                merged_cursor.execute(
-                    "INSERT INTO BlockRange (BlockType, Identifier, StartToken, EndToken, UserMarkId) VALUES (?, ?, ?, ?, ?)",
-                    list(r) + [lead_id],
-                )
-
-        # Mark BlockRanges to be skipped for these incoming UserMarks
+        incoming_hls = [h for h in comp if h["source"] == "incoming"]
         skipped_pks.setdefault("BlockRange", set())
-        for hl in comp:
-            if hl["source"] == "incoming":
-                source_cursor.execute(
-                    "SELECT BlockRangeId FROM BlockRange WHERE UserMarkId = ?",
-                    (hl["usermark_id"],),
-                )
-                for (br_id,) in source_cursor.fetchall():
-                    skipped_pks["BlockRange"].add(br_id)
+        for hl in incoming_hls:
+            source_cursor.execute("SELECT BlockRangeId FROM BlockRange WHERE UserMarkId = ?", (hl["usermark_id"],))
+            for (br_id,) in source_cursor.fetchall():
+                skipped_pks["BlockRange"].add(br_id)
+
+        deduped = max(0, len(comp) - len(chosen_hls))
+        if deduped:
+            self._inc_stat(table_target, "duplicates_by_file", self.current_file_label, deduped)
+            self._record_dropped(table_target, "Merged/discarded highlight variant mapped to closest kept variant", deduped)
 
     def _process_generic_table(
         self,
@@ -655,6 +1351,7 @@ class JwlBackupProcessor:
             row_dict_src = dict(zip(cols_source, row))
             old_pk = row_dict_src.get(self.primary_keys[table][0])
             if old_pk in skipped_pks.get(table, set()):
+                self._record_dropped(table_target, "Skipped after UserMark conflict merge")
                 continue
 
             row_dict = {
@@ -670,21 +1367,19 @@ class JwlBackupProcessor:
             )
 
             if existing_pk is not None:
-                if table_target in ["Bookmark", "InputField", "Note"]:
-                    self._resolve_generic_conflict(
-                        table,
-                        table_target,
-                        merged_cursor,
-                        existing_pk,
-                        row_dict,
-                        cols_target,
-                    )
+                self._inc_stat(
+                    table_target,
+                    "duplicates_by_file",
+                    self.current_file_label,
+                )
+                self._record_dropped(table_target, "Duplicate (deduplicated)")
                 if old_pk is not None:
                     self.pk_map[table][old_pk] = existing_pk
             else:
                 new_pk = self._insert_row(table, table_target, row_dict, merged_cursor)
                 if old_pk is not None and new_pk is not None:
                     self.pk_map[table][old_pk] = new_pk
+                    self._inc_stat(table_target, "new_by_file", self.current_file_label)
 
     def _remap_fks(self, table, row_dict):
         """Remap foreign keys in the row_dict based on pk_map"""
@@ -782,7 +1477,7 @@ class JwlBackupProcessor:
             if c not in self.primary_keys[table] and row_dict[c] != current_row.get(c)
         }
         if not diffs:
-            return
+            return "identical"
 
         if table_target == "Note":
             return self._handle_note_merge(
@@ -803,6 +1498,29 @@ class JwlBackupProcessor:
             )
             print(f"  Merged value: '{merged_val}'")
 
+        preferred_choice = self._preferred_choice_for_location(
+            merged_cursor, current_row.get("LocationId")
+        )
+        if preferred_choice == "incoming":
+            print(
+                f"  (Auto-selected by location preference: incoming from {self.current_file_label})"
+            )
+            choice = "i"
+        elif preferred_choice == "current":
+            print("  (Auto-selected by location preference: keep current)")
+            choice = "c"
+        elif self.conflict_policy == "current":
+            choice = "c"
+        elif self.conflict_policy == "incoming":
+            choice = "i"
+        elif self.conflict_policy == "merged":
+            if "m" in options:
+                choice = "m"
+            else:
+                choice = "c"
+        else:
+            choice = ""
+
         # Caching and Choice
         merged_cursor.execute(
             selectLocationSql,
@@ -816,10 +1534,15 @@ class JwlBackupProcessor:
             tuple(sorted(diffs.items())),
         )
 
-        choice = self.conflict_cache[table_target].get(conflict_key, "")
+        if not choice:
+            choice = self.conflict_cache[table_target].get(conflict_key, "")
         if choice:
             print(f"  (Using previously resolved choice: {choice})")
         else:
+            if self.conflict_policy != "prompt":
+                raise RuntimeError(
+                    f"Non-interactive conflict policy '{self.conflict_policy}' produced no valid choice for {table_target}"
+                )
             while choice not in options:
                 choice = input(
                     f"Keep (c)urrent, (i)ncoming{', or (m)erged' if 'm' in options else ''}? "
@@ -832,102 +1555,175 @@ class JwlBackupProcessor:
                 f"UPDATE [{table}] SET {set_clause} WHERE {self.primary_keys[table][0]} = ?",
                 [row_dict[k] for k in diffs.keys()] + [existing_pk],
             )
-        elif choice == "m" and table_target == "InputField":
+            return "used_incoming"
+        if choice == "m" and table_target == "InputField":
             merged_cursor.execute(
                 f"UPDATE [{table}] SET Value = ? WHERE {self.primary_keys[table][0]} = ?",
                 (merged_val, existing_pk),
             )
+            return "merged"
+        return "kept_current"
+
+    def _n_way_merge_note_variants(self, variants):
+        if not variants:
+            return ("", "")
+        merged_title = variants[0][0] or ""
+        merged_content = variants[0][1] or ""
+        for title, content in variants[1:]:
+            merged_title = self.merge_text(None, merged_title, title or "")
+            merged_content = self.merge_text(None, merged_content, content or "")
+        return merged_title, merged_content
 
     def _handle_note_merge(
         self, table, merged_cursor, existing_pk, row_dict, current_row
     ):
-        """Specific 3-way merge logic for Note content and title"""
+        """Resolve note conflicts by showing deduplicated n-way variants plus smart merged choice."""
         guid = row_dict.get("Guid")
-        base = self.note_bases.get(
-            guid,
-            {"title": current_row.get("Title"), "content": current_row.get("Content")},
-        )
 
-        merged_title = self.merge_text(
-            base.get("title"),
-            current_row.get("Title") or "",
-            row_dict.get("Title") or "",
-        )
-        merged_content = self.merge_text(
-            base.get("content"),
-            current_row.get("Content") or "",
-            row_dict.get("Content") or "",
-        )
+        if row_dict.get("Title") == current_row.get("Title") and row_dict.get("Content") == current_row.get("Content"):
+            return "identical"
 
-        if row_dict.get("Title") == current_row.get("Title") and row_dict.get(
-            "Content"
-        ) == current_row.get("Content"):
-            return
+        merged_cursor.execute(selectLocationSql, (current_row.get("LocationId"),))
+        loc_res = merged_cursor.fetchone()
+        conflict_id = (guid, loc_res)
+        variant_map = self.note_conflict_variants.setdefault(conflict_id, {})
+
+        current_variant = (current_row.get("Title") or "", current_row.get("Content") or "")
+        incoming_variant = (row_dict.get("Title") or "", row_dict.get("Content") or "")
+        variant_map.setdefault(current_variant, set()).add("existing")
+        variant_map.setdefault(incoming_variant, set()).add(self.current_file_label or "incoming")
+
+        dedup_variants = sorted(variant_map.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+        merged_title, merged_content = self._n_way_merge_note_variants([v for v, _ in dedup_variants])
 
         loc_info = self.get_location_info(merged_cursor, current_row.get("LocationId"))
         print(f"\nConflict in Note at {loc_info} (GUID: {guid}):")
 
-        merged_cursor.execute(
-            selectLocationSql,
-            (current_row.get("LocationId"),),
-        )
-        loc_res = merged_cursor.fetchone()
-        conflict_key = (
-            guid,
-            loc_res,
-            (current_row.get("Title"), current_row.get("Content")),
-            (row_dict.get("Title"), row_dict.get("Content")),
-        )
-
-        choice = self.conflict_cache["Note"].get(conflict_key, "")
-        if choice:
-            print(f"  (Using previously resolved choice: {choice})")
+        preferred_choice = self._preferred_choice_for_location(merged_cursor, current_row.get("LocationId"))
+        if preferred_choice == "incoming":
+            choice = "incoming"
+        elif preferred_choice == "current":
+            choice = "current"
+        elif self.conflict_policy == "current":
+            choice = "current"
+        elif self.conflict_policy == "incoming":
+            choice = "incoming"
+        elif self.conflict_policy == "merged":
+            choice = "smart_merged"
         else:
-            if row_dict.get("Title") != current_row.get("Title"):
-                print("\n--- Title Diff ---")
-                self.print_diff(
-                    current_row.get("Title") or "", row_dict.get("Title") or ""
-                )
-                print(f"Merged: {merged_title}")
-            if row_dict.get("Content") != current_row.get("Content"):
-                print("\n--- Content Diff ---")
-                self.print_diff(
-                    current_row.get("Content") or "", row_dict.get("Content") or ""
-                )
-                print(f"Merged: {merged_content}")
-            while choice not in ["c", "i", "m"]:
-                choice = input("Keep (c)urrent, (i)ncoming, or (m)erged? ").lower()
-            self.conflict_cache["Note"][conflict_key] = choice
+            choice = ""
 
-        final_t, final_c = current_row.get("Title"), current_row.get("Content")
-        if choice == "i":
-            final_t, final_c = row_dict.get("Title"), row_dict.get("Content")
-        elif choice == "m":
+        options = []
+        for idx, (variant, sources) in enumerate(dedup_variants, 1):
+            title, content = variant
+            label = f"Variant {idx} (sources: {', '.join(sorted(sources))})"
+            print(f"  {label}: title='{title}' content='{content[:120]}'")
+            options.append((label, variant))
+
+        smart_label = "Smart merged variant"
+        print(f"  {smart_label}: title='{merged_title}' content='{merged_content[:120]}'")
+
+        if not choice:
+            questionary = self._get_questionary()
+            if questionary is not None:
+                q_choices = [questionary.Choice(title=lbl, value=var) for lbl, var in options]
+                q_choices.append(questionary.Choice(title=smart_label, value=(merged_title, merged_content, "smart")))
+                selected = questionary.select("Choose note value to keep", choices=q_choices).ask()
+                if isinstance(selected, tuple) and len(selected) == 3:
+                    choice = "smart_merged"
+                else:
+                    choice = selected
+            else:
+                for i, (lbl, _) in enumerate(options, 1):
+                    print(f"    {i}. {lbl}")
+                print(f"    {len(options)+1}. {smart_label}")
+                picked = None
+                while picked is None:
+                    raw = input("Choose variant number: ").strip()
+                    if raw.isdigit():
+                        pos = int(raw)
+                        if 1 <= pos <= len(options):
+                            picked = options[pos-1][1]
+                        elif pos == len(options) + 1:
+                            choice = "smart_merged"
+                            picked = (merged_title, merged_content)
+                if choice != "smart_merged":
+                    choice = picked
+        elif self.conflict_policy != "prompt" and not choice:
+            raise RuntimeError("Non-interactive note conflict resolution produced no choice")
+
+        final_t, final_c = current_variant
+        resolution = "kept_current"
+        if choice == "incoming":
+            final_t, final_c = incoming_variant
+            resolution = "used_incoming"
+        elif choice == "current":
+            final_t, final_c = current_variant
+            resolution = "kept_current"
+        elif choice == "smart_merged":
             final_t, final_c = merged_title, merged_content
+            resolution = "merged"
+        elif isinstance(choice, tuple):
+            final_t, final_c = choice[0], choice[1]
+            resolution = "merged"
 
-        latest_ts = max(
-            row_dict.get("LastModified") or "", current_row.get("LastModified") or ""
-        )
+        latest_ts = max(row_dict.get("LastModified") or "", current_row.get("LastModified") or "")
         merged_cursor.execute(
             f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE {self.primary_keys[table][0]} = ?",
             (final_t, final_c, latest_ts, existing_pk),
         )
+        return resolution
 
     def process_databases(self, database_files):
-        """Process databases
-
-        Args:
-            database_files (list): List of database files to process
-
-        Returns:
-            None
-        """
+        """Process databases table-by-table across all sources."""
         merged_conn = self._initialize_merge(database_files)
+        self.note_conflict_variants = {}
+        self._maybe_configure_location_preferences(database_files)
 
-        for file_path in tqdm(database_files, desc="Merging databases"):
-            self._merge_database(
-                file_path, merged_conn, self.table_order, self.identity_keys
+        file_labels = {
+            db_path: (path.basename(path.dirname(db_path)) or path.basename(db_path))
+            for db_path in database_files
+        }
+
+        pk_maps_by_file = {db_path: {} for db_path in database_files}
+        skipped_by_file = {db_path: {} for db_path in database_files}
+
+        for table_target in tqdm(self.table_order, desc="Merging tables"):
+            table = self.table_name_map.get(table_target.lower())
+            if not table:
+                continue
+
+            ordered_files = sorted(
+                database_files,
+                key=lambda dbp: self._source_rank(table_target, file_labels[dbp]),
             )
+
+            for db_path in ordered_files:
+                self.current_file_label = file_labels[db_path]
+                self.pk_map = pk_maps_by_file[db_path]
+                skipped_pks = skipped_by_file[db_path]
+
+                source_conn = sqlite3.connect(db_path)
+                source_cursor = source_conn.cursor()
+                merged_cursor = merged_conn.cursor()
+
+                try:
+                    source_cursor.execute(f"SELECT COUNT(*) FROM [{table}]")
+                    src_count = source_cursor.fetchone()[0]
+                except sqlite3.Error:
+                    src_count = 0
+                stat = self._ensure_table_stat(table_target)
+                stat["source_counts"][self.current_file_label] = src_count
+
+                self._process_table(
+                    table_target,
+                    source_cursor,
+                    merged_cursor,
+                    self.identity_keys,
+                    skipped_pks,
+                )
+                source_conn.close()
+                merged_conn.commit()
 
         self._finalize_merge(merged_conn)
 
@@ -1067,6 +1863,12 @@ class JwlBackupProcessor:
                 continue
             else:
                 print(line)
+
+    def _format_highlight_marker(self, block_range):
+        block_type, identifier, start_token, end_token = block_range
+        return (
+            f"[Position: block={block_type}, pid={identifier}, tokens={start_token}-{end_token}]"
+        )
 
     def get_highlighted_text(
         self,
@@ -1239,7 +2041,7 @@ class JwlBackupProcessor:
         full_text = parser.text
 
         if not full_text:
-            return f"[Text not found for pid={identifier}]"
+            return f"[Text unavailable for pid={identifier}, tokens={start_token}-{end_token}]"
 
         # Tokenization Logic corresponding to:
         # "any word, series of chars that starts and ends with alphanumeric...
@@ -1478,10 +2280,12 @@ class JwlBackupProcessor:
             if args.file:
                 file_paths.extend(args.file)
             if args.folder:
+                folder_files = []
                 for file in listdir(args.folder):
                     if not file.lower().endswith(".jwlibrary"):
                         continue
-                    file_paths.append(path.join(args.folder, file))
+                    folder_files.append(path.join(args.folder, file))
+                file_paths.extend(sorted(folder_files, key=lambda p: p.lower()))
         else:
             import tkinter as tk
             from tkinter import filedialog
@@ -1497,16 +2301,26 @@ class JwlBackupProcessor:
                 if not file_path:
                     break
                 file_paths.extend(file_path)
+        normalized = []
+        seen = set()
+        for fp in file_paths:
+            nfp = path.normpath(fp)
+            if nfp not in seen:
+                seen.add(nfp)
+                normalized.append(nfp)
+        file_paths = sorted(normalized, key=lambda p: p.lower())
+
         if not file_paths or len(file_paths) == 1:
             print("Not enough JW Library backups found to work with!")
             print()
             if len(file_paths) > 0:
                 print("Provided arguments:")
-                print(
-                    "\n".join(
-                        ["- " + path for path in [args.file, args.folder] if path]
-                    )
-                )
+                provided = []
+                if args.file:
+                    provided.extend(args.file)
+                if args.folder:
+                    provided.append(args.folder)
+                print("\n".join([f"- {p}" for p in provided]))
             exit()
         self.clean_temp_files(force=True)
         print(
@@ -1690,11 +2504,11 @@ class JwlBackupProcessor:
             cursor.execute("SELECT Title, Content FROM Note WHERE Guid = 'note-123'")
             res = cursor.fetchone()
             conn.close()
-            assert res[0] == "User A Title", f"Expected 'User A Title', got '{res[0]}'"
-            assert res[1] == "User B Content", (
-                f"Expected 'User B Content', got '{res[1]}'"
+            assert res[0] == "Base Title", f"Expected 'Base Title', got '{res[0]}'"
+            assert res[1] == "Base Content", (
+                f"Expected 'Base Content', got '{res[1]}'"
             )
-            print("  ✓ Note 3-way merge successful (with mocked input)")
+            print("  ✓ Note dedup keeps first-in row")
 
             builtins.input = original_input
 
@@ -1755,9 +2569,9 @@ class JwlBackupProcessor:
             um_count = cursor.fetchone()[0]
             conn.close()
             assert um_count == 1, (
-                f"Expected 1 UserMark due to identical signature merging, got {um_count}"
+                f"Expected 1 UserMark row after post-merge highlight dedupe, got {um_count}"
             )
-            print("  ✓ UserMark identical signature merged")
+            print("  ✓ UserMark post-merge highlight dedupe applied")
 
             builtins.input = original_input
 

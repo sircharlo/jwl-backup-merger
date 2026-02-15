@@ -17,7 +17,7 @@ Please note that this project is not affiliated with jw.org or the official JW L
 
 Pre-requisites:
 
-    pip install pandas tqdm tk
+    pip install tqdm tk python-dateutil requests questionary
 
 Running the app:
 
@@ -27,7 +27,24 @@ Running the app:
 
 - `--folder FOLDER_PATH`: Folder containing JW Library backups to merge.
 - `--file FILE_PATH`: JW Library backup to add to the list of backups to merge. You can specify multiple `--file` arguments to merge multiple backups.
-- `--debug`: Enable verbose output and Excel file creation to help with debugging; also prevents deletion of temporary files.
+- `--debug`: Enable verbose output and keep temporary working files for debugging.
+- `--conflict-policy prompt|current|incoming|merged`: Choose interactive or automatic conflict resolution behavior.
+- `--verbose-stats`: Print per-table counts for each input DB, merged counts, dedup stats, and dropped-item reasons.
+
+When using `--conflict-policy prompt`, you can optionally configure source preferences at runtime (for highlights, notes, bookmarks, and input fields) by `KeySymbol` and assign a preferred input backup file to auto-resolve conflicts for matching records.
+
+In a TTY terminal with `questionary` installed, initial confirmation prompts, KeySymbol selection, and source-file selection all support interactive keyboard navigation (arrow keys + space/enter). For priority lists, after checkbox selection the app asks for explicit ranking so priority follows your chosen order. In non-interactive environments or when `questionary` is unavailable, it falls back to number-based prompts.
+
+The merger now processes data table-by-table across all sources (instead of one source at a time), while preserving FK/PK constraints from a copied base DB.
+
+After the merge insert phase completes, the tool now runs post-merge dedupe passes on the merged DB for highlights (overlap analysis), notes (duplicate note cleanup using `LastModified` recency), and input fields (same `LocationId + TextTag`).
+
+When running in prompt mode, you can configure:
+- per-table source priority fallback order (Bookmark/InputField/Note/UserMark),
+- highlight color priority for identical-range highlight conflicts, and
+- KeySymbol-specific source preferences.
+
+These preferences are saved to `~/.jw-backup-merger.json` and reloaded on future runs (you can still change them each run).
 
 ### Example usage
 
