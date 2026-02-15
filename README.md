@@ -33,7 +33,16 @@ Running the app:
 
 When using `--conflict-policy prompt`, you can optionally configure source preferences at runtime (for highlights, notes, bookmarks, and input fields) by `KeySymbol` and assign a preferred input backup file to auto-resolve conflicts for matching records.
 
-In a TTY terminal with `questionary` installed, KeySymbol and file selection supports interactive keyboard navigation (arrow keys + space/enter). In non-interactive environments or when `questionary` is unavailable, it falls back to number-based prompts.
+In a TTY terminal with `questionary` installed, initial confirmation prompts, KeySymbol selection, and source-file selection all support interactive keyboard navigation (arrow keys + space/enter). In non-interactive environments or when `questionary` is unavailable, it falls back to number-based prompts.
+
+The merger now processes data table-by-table across all sources (instead of one source at a time), while preserving FK/PK constraints from a copied base DB.
+
+When running in prompt mode, you can configure:
+- per-table source priority fallback order (Bookmark/InputField/Note/UserMark),
+- highlight color priority for identical-range highlight conflicts, and
+- KeySymbol-specific source preferences.
+
+These preferences are saved to `~/.jw-backup-merger.json` and reloaded on future runs (you can still change them each run).
 
 ### Example usage
 
