@@ -642,8 +642,206 @@ class JwlBackupProcessor:
         merged_conn.commit()
         return merged_conn
 
+    def _remap_references_to_pk(self, cursor, target_table, target_pk_col, old_pk, new_pk):
+        target_lower = target_table.lower()
+        for from_table_lower, fk_cols in self.fk_map.items():
+            from_table = self.table_name_map.get(from_table_lower)
+            if not from_table:
+                continue
+            for from_col_lower, (to_table, _to_col) in fk_cols.items():
+                if to_table.lower() != target_lower:
+                    continue
+                from_col = None
+                cursor.execute(f"PRAGMA table_info([{from_table}])")
+                for col in cursor.fetchall():
+                    if col[1].lower() == from_col_lower:
+                        from_col = col[1]
+                        break
+                if not from_col:
+                    continue
+                cursor.execute(
+                    f"UPDATE [{from_table}] SET [{from_col}] = ? WHERE [{from_col}] = ?",
+                    (new_pk, old_pk),
+                )
+
+    def _choose_highlight_winner(self, options):
+        color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
+        ranked = sorted(
+            options,
+            key=lambda o: (
+                self.color_priority.index(o["color"]) if o["color"] in self.color_priority else len(self.color_priority) + 99,
+                o["usermark_id"],
+            ),
+        )
+
+        if self.conflict_policy != "prompt":
+            return ranked[0]
+
+        questionary = self._get_questionary()
+        if questionary is not None:
+            choices = []
+            for opt in ranked:
+                ranges = "; ".join([f"{r[2]}-{r[3]}" for r in opt["ranges"]])
+                title = f"{color_names.get(opt['color'], opt['color'])} | UserMarkId={opt['usermark_id']} | tokens={ranges}"
+                choices.append(questionary.Choice(title=title, value=opt["usermark_id"]))
+            chosen_id = questionary.select(
+                "Select highlight to keep for overlapping ranges", choices=choices
+            ).ask()
+            selected = next((o for o in ranked if o["usermark_id"] == chosen_id), None)
+            if selected:
+                return selected
+
+        print("Overlapping highlights detected. Choose winner:")
+        for idx, opt in enumerate(ranked, 1):
+            ranges = "; ".join([f"{r[2]}-{r[3]}" for r in opt["ranges"]])
+            print(f"  {idx}. color={opt['color']} usermark={opt['usermark_id']} tokens={ranges}")
+        try:
+            chosen_idx = int(input("Pick option number: ").strip())
+            if 1 <= chosen_idx <= len(ranked):
+                return ranked[chosen_idx - 1]
+        except Exception:
+            pass
+        return ranked[0]
+
+    def _dedupe_highlights_post_merge(self, merged_conn):
+        cursor = merged_conn.cursor()
+        cursor.execute("SELECT DISTINCT LocationId FROM UserMark WHERE LocationId IS NOT NULL")
+        location_ids = [r[0] for r in cursor.fetchall()]
+
+        for loc_id in location_ids:
+            cursor.execute("SELECT UserMarkId, ColorIndex FROM UserMark WHERE LocationId = ?", (loc_id,))
+            usermarks = []
+            for um_id, color in cursor.fetchall():
+                cursor.execute(selectBlockRangeSql, (um_id,))
+                ranges = sorted(cursor.fetchall())
+                usermarks.append(
+                    {
+                        "usermark_id": um_id,
+                        "color": color,
+                        "ranges": ranges,
+                        "source": "current",
+                    }
+                )
+
+            components = self._find_highlight_components(usermarks)
+            for comp in components:
+                if len(comp) <= 1:
+                    continue
+
+                by_range = {}
+                for hl in comp:
+                    by_range.setdefault(tuple(hl["ranges"]), []).append(hl)
+
+                if len(by_range) == 1:
+                    winner = self._choose_highlight_winner(comp)
+                    reason = "Duplicate highlight range resolved by color priority"
+                else:
+                    winner = self._choose_highlight_winner(comp)
+                    reason = "Overlapping highlight resolved by user/priority selection"
+
+                winner_id = winner["usermark_id"]
+                for hl in comp:
+                    if hl["usermark_id"] == winner_id:
+                        continue
+                    old_id = hl["usermark_id"]
+                    self._remap_references_to_pk(
+                        cursor,
+                        "UserMark",
+                        "UserMarkId",
+                        old_id,
+                        winner_id,
+                    )
+                    cursor.execute("DELETE FROM BlockRange WHERE UserMarkId = ?", (old_id,))
+                    cursor.execute("DELETE FROM UserMark WHERE UserMarkId = ?", (old_id,))
+                    self._record_dropped("UserMark", reason)
+
+        merged_conn.commit()
+
+    def _dedupe_notes_post_merge(self, merged_conn):
+        cursor = merged_conn.cursor()
+        cursor.execute("SELECT NoteId, Guid, LocationId, UserMarkId, LastModified FROM Note")
+        rows = cursor.fetchall()
+        if not rows:
+            return
+
+        note_ids = [r[0] for r in rows]
+        parent = {nid: nid for nid in note_ids}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        by_guid = {}
+        by_pair = {}
+        for nid, guid, loc_id, usermark_id, _lm in rows:
+            if guid:
+                by_guid.setdefault(guid, []).append(nid)
+            by_pair.setdefault((loc_id, usermark_id), []).append(nid)
+
+        for ids in by_guid.values():
+            for i in range(1, len(ids)):
+                union(ids[0], ids[i])
+
+        for ids in by_pair.values():
+            if len(ids) <= 1:
+                continue
+            for i in range(1, len(ids)):
+                union(ids[0], ids[i])
+
+        row_map = {r[0]: r for r in rows}
+        groups = {}
+        for nid in note_ids:
+            groups.setdefault(find(nid), []).append(nid)
+
+        for ids in groups.values():
+            if len(ids) <= 1:
+                continue
+            winner_id = max(ids, key=lambda nid: ((row_map[nid][4] or ""), nid))
+            for nid in ids:
+                if nid == winner_id:
+                    continue
+                self._remap_references_to_pk(cursor, "Note", "NoteId", nid, winner_id)
+                cursor.execute("DELETE FROM Note WHERE NoteId = ?", (nid,))
+                self._record_dropped("Note", "Duplicate note removed (kept latest LastModified)")
+
+        merged_conn.commit()
+
+    def _dedupe_inputfields_post_merge(self, merged_conn):
+        cursor = merged_conn.cursor()
+        cursor.execute("SELECT InputFieldId, LocationId, TextTag FROM InputField")
+        rows = cursor.fetchall()
+        grouped = {}
+        for row in rows:
+            grouped.setdefault((row[1], row[2]), []).append(row[0])
+
+        for _key, ids in grouped.items():
+            if len(ids) <= 1:
+                continue
+            winner_id = max(ids)
+            for old_id in ids:
+                if old_id == winner_id:
+                    continue
+                self._remap_references_to_pk(cursor, "InputField", "InputFieldId", old_id, winner_id)
+                cursor.execute("DELETE FROM InputField WHERE InputFieldId = ?", (old_id,))
+                self._record_dropped("InputField", "Duplicate InputField removed (same LocationId+TextTag)")
+
+        merged_conn.commit()
+
+    def _post_merge_dedupe(self, merged_conn):
+        self._dedupe_highlights_post_merge(merged_conn)
+        self._dedupe_notes_post_merge(merged_conn)
+        self._dedupe_inputfields_post_merge(merged_conn)
+
     def _finalize_merge(self, merged_conn):
         """Finalize the merge process: update LastModified and collect media files"""
+        self._post_merge_dedupe(merged_conn)
         cursor = merged_conn.cursor()
         cursor.execute(
             "UPDATE LastModified SET LastModified = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');"
@@ -2329,10 +2527,10 @@ class JwlBackupProcessor:
             cursor.execute("SELECT COUNT(*) FROM UserMark")
             um_count = cursor.fetchone()[0]
             conn.close()
-            assert um_count == 2, (
-                f"Expected 2 UserMark rows in straight merge mode, got {um_count}"
+            assert um_count == 1, (
+                f"Expected 1 UserMark row after post-merge highlight dedupe, got {um_count}"
             )
-            print("  ✓ UserMark rows inserted without conflict resolution")
+            print("  ✓ UserMark post-merge highlight dedupe applied")
 
             builtins.input = original_input
 

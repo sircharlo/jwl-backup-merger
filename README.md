@@ -37,6 +37,8 @@ In a TTY terminal with `questionary` installed, initial confirmation prompts, Ke
 
 The merger now processes data table-by-table across all sources (instead of one source at a time), while preserving FK/PK constraints from a copied base DB.
 
+After the merge insert phase completes, the tool now runs post-merge dedupe passes on the merged DB for highlights (overlap analysis), notes (duplicate note cleanup using `LastModified` recency), and input fields (same `LocationId + TextTag`).
+
 When running in prompt mode, you can configure:
 - per-table source priority fallback order (Bookmark/InputField/Note/UserMark),
 - highlight color priority for identical-range highlight conflicts, and
