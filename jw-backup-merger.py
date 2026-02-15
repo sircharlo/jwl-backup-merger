@@ -664,7 +664,7 @@ class JwlBackupProcessor:
                     (new_pk, old_pk),
                 )
 
-    def _choose_highlight_winner(self, options):
+    def _choose_highlight_winner(self, options, allow_prompt=True):
         color_names = {1: "yellow", 2: "green", 3: "blue", 4: "red", 5: "orange", 6: "purple"}
         ranked = sorted(
             options,
@@ -674,7 +674,7 @@ class JwlBackupProcessor:
             ),
         )
 
-        if self.conflict_policy != "prompt":
+        if self.conflict_policy != "prompt" or not allow_prompt:
             return ranked[0]
 
         questionary = self._get_questionary()
@@ -703,6 +703,9 @@ class JwlBackupProcessor:
             pass
         return ranked[0]
 
+    def _highlight_token_signature(self, ranges):
+        return tuple(sorted((r[2], r[3]) for r in ranges))
+
     def _dedupe_highlights_post_merge(self, merged_conn):
         cursor = merged_conn.cursor()
         cursor.execute("SELECT DISTINCT LocationId FROM UserMark WHERE LocationId IS NOT NULL")
@@ -728,15 +731,15 @@ class JwlBackupProcessor:
                 if len(comp) <= 1:
                     continue
 
-                by_range = {}
+                by_token_range = {}
                 for hl in comp:
-                    by_range.setdefault(tuple(hl["ranges"]), []).append(hl)
+                    by_token_range.setdefault(self._highlight_token_signature(hl["ranges"]), []).append(hl)
 
-                if len(by_range) == 1:
-                    winner = self._choose_highlight_winner(comp)
-                    reason = "Duplicate highlight range resolved by color priority"
+                if len(by_token_range) == 1:
+                    winner = self._choose_highlight_winner(comp, allow_prompt=False)
+                    reason = "Duplicate highlight token range resolved by color priority"
                 else:
-                    winner = self._choose_highlight_winner(comp)
+                    winner = self._choose_highlight_winner(comp, allow_prompt=True)
                     reason = "Overlapping highlight resolved by user/priority selection"
 
                 winner_id = winner["usermark_id"]
@@ -1638,6 +1641,7 @@ class JwlBackupProcessor:
         """Process databases table-by-table across all sources."""
         merged_conn = self._initialize_merge(database_files)
         self.note_conflict_variants = {}
+        self._maybe_configure_location_preferences(database_files)
 
         file_labels = {
             db_path: (path.basename(path.dirname(db_path)) or path.basename(db_path))
