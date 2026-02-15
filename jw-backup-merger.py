@@ -302,6 +302,29 @@ class JwlBackupProcessor:
             return None
         return importlib.import_module("questionary")
 
+    def _rank_selected_indices(self, title, selected_indices, items):
+        questionary = self._get_questionary()
+        if questionary is None or len(selected_indices) <= 1:
+            return list(selected_indices)
+
+        remaining = list(selected_indices)
+        ranked = []
+        while remaining:
+            choices = [
+                questionary.Choice(title=items[idx], value=idx) for idx in remaining
+            ]
+            chosen = questionary.select(
+                f"{title} (choose next highest priority)", choices=choices
+            ).ask()
+            if chosen is None:
+                break
+            ranked.append(chosen)
+            remaining = [idx for idx in remaining if idx != chosen]
+
+        if remaining:
+            ranked.extend(remaining)
+        return ranked
+
     def _multi_select_menu(self, title, items):
         if not items:
             return []
@@ -313,7 +336,8 @@ class JwlBackupProcessor:
         result = questionary.checkbox(title, choices=choices).ask()
         if not result:
             return []
-        return sorted(result)
+        selected = list(result)
+        return self._rank_selected_indices(title, selected, items)
 
     def _single_select_menu(self, title, items):
         if not items:
