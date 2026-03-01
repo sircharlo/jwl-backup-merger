@@ -576,6 +576,54 @@ class JwlBackupProcessor:
         old_note_id = row_dict.get(note_id_col) if note_id_col else None
         guid = row_dict.get("Guid")
 
+        # Secondary duplicate detection: identical note payload even with different Guid.
+        merged_cursor.execute(
+            f"""
+            SELECT _rowid_ AS __rowid__, *
+            FROM [{table}]
+            WHERE UserMarkId IS ?
+              AND LocationId IS ?
+              AND COALESCE(Title, '') = COALESCE(?, '')
+              AND COALESCE(Content, '') = COALESCE(?, '')
+            ORDER BY _rowid_ DESC
+            LIMIT 1
+            """,
+            (
+                row_dict.get("UserMarkId"),
+                row_dict.get("LocationId"),
+                row_dict.get("Title"),
+                row_dict.get("Content"),
+            ),
+        )
+        payload_dup = merged_cursor.fetchone()
+        if payload_dup is not None:
+            cols_payload = [d[0] for d in merged_cursor.description]
+            existing_payload = dict(zip(cols_payload, payload_dup))
+            existing_note_id = existing_payload.get(note_id_col) if note_id_col else None
+            if old_note_id is not None and existing_note_id is not None:
+                pk_remap[table][old_note_id] = existing_note_id
+
+            incoming_raw_ts = str(row_dict.get("LastModified") or "")
+            existing_raw_ts = str(existing_payload.get("LastModified") or "")
+            incoming_ts = self._parse_last_modified(incoming_raw_ts)
+            existing_ts = self._parse_last_modified(existing_raw_ts)
+            if incoming_raw_ts > existing_raw_ts or (
+                incoming_raw_ts == existing_raw_ts and incoming_ts > existing_ts
+            ):
+                merged_cursor.execute(
+                    f"UPDATE [{table}] SET LastModified = ? WHERE rowid = ?",
+                    (row_dict.get("LastModified"), existing_payload.get("__rowid__")),
+                )
+
+            if guid:
+                id_cols = self.identity_keys.get("Note", ["Guid"])
+                identity_tuple = tuple(row_dict.get(c) for c in id_cols)
+                if self._is_autoincrement_table(table) and existing_note_id is not None:
+                    identity_index.setdefault("Note", {})[identity_tuple] = existing_note_id
+                else:
+                    identity_index.setdefault("Note", {})[identity_tuple] = True
+            return existing_note_id
+
         if not guid:
             return self._insert_row(table, "Note", row_dict, merged_cursor)
 
@@ -2441,6 +2489,57 @@ class JwlBackupProcessor:
             assert res[1] == "User B Content", f"Expected merged content 'User B Content', got '{res[1]}'"
             assert res[2] == "2024-02-03T00:00:00Z", f"Expected latest timestamp to win, got '{res[2]}'"
             print("  ✓ 3+ row Note merge intelligently merged title/content and kept latest timestamp")
+
+            # -------------------------------------------------------
+            # Test 3c: Identical notes with different Guid dedupe by payload
+            # -------------------------------------------------------
+            print("\nTest 3c: Note payload dedupe across different Guid...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-guid-a",
+                            "Title": "Same title",
+                            "Content": "Same content",
+                            "LocationId": 10,
+                            "UserMarkId": None,
+                            "LastModified": "2024-03-01T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-guid-b",
+                            "Title": "Same title",
+                            "Content": "Same content",
+                            "LocationId": 10,
+                            "UserMarkId": None,
+                            "LastModified": "2024-03-02T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            count = conn.execute("SELECT COUNT(*) FROM Note").fetchone()[0]
+            last_mod = conn.execute("SELECT LastModified FROM Note").fetchone()[0]
+            conn.close()
+            assert count == 1, f"Expected payload-equivalent notes to dedupe to 1 row, got {count}"
+            assert last_mod == "2024-03-02T00:00:00Z", (
+                f"Expected newer LastModified to be kept, got '{last_mod}'"
+            )
+            print("  ✓ Notes with different Guid but identical payload dedupe correctly")
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
