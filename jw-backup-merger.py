@@ -127,6 +127,7 @@ class JwlBackupProcessor:
         self.autoresolve_config = {}
         self.usermark_sources = {}  # {merged_usermark_id: source_path}
         self.text_prefetch_workers = 3
+        self.color_preference = [1, 2, 3, 4, 5, 6]
 
         # Tables processed in parent-before-child dependency order.
         # This is critical: every FK target must appear before the table that references it.
@@ -411,6 +412,8 @@ class JwlBackupProcessor:
 
         sorted_keys = sorted(list(all_keysymbols))
         if sorted_keys:
+            self._configure_color_preference()
+
             if self._ask_confirm(
                 "Would you like to ignore certain publications for highlight merge?"
             ):
@@ -529,6 +532,46 @@ class JwlBackupProcessor:
             merged_conn.commit()
 
         self._finalize_merge(merged_conn)
+
+    def _configure_color_preference(self):
+        """Prompt once for preferred highlight color order used in identical-text autoresolve."""
+        color_names = {
+            1: "yellow",
+            2: "green",
+            3: "blue",
+            4: "red",
+            5: "orange",
+            6: "purple",
+        }
+
+        if not self._ask_confirm(
+            "Set highlight color priority for identical-text auto-resolution?",
+            default=False,
+        ):
+            return
+
+        available = list(self.color_preference)
+        preference = []
+        for idx in range(len(available)):
+            choices = [
+                {
+                    "name": f"{color_names.get(c, f'color_{c}')} (#{c})",
+                    "value": c,
+                }
+                for c in available
+            ]
+            picked = self._ask_select(
+                f"Choose preferred color #{idx + 1}:",
+                choices=choices,
+                default=available[0],
+            )
+            if picked not in available:
+                picked = available[0]
+            preference.append(picked)
+            available.remove(picked)
+
+        if preference:
+            self.color_preference = preference
 
     # ------------------------------------------------------------------
     # Generic row merge
@@ -1088,14 +1131,24 @@ class JwlBackupProcessor:
             t for t in normalized_option_text.values() if t and t != "(text unavailable)"
         }
         if len(unique_texts) == 1 and len(normalized_option_text) == len(options):
-            print("  (Autoresolved: all variants have identical highlight text)")
-            chosen = next(
-                (
-                    o
-                    for o in options
+            ranked = sorted(
+                options,
+                key=lambda o: (
+                    self.color_preference.index(o["color"])
+                    if o["color"] in self.color_preference
+                    else len(self.color_preference),
+                    0
                     if any(h.get("source") == "current" for h in o["highlights"])
+                    else 1,
                 ),
-                options[0],
+            )
+            chosen = ranked[0]
+            chosen_color_name = color_names.get(
+                chosen["color"], f"color_{chosen['color']}"
+            )
+            print(
+                "  (Autoresolved: all variants have identical highlight text; "
+                f"selected preferred color '{chosen_color_name}')"
             )
             self.conflict_cache["UserMark"][conflict_key] = (
                 chosen["color"],
@@ -2380,17 +2433,19 @@ class JwlBackupProcessor:
 
             conn = sqlite3.connect(db1_path)
             cur = conn.cursor()
+            self.color_preference = [4, 2, 1, 3, 5, 6]
+
             sig_groups = {
-                (2, ((1, 1, 0, 5),)): [
+                (4, ((1, 1, 0, 5),)): [
                     {
-                        "source": "current",
-                        "source_path": "current.db",
+                        "source": "incoming",
+                        "source_path": "incoming-red.db",
                     }
                 ],
                 (2, ((1, 1, 1, 6),)): [
                     {
                         "source": "incoming",
-                        "source_path": "incoming.db",
+                        "source_path": "incoming-green.db",
                     }
                 ],
             }
@@ -2407,11 +2462,10 @@ class JwlBackupProcessor:
                 self.get_highlighted_text = original_get_text
             conn.close()
 
-            assert chosen["color"] == 2, f"Expected green highlight, got {chosen}"
-            assert any(
-                h.get("source") == "current" for h in chosen["highlights"]
-            ), "Expected current highlight to win when rendered text is identical"
-            print("  ✓ Identical rendered highlight text now autoresolves without prompting")
+            assert chosen["color"] == 4, f"Expected red highlight from preference order, got {chosen}"
+            print(
+                "  ✓ Identical rendered highlight text now autoresolves using configured color priority"
+            )
 
             print("\n=== All Tests Passed! ===\n")
 
