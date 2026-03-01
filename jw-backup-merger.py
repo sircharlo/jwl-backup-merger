@@ -417,7 +417,7 @@ class JwlBackupProcessor:
         )
 
         sorted_keys = sorted(list(all_keysymbols))
-        if sorted_keys:
+        if self.deduplicate_highlights and sorted_keys:
             self._configure_color_preference()
 
             if self._ask_confirm(
@@ -607,6 +607,10 @@ class JwlBackupProcessor:
           5a. Not found + auto-increment   -> insert (omit PK col), use lastrowid, update index.
           5b. Not found + composite PK     -> insert all columns (PK cols are remapped FK values).
         """
+        # JWL platform workaround: Location.Title must never be NULL.
+        if table_name == "Location" and row_dict.get("Title") is None:
+            row_dict["Title"] = " "
+
         autoincrement = self._is_autoincrement_table(table)
         pk_cols = self.primary_keys.get(table, [])
         # Only auto-increment tables have a single source PK worth tracking
@@ -2809,6 +2813,43 @@ class JwlBackupProcessor:
             conn.close()
             assert um_count == 2, f"Expected 2 UserMarks with dedupe off, got {um_count}"
             print("  ✓ Dedupe-off mode bypasses highlight conflict resolution")
+
+            # -------------------------------------------------------
+            # Test 13: Location.Title NULL is normalized to single space
+            # -------------------------------------------------------
+            print("\nTest 13: Normalize NULL Location.Title to single space...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [
+                        {"LocationId": 1, "KeySymbol": "w", "DocumentId": 999, "MepsLanguage": 0, "Title": None}
+                    ]
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [
+                        {"LocationId": 2, "KeySymbol": "w", "DocumentId": 1000, "MepsLanguage": 0, "Title": "Has Title"}
+                    ]
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            null_count = conn.execute(
+                "SELECT COUNT(*) FROM Location WHERE Title IS NULL"
+            ).fetchone()[0]
+            space_count = conn.execute(
+                "SELECT COUNT(*) FROM Location WHERE Title = ' '"
+            ).fetchone()[0]
+            conn.close()
+            assert null_count == 0, f"Expected no NULL Location.Title values, got {null_count}"
+            assert space_count >= 1, "Expected at least one normalized single-space title"
+            print("  ✓ NULL Location.Title values are normalized to single space")
 
             print("\n=== All Tests Passed! ===\n")
 
