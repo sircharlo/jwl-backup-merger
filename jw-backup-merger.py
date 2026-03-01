@@ -127,7 +127,7 @@ class JwlBackupProcessor:
         self.autoresolve_config = {}
         self.usermark_sources = {}  # {merged_usermark_id: source_path}
         self.text_prefetch_workers = 3
-        self.color_preference = [1, 2, 3, 4, 5, 6]
+        self.color_preference = [6, 5, 4, 3, 2, 1]
 
         # Tables processed in parent-before-child dependency order.
         # This is critical: every FK target must appear before the table that references it.
@@ -428,11 +428,8 @@ class JwlBackupProcessor:
             remaining_keys = [
                 k for k in sorted_keys if k not in self.ignored_keysymbols
             ]
-            if (
-                remaining_keys
-                and self._ask_confirm(
-                    "Should some publications autoresolve highlight issues by choosing preferred source?"
-                )
+            if remaining_keys and self._ask_confirm(
+                "Should some publications autoresolve highlight issues by choosing preferred source?"
             ):
                 auto_keys = (
                     self._ask_checkbox(
@@ -1057,7 +1054,9 @@ class JwlBackupProcessor:
         texts = {}
         with ThreadPoolExecutor(max_workers=self.text_prefetch_workers) as executor:
             future_map = {
-                executor.submit(self._fetch_highlight_variant_text, loc_res, sig[1]): sig
+                executor.submit(
+                    self._fetch_highlight_variant_text, loc_res, sig[1]
+                ): sig
                 for sig, _ in sig_items
             }
             for future in as_completed(future_map):
@@ -1067,6 +1066,128 @@ class JwlBackupProcessor:
                 except Exception:
                     texts[sig] = None
         return texts
+
+    def _range_contains(self, outer, inner):
+        """True if outer BlockRange fully contains inner BlockRange (same block/identifier)."""
+        return (
+            outer[0] == inner[0]
+            and outer[1] == inner[1]
+            and outer[2] <= inner[2]
+            and outer[3] >= inner[3]
+        )
+
+    def _ranges_contain_other_ranges(self, outer_ranges, inner_ranges):
+        """True if every inner range is fully covered by at least one outer range."""
+        if not outer_ranges or not inner_ranges:
+            return False
+        for inner in inner_ranges:
+            if not any(self._range_contains(outer, inner) for outer in outer_ranges):
+                return False
+        return True
+
+    def _find_containment_parent_option(self, options):
+        """
+        Return (parent_idx, contained_indices) when one option contains all other options' ranges.
+        """
+        if len(options) < 2:
+            return (None, [])
+
+        for p_idx, parent in enumerate(options):
+            contained = []
+            for c_idx, child in enumerate(options):
+                if p_idx == c_idx:
+                    continue
+                if self._ranges_contain_other_ranges(parent["ranges"], child["ranges"]):
+                    contained.append(c_idx)
+            if len(contained) == len(options) - 1:
+                return (p_idx, contained)
+
+        return (None, [])
+
+    def _pick_option_by_preference(self, option_subset):
+        """Deterministically pick one option by color preference, then current-source bias."""
+        ranked = sorted(
+            option_subset,
+            key=lambda o: (
+                self.color_preference.index(o["color"])
+                if o["color"] in self.color_preference
+                else len(self.color_preference),
+                0 if any(h.get("source") == "current" for h in o["highlights"]) else 1,
+            ),
+        )
+        return ranked[0]
+
+    def _resolve_containment_fold_choice(
+        self, loc_res, options, conflict_key, color_names
+    ):
+        """
+        If one option fully contains all others, ask which contained option it should fold into.
+        Returns chosen option or None when no containment pattern is found.
+        """
+        parent_idx, contained_indices = self._find_containment_parent_option(options)
+        if parent_idx is None:
+            return None
+
+        parent = options[parent_idx]
+        contained_opts = [options[i] for i in contained_indices]
+
+        print(
+            "  Detected container highlight pattern (one variant fully contains the others)."
+        )
+        print(
+            "  Choose which contained variant the container highlight should be folded into."
+        )
+
+        containment_key = (
+            "containment-fold",
+            conflict_key,
+            tuple(sorted((o["color"], tuple(o["ranges"])) for o in contained_opts)),
+            (parent["color"], tuple(parent["ranges"])),
+        )
+        cached = self.conflict_cache["UserMark"].get(containment_key)
+        if cached:
+            chosen = next(
+                (
+                    o
+                    for o in contained_opts
+                    if (o["color"], tuple(o["ranges"])) == cached
+                ),
+                None,
+            )
+            if chosen is not None:
+                print("  (Using previously resolved containment fold choice)")
+                return chosen
+
+        choices = []
+        for idx, opt in enumerate(contained_opts, 1):
+            cname = color_names.get(opt["color"], f"color_{opt['color']}")
+            choices.append(
+                {
+                    "name": f"Fold into Option {idx}: {cname} (instances: {len(opt['highlights'])})",
+                    "value": idx,
+                }
+            )
+
+        default_choice = self._pick_option_by_preference(contained_opts)
+        default_idx = contained_opts.index(default_choice) + 1
+        chosen_idx = self._ask_select(
+            "Container highlight detected — choose contained target:",
+            choices=choices,
+            default=default_idx,
+        )
+        if (
+            not isinstance(chosen_idx, int)
+            or chosen_idx < 1
+            or chosen_idx > len(contained_opts)
+        ):
+            chosen_idx = default_idx
+
+        chosen = contained_opts[chosen_idx - 1]
+        self.conflict_cache["UserMark"][containment_key] = (
+            chosen["color"],
+            tuple(chosen["ranges"]),
+        )
+        return chosen
 
     def _resolve_usermark_conflict(self, loc_id, sig_groups, merged_cursor):
         """Prompt the user to pick a highlight variant, with caching."""
@@ -1123,26 +1244,28 @@ class JwlBackupProcessor:
 
         conflict_key = (loc_res, tuple(sorted(sig_groups.keys())))
 
+        # Containment-specific decision: one parent/container + contained variants.
+        containment_choice = self._resolve_containment_fold_choice(
+            loc_res, options, conflict_key, color_names
+        )
+        if containment_choice is not None:
+            self.conflict_cache["UserMark"][conflict_key] = (
+                containment_choice["color"],
+                tuple(containment_choice["ranges"]),
+            )
+            return containment_choice
+
         # --- Autoresolve logic ---
         keysymbol = loc_res[2] if loc_res else None
 
         # Autoresolve if every option renders to the exact same text.
         unique_texts = {
-            t for t in normalized_option_text.values() if t and t != "(text unavailable)"
+            t
+            for t in normalized_option_text.values()
+            if t and t != "(text unavailable)"
         }
         if len(unique_texts) == 1 and len(normalized_option_text) == len(options):
-            ranked = sorted(
-                options,
-                key=lambda o: (
-                    self.color_preference.index(o["color"])
-                    if o["color"] in self.color_preference
-                    else len(self.color_preference),
-                    0
-                    if any(h.get("source") == "current" for h in o["highlights"])
-                    else 1,
-                ),
-            )
-            chosen = ranked[0]
+            chosen = self._pick_option_by_preference(options)
             chosen_color_name = color_names.get(
                 chosen["color"], f"color_{chosen['color']}"
             )
@@ -2462,14 +2585,75 @@ class JwlBackupProcessor:
                 self.get_highlighted_text = original_get_text
             conn.close()
 
-            assert chosen["color"] == 4, f"Expected red highlight from preference order, got {chosen}"
+            assert chosen["color"] == 4, (
+                f"Expected red highlight from preference order, got {chosen}"
+            )
             print(
                 "  ✓ Identical rendered highlight text now autoresolves using configured color priority"
             )
 
+            # -------------------------------------------------------
+            # Test 10: Container highlight can be folded into chosen child variant
+            # -------------------------------------------------------
+            print("\nTest 10: Containment fold chooses target contained variant...")
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            sig_groups = {
+                (2, ((1, 1, 0, 12),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "parent-green.db",
+                    }
+                ],
+                (2, ((1, 1, 0, 3),)): [
+                    {
+                        "source": "current",
+                        "source_path": "child-green.db",
+                    }
+                ],
+                (4, ((1, 1, 4, 7),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "child-red.db",
+                    }
+                ],
+            }
+
+            original_ask_select = self._ask_select
+
+            def ask_select_containment(message, choices, default=None):
+                if message == "Container highlight detected — choose contained target:":
+                    for c in choices:
+                        if "red" in c["name"]:
+                            return c["value"]
+                return default
+
+            self._ask_select = ask_select_containment
+            original_get_text = self.get_highlighted_text
+            self.get_highlighted_text = lambda *_args, **_kwargs: (
+                "synthetic containment text"
+            )
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self.get_highlighted_text = original_get_text
+                self._ask_select = original_ask_select
+
+            assert chosen["color"] == 4, (
+                f"Expected red child highlight to be chosen, got {chosen}"
+            )
+            assert chosen["ranges"] == [(1, 1, 4, 7)], (
+                f"Expected fold target child range [(1,1,4,7)], got {chosen['ranges']}"
+            )
+            print(
+                "  ✓ Container highlight fold now allows choosing the contained target variant"
+            )
+            conn.close()
+
             print("\n=== All Tests Passed! ===\n")
 
         finally:
+
             def secure_delete(p, is_dir=False):
                 import time
 
