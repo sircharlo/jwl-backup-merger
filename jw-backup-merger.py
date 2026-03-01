@@ -563,6 +563,22 @@ class JwlBackupProcessor:
         except ValueError:
             return datetime.min
 
+    def _delete_usermark_and_blockranges(self, merged_cursor, usermark_id):
+        """Delete a UserMark and its BlockRanges (best-effort)."""
+        if not usermark_id:
+            return
+        try:
+            merged_cursor.execute(
+                "DELETE FROM BlockRange WHERE UserMarkId = ?",
+                (usermark_id,),
+            )
+            merged_cursor.execute(
+                "DELETE FROM UserMark WHERE UserMarkId = ?",
+                (usermark_id,),
+            )
+        except sqlite3.Error:
+            pass
+
     def _merge_note_by_guid(self, table, row_dict, merged_cursor, pk_remap, identity_index):
         """Merge Note rows by Guid.
 
@@ -581,48 +597,78 @@ class JwlBackupProcessor:
             f"""
             SELECT _rowid_ AS __rowid__, *
             FROM [{table}]
-            WHERE UserMarkId IS ?
-              AND LocationId IS ?
+            WHERE LocationId IS ?
               AND COALESCE(Title, '') = COALESCE(?, '')
               AND COALESCE(Content, '') = COALESCE(?, '')
-            ORDER BY _rowid_ DESC
-            LIMIT 1
             """,
             (
-                row_dict.get("UserMarkId"),
                 row_dict.get("LocationId"),
                 row_dict.get("Title"),
                 row_dict.get("Content"),
             ),
         )
-        payload_dup = merged_cursor.fetchone()
-        if payload_dup is not None:
+        payload_dups = merged_cursor.fetchall()
+        if payload_dups:
             cols_payload = [d[0] for d in merged_cursor.description]
-            existing_payload = dict(zip(cols_payload, payload_dup))
-            existing_note_id = existing_payload.get(note_id_col) if note_id_col else None
-            if old_note_id is not None and existing_note_id is not None:
-                pk_remap[table][old_note_id] = existing_note_id
+            existing_dups = [dict(zip(cols_payload, r)) for r in payload_dups]
 
             incoming_raw_ts = str(row_dict.get("LastModified") or "")
-            existing_raw_ts = str(existing_payload.get("LastModified") or "")
             incoming_ts = self._parse_last_modified(incoming_raw_ts)
-            existing_ts = self._parse_last_modified(existing_raw_ts)
-            if incoming_raw_ts > existing_raw_ts or (
-                incoming_raw_ts == existing_raw_ts and incoming_ts > existing_ts
-            ):
+
+            def _cand_key(c):
+                raw = str(c.get("LastModified") or "")
+                return (self._parse_last_modified(raw), raw)
+
+            winner = max(existing_dups + [dict(row_dict)], key=_cand_key)
+            keep_row = max(
+                existing_dups,
+                key=lambda r: (
+                    self._parse_last_modified(r.get("LastModified")),
+                    r.get("__rowid__", 0),
+                ),
+            )
+
+            keep_note_id = keep_row.get(note_id_col) if note_id_col else None
+            if old_note_id is not None and keep_note_id is not None:
+                pk_remap[table][old_note_id] = keep_note_id
+
+            # Update kept row with winner values (newer note data/usermark/guid/etc).
+            updatable_cols = [c for c in row_dict.keys() if c not in pk_cols and c != note_id_col]
+            if updatable_cols:
+                set_clause = ", ".join(f"[{c}] = ?" for c in updatable_cols)
+                params = [winner.get(c) for c in updatable_cols] + [keep_row.get("__rowid__")]
                 merged_cursor.execute(
-                    f"UPDATE [{table}] SET LastModified = ? WHERE rowid = ?",
-                    (row_dict.get("LastModified"), existing_payload.get("__rowid__")),
+                    f"UPDATE [{table}] SET {set_clause} WHERE rowid = ?",
+                    params,
                 )
 
-            if guid:
+            kept_usermark = winner.get("UserMarkId")
+            # Remove all older duplicate notes and linked old highlights.
+            for dup in existing_dups:
+                if dup.get("__rowid__") == keep_row.get("__rowid__"):
+                    # If keep row had an old different usermark, remove it too.
+                    old_um = dup.get("UserMarkId")
+                    if old_um and old_um != kept_usermark:
+                        self._delete_usermark_and_blockranges(merged_cursor, old_um)
+                    continue
+
+                old_um = dup.get("UserMarkId")
+                merged_cursor.execute(
+                    f"DELETE FROM [{table}] WHERE rowid = ?",
+                    (dup.get("__rowid__"),),
+                )
+                self._delete_usermark_and_blockranges(merged_cursor, old_um)
+
+            winner_guid = winner.get("Guid")
+            if winner_guid:
                 id_cols = self.identity_keys.get("Note", ["Guid"])
-                identity_tuple = tuple(row_dict.get(c) for c in id_cols)
-                if self._is_autoincrement_table(table) and existing_note_id is not None:
-                    identity_index.setdefault("Note", {})[identity_tuple] = existing_note_id
+                winner_identity = tuple(winner.get(c) for c in id_cols)
+                if self._is_autoincrement_table(table) and keep_note_id is not None:
+                    identity_index.setdefault("Note", {})[winner_identity] = keep_note_id
                 else:
-                    identity_index.setdefault("Note", {})[identity_tuple] = True
-            return existing_note_id
+                    identity_index.setdefault("Note", {})[winner_identity] = True
+
+            return keep_note_id
 
         if not guid:
             return self._insert_row(table, "Note", row_dict, merged_cursor)
@@ -2540,6 +2586,70 @@ class JwlBackupProcessor:
                 f"Expected newer LastModified to be kept, got '{last_mod}'"
             )
             print("  ✓ Notes with different Guid but identical payload dedupe correctly")
+
+            # -------------------------------------------------------
+            # Test 3d: Payload dedupe removes older linked UserMark/BlockRange
+            # -------------------------------------------------------
+            print("\nTest 3d: Payload dedupe removes older linked highlight data...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "UserMark": [
+                        {"UserMarkId": 1001, "ColorIndex": 2, "LocationId": 10, "UserMarkGuid": "old-um"}
+                    ],
+                    "BlockRange": [
+                        {"BlockRangeId": 1, "BlockType": 1, "Identifier": 18, "StartToken": 0, "EndToken": 5, "UserMarkId": 1001}
+                    ],
+                    "Note": [
+                        {
+                            "Guid": "note-old-guid",
+                            "Title": "boldness",
+                            "Content": "Same payload",
+                            "LocationId": 10,
+                            "UserMarkId": 1001,
+                            "LastModified": "2024-03-01T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "UserMark": [
+                        {"UserMarkId": 2002, "ColorIndex": 2, "LocationId": 10, "UserMarkGuid": "new-um"}
+                    ],
+                    "BlockRange": [
+                        {"BlockRangeId": 2, "BlockType": 1, "Identifier": 23, "StartToken": 0, "EndToken": 5, "UserMarkId": 2002}
+                    ],
+                    "Note": [
+                        {
+                            "Guid": "note-new-guid",
+                            "Title": "boldness",
+                            "Content": "Same payload",
+                            "LocationId": 10,
+                            "UserMarkId": 2002,
+                            "LastModified": "2024-03-02T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            note_row = conn.execute("SELECT UserMarkId, LastModified FROM Note").fetchone()
+            old_um_count = conn.execute("SELECT COUNT(*) FROM UserMark WHERE UserMarkId = 1001").fetchone()[0]
+            old_br_count = conn.execute("SELECT COUNT(*) FROM BlockRange WHERE UserMarkId = 1001").fetchone()[0]
+            conn.close()
+            assert note_row[0] == 2002, f"Expected note to point at newer UserMarkId 2002, got {note_row[0]}"
+            assert note_row[1] == "2024-03-02T00:00:00Z", f"Expected newer LastModified, got {note_row[1]}"
+            assert old_um_count == 0, f"Expected old linked UserMark to be removed, got {old_um_count}"
+            assert old_br_count == 0, f"Expected old linked BlockRange to be removed, got {old_br_count}"
+            print("  ✓ Older linked UserMark and BlockRange are removed on payload dedupe")
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
