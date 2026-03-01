@@ -2222,10 +2222,9 @@ class JwlBackupProcessor:
             root = tk.Tk()
             root.withdraw()
             while len(file_paths) < 2:
-                file_path = filedialog.askopenfilename(
+                file_path = filedialog.askopenfilenames(
                     filetypes=[("JW Library backups", "*.jwlibrary")],
                     title="Select one or more JW Library backups",
-                    multiple=True,
                 )
                 if not file_path:
                     break
