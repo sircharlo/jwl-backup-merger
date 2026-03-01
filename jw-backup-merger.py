@@ -128,6 +128,7 @@ class JwlBackupProcessor:
         self.usermark_sources = {}  # {merged_usermark_id: source_path}
         self.text_prefetch_workers = 3
         self.color_preference = [1, 2, 3, 4, 5, 6]
+        self.deduplicate_highlights = False
 
         # Tables processed in parent-before-child dependency order.
         # This is critical: every FK target must appear before the table that references it.
@@ -410,6 +411,11 @@ class JwlBackupProcessor:
                 pass
             conn.close()
 
+        self.deduplicate_highlights = self._ask_confirm(
+            "Would you like to deduplicate highlights (detect/resolve overlaps)?",
+            default=False,
+        )
+
         sorted_keys = sorted(list(all_keysymbols))
         if sorted_keys:
             self._configure_color_preference()
@@ -496,17 +502,28 @@ class JwlBackupProcessor:
                 rows = source_cursor.fetchall()
 
                 if table_name == "UserMark":
-                    self._merge_usermark_table(
-                        table,
-                        rows,
-                        cols,
-                        source_cursor,
-                        merged_cursor,
-                        pk_remap,
-                        identity_index,
-                        usermark_skip_source_pks,
-                        file_path,
-                    )
+                    if self.deduplicate_highlights:
+                        self._merge_usermark_table(
+                            table,
+                            rows,
+                            cols,
+                            source_cursor,
+                            merged_cursor,
+                            pk_remap,
+                            identity_index,
+                            usermark_skip_source_pks,
+                            file_path,
+                        )
+                    else:
+                        for row in rows:
+                            self._merge_row(
+                                table,
+                                table_name,
+                                dict(zip(cols, row)),
+                                merged_cursor,
+                                pk_remap,
+                                identity_index,
+                            )
                 elif table_name == "BlockRange":
                     self._merge_blockrange_table(
                         table,
@@ -2051,6 +2068,15 @@ class JwlBackupProcessor:
 
         test_dir = tempfile.mkdtemp(prefix="jwl_test_")
 
+        original_ask_confirm = self._ask_confirm
+
+        def ask_confirm_for_tests(message, default=False):
+            if "deduplicate highlights" in message.lower():
+                return True
+            return default
+
+        self._ask_confirm = ask_confirm_for_tests
+
         try:
             db1_path = path.join(test_dir, "db1.db")
             db2_path = path.join(test_dir, "db2.db")
@@ -2722,9 +2748,73 @@ class JwlBackupProcessor:
             print("  ✓ 2-option conflicts no longer trigger containment fold flow")
             conn.close()
 
+            # -------------------------------------------------------
+            # Test 12: Dedupe disabled skips UserMark conflict resolver
+            # -------------------------------------------------------
+            print("\nTest 12: Dedupe-disabled mode skips highlight conflict resolver...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [
+                        {"LocationId": 1, "KeySymbol": "w", "DocumentId": 777, "MepsLanguage": 0}
+                    ],
+                    "UserMark": [
+                        {"UserMarkId": 1, "ColorIndex": 2, "LocationId": 1, "UserMarkGuid": "dedupe-off-a"}
+                    ],
+                    "BlockRange": [
+                        {"BlockType": 1, "Identifier": 1, "StartToken": 0, "EndToken": 12, "UserMarkId": 1}
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [
+                        {"LocationId": 1, "KeySymbol": "w", "DocumentId": 777, "MepsLanguage": 0}
+                    ],
+                    "UserMark": [
+                        {"UserMarkId": 2, "ColorIndex": 2, "LocationId": 1, "UserMarkGuid": "dedupe-off-b"}
+                    ],
+                    "BlockRange": [
+                        {"BlockType": 1, "Identifier": 1, "StartToken": 4, "EndToken": 7, "UserMarkId": 2}
+                    ],
+                },
+            )
+
+            original_ask_confirm_inner = self._ask_confirm
+            original_conflict_resolver = self._resolve_usermark_conflict
+
+            def ask_confirm_dedupe_off(message, default=False):
+                if "deduplicate highlights" in message.lower():
+                    return False
+                return default
+
+            self._ask_confirm = ask_confirm_dedupe_off
+            self._resolve_usermark_conflict = (
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("_resolve_usermark_conflict must not run when dedupe is disabled")
+                )
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            try:
+                self.process_databases([db1_path, db2_path])
+            finally:
+                self._ask_confirm = original_ask_confirm_inner
+                self._resolve_usermark_conflict = original_conflict_resolver
+
+            conn = sqlite3.connect(self.merged_db_path)
+            um_count = conn.execute("SELECT COUNT(*) FROM UserMark").fetchone()[0]
+            conn.close()
+            assert um_count == 2, f"Expected 2 UserMarks with dedupe off, got {um_count}"
+            print("  ✓ Dedupe-off mode bypasses highlight conflict resolution")
+
             print("\n=== All Tests Passed! ===\n")
 
         finally:
+            self._ask_confirm = original_ask_confirm
+
             def secure_delete(p, is_dir=False):
                 import time
 
