@@ -11,8 +11,10 @@ from tqdm import tqdm
 import difflib
 import sqlite3
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 import re
+import sys
 from urllib.parse import urlparse
 import questionary
 
@@ -105,6 +107,7 @@ class JwlBackupProcessor:
         self.fk_map = {}  # {table_lower: {col_lower: (ref_table_original, ref_col)}}
         self.table_name_map = {}  # {table_lower: table_original}
         self.note_bases = {}  # {guid: {'title': ..., 'content': ...}}
+        self.note_seen_counts = {}  # {guid: total note rows seen across all sources}
         self.files_to_include_in_archive = []
         self.start_time = 0
 
@@ -124,6 +127,9 @@ class JwlBackupProcessor:
         self.ignored_keysymbols = []
         self.autoresolve_config = {}
         self.usermark_sources = {}  # {merged_usermark_id: source_path}
+        self.text_prefetch_workers = 3
+        self.color_preference = [1, 2, 3, 4, 5, 6]
+        self.deduplicate_highlights = False
 
         # Tables processed in parent-before-child dependency order.
         # This is critical: every FK target must appear before the table that references it.
@@ -276,7 +282,7 @@ class JwlBackupProcessor:
                 except sqlite3.Error:
                     index[table_name] = {}
                     continue
-                index[table_name] = {row: True for row in merged_cursor.fetchall()}
+                index[table_name] = dict.fromkeys(merged_cursor.fetchall(), True)
 
         return index
 
@@ -326,7 +332,7 @@ class JwlBackupProcessor:
         table_lower = table.lower()
         if table_lower not in self.fk_map:
             return
-        for col_name in list(row_dict.keys()):
+        for col_name in row_dict.keys():
             col_lower = col_name.lower()
             if col_lower in self.fk_map[table_lower]:
                 ref_table_orig, _ = self.fk_map[table_lower][col_lower]
@@ -345,6 +351,7 @@ class JwlBackupProcessor:
         """Copy first source DB as the merge target and wipe all data tables."""
         self.start_time = time()
         self.note_bases = {}
+        self.note_seen_counts = {}
 
         copy2(database_files[0], self.merged_db_path)
         merged_conn = sqlite3.connect(self.merged_db_path)
@@ -406,33 +413,37 @@ class JwlBackupProcessor:
                 pass
             conn.close()
 
-        sorted_keys = sorted(list(all_keysymbols))
-        if sorted_keys:
-            if questionary.confirm(
+        self.deduplicate_highlights = self._ask_confirm(
+            "Would you like to deduplicate highlights (detect/resolve overlaps)?",
+            default=False,
+        )
+
+        sorted_keys = sorted(all_keysymbols)
+        if self.deduplicate_highlights and sorted_keys:
+            self._configure_color_preference()
+
+            if self._ask_confirm(
                 "Would you like to ignore certain publications for highlight merge?"
-            ).ask():
+            ):
                 self.ignored_keysymbols = (
-                    questionary.checkbox(
+                    self._ask_checkbox(
                         "Select publications to ignore for highlight merging:",
                         choices=sorted_keys,
-                    ).ask()
+                    )
                     or []
                 )
 
             remaining_keys = [
                 k for k in sorted_keys if k not in self.ignored_keysymbols
             ]
-            if (
-                remaining_keys
-                and questionary.confirm(
-                    "Should some publications autoresolve highlight issues by choosing preferred source?"
-                ).ask()
+            if remaining_keys and self._ask_confirm(
+                "Should some publications autoresolve highlight issues by choosing preferred source?"
             ):
                 auto_keys = (
-                    questionary.checkbox(
+                    self._ask_checkbox(
                         "Select publications to autoresolve highlight issues:",
                         choices=remaining_keys,
-                    ).ask()
+                    )
                     or []
                 )
 
@@ -446,10 +457,10 @@ class JwlBackupProcessor:
                     preference = []
                     temp_choices = list(choices)
                     for i in range(len(database_files)):
-                        p = questionary.select(
+                        p = self._ask_select(
                             f"Select priority #{i + 1} source for {key}:",
                             choices=temp_choices,
-                        ).ask()
+                        )
                         preference.append(database_files[choices.index(p)])
                         temp_choices.remove(p)
                         if len(temp_choices) == 1:
@@ -490,17 +501,27 @@ class JwlBackupProcessor:
                 rows = source_cursor.fetchall()
 
                 if table_name == "UserMark":
-                    self._merge_usermark_table(
-                        table,
-                        rows,
-                        cols,
-                        source_cursor,
-                        merged_cursor,
-                        pk_remap,
-                        identity_index,
-                        usermark_skip_source_pks,
-                        file_path,
-                    )
+                    if self.deduplicate_highlights:
+                        self._merge_usermark_table(
+                            table,
+                            rows,
+                            cols,
+                            source_cursor,
+                            merged_cursor,
+                            pk_remap,
+                            usermark_skip_source_pks,
+                            file_path,
+                        )
+                    else:
+                        for row in rows:
+                            self._merge_row(
+                                table,
+                                table_name,
+                                dict(zip(cols, row)),
+                                merged_cursor,
+                                pk_remap,
+                                identity_index,
+                            )
                 elif table_name == "BlockRange":
                     self._merge_blockrange_table(
                         table,
@@ -527,6 +548,286 @@ class JwlBackupProcessor:
 
         self._finalize_merge(merged_conn)
 
+    def _parse_last_modified(self, raw_value):
+        if not raw_value:
+            return datetime.min
+        txt = str(raw_value).strip()
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(txt)
+        except ValueError:
+            return datetime.min
+
+    def _delete_usermark_and_blockranges(self, merged_cursor, usermark_id):
+        """Delete a UserMark and its BlockRanges (best-effort)."""
+        if not usermark_id:
+            return
+        try:
+            merged_cursor.execute(
+                "DELETE FROM BlockRange WHERE UserMarkId = ?",
+                (usermark_id,),
+            )
+            merged_cursor.execute(
+                "DELETE FROM UserMark WHERE UserMarkId = ?",
+                (usermark_id,),
+            )
+        except sqlite3.Error:
+            pass
+
+    def _merge_note_by_guid(
+        self, table, row_dict, merged_cursor, pk_remap, identity_index
+    ):
+        """Merge Note rows by Guid.
+
+        Rules:
+        - If exactly 2 rows share a Guid (existing + incoming), keep the newer LastModified row.
+        - If 3+ rows share a Guid, perform an intelligent merge for Title/Content while keeping
+          the newest LastModified timestamp.
+        """
+        pk_cols = self.primary_keys.get(table, [])
+        note_id_col = (
+            "NoteId" if "NoteId" in row_dict else (pk_cols[0] if pk_cols else None)
+        )
+        old_note_id = row_dict.get(note_id_col) if note_id_col else None
+        guid = row_dict.get("Guid")
+
+        # Secondary duplicate detection: identical note payload even with different Guid.
+        merged_cursor.execute(
+            f"""
+            SELECT _rowid_ AS __rowid__, *
+            FROM [{table}]
+            WHERE LocationId IS ?
+              AND COALESCE(Title, '') = COALESCE(?, '')
+              AND COALESCE(Content, '') = COALESCE(?, '')
+            """,
+            (
+                row_dict.get("LocationId"),
+                row_dict.get("Title"),
+                row_dict.get("Content"),
+            ),
+        )
+        payload_dups = merged_cursor.fetchall()
+        if payload_dups:
+            cols_payload = [d[0] for d in merged_cursor.description]
+            existing_dups = [dict(zip(cols_payload, r)) for r in payload_dups]
+
+            def _cand_key(c):
+                raw = str(c.get("LastModified") or "")
+                return (self._parse_last_modified(raw), raw)
+
+            winner = max(existing_dups + [dict(row_dict)], key=_cand_key)
+            keep_row = max(
+                existing_dups,
+                key=lambda r: (
+                    self._parse_last_modified(r.get("LastModified")),
+                    r.get("__rowid__", 0),
+                ),
+            )
+
+            keep_note_id = keep_row.get(note_id_col) if note_id_col else None
+            if old_note_id is not None and keep_note_id is not None:
+                pk_remap[table][old_note_id] = keep_note_id
+
+            # Update kept row with winner values (newer note data/usermark/guid/etc).
+            updatable_cols = [
+                c for c in row_dict.keys() if c not in pk_cols and c != note_id_col
+            ]
+            if updatable_cols:
+                set_clause = ", ".join(f"[{c}] = ?" for c in updatable_cols)
+                params = [winner.get(c) for c in updatable_cols] + [
+                    keep_row.get("__rowid__")
+                ]
+                merged_cursor.execute(
+                    f"UPDATE [{table}] SET {set_clause} WHERE rowid = ?",
+                    params,
+                )
+
+            # kept_usermark = winner.get("UserMarkId")
+            # Remove all older duplicate notes and linked old highlights.
+            # for dup in existing_dups:
+            # if dup.get("__rowid__") == keep_row.get("__rowid__"):
+            # If keep row had an old different usermark, remove it too.
+            # old_um = dup.get("UserMarkId")
+            # if old_um and old_um != kept_usermark:
+            #    self._delete_usermark_and_blockranges(merged_cursor, old_um)
+            # continue
+
+            # old_um = dup.get("UserMarkId")
+            # merged_cursor.execute(
+            #     f"DELETE FROM [{table}] WHERE rowid = ?",
+            #     (dup.get("__rowid__"),),
+            # )
+            # self._delete_usermark_and_blockranges(merged_cursor, old_um)
+
+            winner_guid = winner.get("Guid")
+            if winner_guid:
+                id_cols = self.identity_keys.get("Note", ["Guid"])
+                winner_identity = tuple(winner.get(c) for c in id_cols)
+                if self._is_autoincrement_table(table) and keep_note_id is not None:
+                    identity_index.setdefault("Note", {})[winner_identity] = (
+                        keep_note_id
+                    )
+                else:
+                    identity_index.setdefault("Note", {})[winner_identity] = True
+
+            return keep_note_id
+
+        if not guid:
+            return self._insert_row(table, "Note", row_dict, merged_cursor)
+
+        self.note_seen_counts[guid] = self.note_seen_counts.get(guid, 0) + 1
+        total_seen_for_guid = self.note_seen_counts[guid]
+        self.note_bases.setdefault(
+            guid,
+            {
+                "title": row_dict.get("Title") or "",
+                "content": row_dict.get("Content") or "",
+            },
+        )
+
+        merged_cursor.execute(
+            f"SELECT _rowid_ AS __rowid__, * FROM [{table}] WHERE Guid = ?", (guid,)
+        )
+        existing_rows = merged_cursor.fetchall()
+
+        id_cols = self.identity_keys.get("Note", ["Guid"])
+        identity_tuple = tuple(row_dict.get(c) for c in id_cols)
+
+        if not existing_rows:
+            autoincrement = self._is_autoincrement_table(table)
+            if autoincrement and note_id_col in row_dict:
+                insert_dict = {k: v for k, v in row_dict.items() if k != note_id_col}
+                new_note_id = self._insert_row(
+                    table, "Note", insert_dict, merged_cursor
+                )
+                if old_note_id is not None and new_note_id is not None:
+                    pk_remap[table][old_note_id] = new_note_id
+                if new_note_id is not None:
+                    identity_index.setdefault("Note", {})[identity_tuple] = new_note_id
+                return new_note_id
+
+            new_rowid = self._insert_row(table, "Note", row_dict, merged_cursor)
+            if old_note_id is not None and note_id_col:
+                pk_remap[table][old_note_id] = row_dict.get(note_id_col)
+            identity_index.setdefault("Note", {})[identity_tuple] = True
+            return new_rowid
+
+        cols = [d[0] for d in merged_cursor.description]
+        existing_dicts = [dict(zip(cols, r)) for r in existing_rows]
+
+        # Anchor updates to the newest existing row.
+        existing_best = max(
+            existing_dicts,
+            key=lambda r: (
+                self._parse_last_modified(r.get("LastModified")),
+                r.get("__rowid__", 0),
+            ),
+        )
+
+        existing_note_id = existing_best.get(note_id_col) if note_id_col else None
+        if old_note_id is not None and existing_note_id is not None:
+            pk_remap[table][old_note_id] = existing_note_id
+
+        candidates = existing_dicts + [dict(row_dict)]
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda r: (
+                self._parse_last_modified(r.get("LastModified")),
+                str(r.get("LastModified") or ""),
+            ),
+        )
+
+        # Exactly two rows: keep the most recent row directly.
+        if total_seen_for_guid <= 2 and len(candidates_sorted) == 2:
+            winner = candidates_sorted[-1]
+            updatable_cols = [
+                c for c in row_dict.keys() if c not in pk_cols and c != note_id_col
+            ]
+            if updatable_cols:
+                set_clause = ", ".join(f"[{c}] = ?" for c in updatable_cols)
+                params = [winner.get(c) for c in updatable_cols] + [
+                    existing_best.get("__rowid__")
+                ]
+                merged_cursor.execute(
+                    f"UPDATE [{table}] SET {set_clause} WHERE rowid = ?",
+                    params,
+                )
+        else:
+            # 3+ rows: intelligent content merge ordered by recency progression.
+            merged_title = candidates_sorted[0].get("Title") or ""
+            merged_content = candidates_sorted[0].get("Content") or ""
+            base_info = self.note_bases.get(guid, {})
+            base_title = base_info.get("title") or ""
+            base_content = base_info.get("content") or ""
+
+            for candidate in candidates_sorted[1:]:
+                cand_title = candidate.get("Title") or ""
+                cand_content = candidate.get("Content") or ""
+                merged_title = self.merge_text(base_title, merged_title, cand_title)
+                merged_content = self.merge_text(
+                    base_content, merged_content, cand_content
+                )
+
+            latest = candidates_sorted[-1]
+            latest_ts = latest.get("LastModified")
+            merged_cursor.execute(
+                f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE rowid = ?",
+                (
+                    merged_title,
+                    merged_content,
+                    latest_ts,
+                    existing_best.get("__rowid__"),
+                ),
+            )
+
+        if self._is_autoincrement_table(table) and existing_note_id is not None:
+            identity_index.setdefault("Note", {})[identity_tuple] = existing_note_id
+        else:
+            identity_index.setdefault("Note", {})[identity_tuple] = True
+
+        return existing_note_id
+
+    def _configure_color_preference(self):
+        """Prompt once for preferred highlight color order used in identical-text autoresolve."""
+        color_names = {
+            1: "yellow",
+            2: "green",
+            3: "blue",
+            4: "red",
+            5: "orange",
+            6: "purple",
+        }
+
+        if not self._ask_confirm(
+            "Set highlight color priority for identical-text auto-resolution?",
+            default=False,
+        ):
+            return
+
+        available = list(self.color_preference)
+        preference = []
+        for idx in range(len(available)):
+            choices = [
+                {
+                    "name": f"{color_names.get(c, f'color_{c}')} (#{c})",
+                    "value": c,
+                }
+                for c in available
+            ]
+            picked = self._ask_select(
+                f"Choose preferred color #{idx + 1}:",
+                choices=choices,
+                default=available[0],
+            )
+            if picked not in available:
+                picked = available[0]
+            preference.append(picked)
+            available.remove(picked)
+
+        if preference:
+            self.color_preference = preference
+
     # ------------------------------------------------------------------
     # Generic row merge
     # ------------------------------------------------------------------
@@ -544,6 +845,10 @@ class JwlBackupProcessor:
           5a. Not found + auto-increment   -> insert (omit PK col), use lastrowid, update index.
           5b. Not found + composite PK     -> insert all columns (PK cols are remapped FK values).
         """
+        # JWL platform workaround: Location.Title must never be NULL.
+        if table_name == "Location" and row_dict.get("Title") is None:
+            row_dict["Title"] = " "
+
         autoincrement = self._is_autoincrement_table(table)
         pk_cols = self.primary_keys.get(table, [])
         # Only auto-increment tables have a single source PK worth tracking
@@ -551,6 +856,12 @@ class JwlBackupProcessor:
 
         # 1. Remap all FK columns (mutates row_dict in place)
         self._remap_fks(table, row_dict, pk_remap)
+
+        # Notes are merged strictly by Guid + LastModified recency.
+        if table_name == "Note":
+            return self._merge_note_by_guid(
+                table, row_dict, merged_cursor, pk_remap, identity_index
+            )
 
         # 2. Identity tuple - built AFTER FK remap so FK-based identity cols are correct
         id_cols = self.identity_keys.get(table_name, [])
@@ -658,7 +969,6 @@ class JwlBackupProcessor:
         source_cursor,
         merged_cursor,
         pk_remap,
-        identity_index,
         usermark_skip_source_pks,
         file_path,
     ):
@@ -762,9 +1072,7 @@ class JwlBackupProcessor:
                     merged_cursor,
                     source_cursor,
                     pk_remap,
-                    identity_index,
                     usermark_skip_source_pks,
-                    file_path,
                 )
 
     def _apply_usermark_choice(
@@ -776,9 +1084,7 @@ class JwlBackupProcessor:
         merged_cursor,
         source_cursor,
         pk_remap,
-        identity_index,
         usermark_skip_source_pks,
-        file_path,
     ):
         """
         Write the winning highlight into the merged DB and record all PK remappings.
@@ -869,12 +1175,12 @@ class JwlBackupProcessor:
                     (lead_merged_pk, hl["usermark_id"]),
                 )
                 # Add more UPDATE statements here if future schema adds FK refs to UserMark
-                merged_cursor.execute(
-                    "DELETE FROM BlockRange WHERE UserMarkId = ?", (hl["usermark_id"],)
-                )
-                merged_cursor.execute(
-                    "DELETE FROM UserMark WHERE UserMarkId = ?", (hl["usermark_id"],)
-                )
+                # merged_cursor.execute(
+                #     "DELETE FROM BlockRange WHERE UserMarkId = ?", (hl["usermark_id"],)
+                # )
+                # merged_cursor.execute(
+                #     "DELETE FROM UserMark WHERE UserMarkId = ?", (hl["usermark_id"],)
+                # )
 
         # Map ALL incoming highlights in this component to lead_merged_pk
         for hl in comp:
@@ -957,6 +1263,237 @@ class JwlBackupProcessor:
                 components.append(comp)
         return components
 
+    def _is_interactive_terminal(self):
+        return sys.stdin.isatty() and sys.stdout.isatty()
+
+    def _ask_confirm(self, message, default=False):
+        if not self._is_interactive_terminal():
+            return default
+        answer = questionary.confirm(message).ask()
+        return default if answer is None else answer
+
+    def _ask_checkbox(self, message, choices):
+        if not self._is_interactive_terminal():
+            return []
+        answer = questionary.checkbox(message, choices=choices).ask()
+        return answer or []
+
+    def _ask_select(self, message, choices, default=None):
+        if not self._is_interactive_terminal():
+            if isinstance(default, dict):
+                return default.get("value")
+            return default
+        answer = questionary.select(message, choices=choices).ask()
+        if answer is None:
+            if isinstance(default, dict):
+                return default.get("value")
+            return default
+        return answer
+
+    def _fetch_highlight_variant_text(self, loc_res, ranges):
+        if not loc_res:
+            return None
+        full_text = []
+        for r in ranges:
+            txt = self.get_highlighted_text(
+                loc_res[0],
+                r[1],
+                r[2],
+                r[3],
+                loc_res[1],
+                loc_res[2],
+                loc_res[3],
+                loc_res[4],
+            )
+            if txt:
+                full_text.append(txt)
+        return " [...] ".join(full_text) if full_text else None
+
+    def _prefetch_variant_texts(self, loc_res, sig_groups):
+        if not loc_res:
+            return {}
+
+        sig_items = list(sig_groups.items())
+        texts = {}
+        with ThreadPoolExecutor(max_workers=self.text_prefetch_workers) as executor:
+            future_map = {
+                executor.submit(
+                    self._fetch_highlight_variant_text, loc_res, sig[1]
+                ): sig
+                for sig, _ in sig_items
+            }
+            for future in as_completed(future_map):
+                sig = future_map[future]
+                try:
+                    texts[sig] = future.result()
+                except Exception:
+                    texts[sig] = None
+        return texts
+
+    def _range_contains(self, outer, inner):
+        """True if outer BlockRange fully contains inner BlockRange (same block/identifier)."""
+        return (
+            outer[0] == inner[0]
+            and outer[1] == inner[1]
+            and outer[2] <= inner[2]
+            and outer[3] >= inner[3]
+        )
+
+    def _ranges_contain_other_ranges(self, outer_ranges, inner_ranges):
+        """True if every inner range is fully covered by at least one outer range."""
+        if not outer_ranges or not inner_ranges:
+            return False
+        for inner in inner_ranges:
+            if not any(self._range_contains(outer, inner) for outer in outer_ranges):
+                return False
+        return True
+
+    def _option_token_bounds(self, option):
+        """Return (block_type, identifier, min_start, max_end) for an option, else None."""
+        ranges = option.get("ranges") or []
+        if not ranges:
+            return None
+
+        first_block_type, first_identifier = ranges[0][0], ranges[0][1]
+        starts = []
+        ends = []
+        for r in ranges:
+            if r[0] != first_block_type or r[1] != first_identifier:
+                return None
+            starts.append(r[2])
+            ends.append(r[3])
+
+        return (first_block_type, first_identifier, min(starts), max(ends))
+
+    def _find_containment_parent_option(self, options):
+        """
+        Return (parent_idx, contained_indices) when one option contains all others.
+
+        Containment logic is intentionally limited to 3+ options and requires
+        one option's start/end bounds to wrap every other option's bounds.
+        """
+        if len(options) < 3:
+            return (None, [])
+
+        bounds = [self._option_token_bounds(o) for o in options]
+
+        for p_idx, parent in enumerate(options):
+            parent_bounds = bounds[p_idx]
+            if parent_bounds is None:
+                continue
+
+            p_block, p_ident, p_start, p_end = parent_bounds
+            contained = []
+            for c_idx, child in enumerate(options):
+                if p_idx == c_idx:
+                    continue
+
+                child_bounds = bounds[c_idx]
+                if child_bounds is None:
+                    continue
+                c_block, c_ident, c_start, c_end = child_bounds
+
+                # User-requested trigger rule: parent start <= child start AND
+                # parent end >= child end for each other option.
+                wraps_child_bounds = (
+                    p_block == c_block
+                    and p_ident == c_ident
+                    and p_start <= c_start
+                    and p_end >= c_end
+                )
+                if wraps_child_bounds and self._ranges_contain_other_ranges(
+                    parent["ranges"], child["ranges"]
+                ):
+                    contained.append(c_idx)
+
+            if len(contained) == len(options) - 1:
+                return (p_idx, contained)
+
+        return (None, [])
+
+    def _pick_option_by_preference(self, option_subset):
+        """Deterministically pick one option by color preference, then current-source bias."""
+        ranked = sorted(
+            option_subset,
+            key=lambda o: (
+                self.color_preference.index(o["color"])
+                if o["color"] in self.color_preference
+                else len(self.color_preference),
+                0 if any(h.get("source") == "current" for h in o["highlights"]) else 1,
+            ),
+        )
+        return ranked[0]
+
+    def _resolve_containment_fold_choice(self, options, conflict_key, color_names):
+        """
+        If one option fully contains all others, ask which contained option it should fold into.
+        Returns chosen option or None when no containment pattern is found.
+        """
+        parent_idx, contained_indices = self._find_containment_parent_option(options)
+        if parent_idx is None:
+            return None
+
+        parent = options[parent_idx]
+        contained_opts = [options[i] for i in contained_indices]
+
+        print(
+            "  Detected container highlight pattern (one variant fully contains the others)."
+        )
+        print(
+            "  Choose which contained variant the container highlight should be folded into."
+        )
+
+        containment_key = (
+            "containment-fold",
+            conflict_key,
+            tuple(sorted((o["color"], tuple(o["ranges"])) for o in contained_opts)),
+            (parent["color"], tuple(parent["ranges"])),
+        )
+        cached = self.conflict_cache["UserMark"].get(containment_key)
+        if cached:
+            chosen = next(
+                (
+                    o
+                    for o in contained_opts
+                    if (o["color"], tuple(o["ranges"])) == cached
+                ),
+                None,
+            )
+            if chosen is not None:
+                print("  (Using previously resolved containment fold choice)")
+                return chosen
+
+        choices = []
+        for idx, opt in enumerate(contained_opts, 1):
+            cname = color_names.get(opt["color"], f"color_{opt['color']}")
+            choices.append(
+                {
+                    "name": f"Fold into Option {idx}: {cname} (instances: {len(opt['highlights'])})",
+                    "value": idx,
+                }
+            )
+
+        default_choice = self._pick_option_by_preference(contained_opts)
+        default_idx = contained_opts.index(default_choice) + 1
+        chosen_idx = self._ask_select(
+            "Container highlight detected — choose contained target:",
+            choices=choices,
+            default=default_idx,
+        )
+        if (
+            not isinstance(chosen_idx, int)
+            or chosen_idx < 1
+            or chosen_idx > len(contained_opts)
+        ):
+            chosen_idx = default_idx
+
+        chosen = contained_opts[chosen_idx - 1]
+        self.conflict_cache["UserMark"][containment_key] = (
+            chosen["color"],
+            tuple(chosen["ranges"]),
+        )
+        return chosen
+
     def _resolve_usermark_conflict(self, loc_id, sig_groups, merged_cursor):
         """Prompt the user to pick a highlight variant, with caching."""
         loc_info = self.get_location_info(merged_cursor, loc_id)
@@ -988,7 +1525,10 @@ class JwlBackupProcessor:
         if loc_res:
             print("  Fetching text context from JW.org...")
 
+        prefetched_text = self._prefetch_variant_texts(loc_res, sig_groups)
+
         options = []
+        normalized_option_text = {}
         for idx, (sig, group) in enumerate(sig_groups.items(), 1):
             color, ranges = sig
             sources = sorted({hl["source"] for hl in group})
@@ -997,27 +1537,9 @@ class JwlBackupProcessor:
             print(
                 f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
             )
-            text = None
-            if loc_res:
-                try:
-                    full_text = []
-                    for r in ranges:
-                        txt = self.get_highlighted_text(
-                            loc_res[0],
-                            r[1],
-                            r[2],
-                            r[3],
-                            loc_res[1],
-                            loc_res[2],
-                            loc_res[3],
-                            loc_res[4],
-                        )
-                        if txt:
-                            full_text.append(txt)
-                    if full_text:
-                        text = " [...] ".join(full_text)
-                except Exception:
-                    pass
+            text = prefetched_text.get(sig)
+            if text:
+                normalized_option_text[sig] = " ".join(text.split()).casefold()
             print(
                 f"    Text: {color_code}{text if text else '(Text unavailable)'}{RESET}"
             )
@@ -1027,8 +1549,41 @@ class JwlBackupProcessor:
 
         conflict_key = (loc_res, tuple(sorted(sig_groups.keys())))
 
+        # Containment-specific decision: one parent/container + contained variants.
+        containment_choice = self._resolve_containment_fold_choice(
+            options, conflict_key, color_names
+        )
+        if containment_choice is not None:
+            self.conflict_cache["UserMark"][conflict_key] = (
+                containment_choice["color"],
+                tuple(containment_choice["ranges"]),
+            )
+            return containment_choice
+
         # --- Autoresolve logic ---
         keysymbol = loc_res[2] if loc_res else None
+
+        # Autoresolve if every option renders to the exact same text.
+        unique_texts = {
+            t
+            for t in normalized_option_text.values()
+            if t and t != "(text unavailable)"
+        }
+        if len(unique_texts) == 1 and len(normalized_option_text) == len(options):
+            chosen = self._pick_option_by_preference(options)
+            chosen_color_name = color_names.get(
+                chosen["color"], f"color_{chosen['color']}"
+            )
+            print(
+                "  (Autoresolved: all variants have identical highlight text; "
+                f"selected preferred color '{chosen_color_name}')"
+            )
+            self.conflict_cache["UserMark"][conflict_key] = (
+                chosen["color"],
+                tuple(chosen["ranges"]),
+            )
+            return chosen
+
         if keysymbol in self.autoresolve_config:
             preference = self.autoresolve_config[keysymbol]
             # preference is a list of database_files in order of priority.
@@ -1073,12 +1628,9 @@ class JwlBackupProcessor:
                 }
             )
 
-        choice_idx = questionary.select(
-            "Choose highlight variant:", choices=choices
-        ).ask()
-
-        if choice_idx is None:  # Handle Ctrl+C or similar
-            choice_idx = 1
+        choice_idx = self._ask_select(
+            "Choose highlight variant:", choices=choices, default=1
+        )
 
         chosen = options[choice_idx - 1]
         self.conflict_cache["UserMark"][conflict_key] = (
@@ -1175,11 +1727,9 @@ class JwlBackupProcessor:
             if "m" in options:
                 choices.append({"name": "Keep (m)erged", "value": "m"})
 
-            choice = questionary.select(
-                f"Conflict in {table_name}:", choices=choices
-            ).ask()
-            if not choice:
-                choice = "c"
+            choice = self._ask_select(
+                f"Conflict in {table_name}:", choices=choices, default="c"
+            )
             self.conflict_cache[table_name][conflict_key] = choice
 
         if choice == "i":
@@ -1251,16 +1801,15 @@ class JwlBackupProcessor:
                     current_row.get("Content") or "", row_dict.get("Content") or ""
                 )
                 print(f"Merged: {merged_content}")
-            choice = questionary.select(
+            choice = self._ask_select(
                 "Conflict in Note:",
                 choices=[
                     {"name": "Keep (c)urrent", "value": "c"},
                     {"name": "Keep (i)ncoming", "value": "i"},
                     {"name": "Keep (m)erged", "value": "m"},
                 ],
-            ).ask()
-            if not choice:
-                choice = "c"
+                default="c",
+            )
             self.conflict_cache["Note"][conflict_key] = choice
 
         final_t, final_c = current_row.get("Title"), current_row.get("Content")
@@ -1494,7 +2043,7 @@ class JwlBackupProcessor:
                                 parser.feed(content)
                                 text = " ".join(parser.text.split())
                                 tokens = re.findall(
-                                    r"\w+(?:[''.:-]\w+)*|[^\s\w\u200b]", text
+                                    r"\w+(?:['.:-]\w+)*|[^\s\w\u200b]", text
                                 )
                                 return " ".join(tokens[start_token : end_token + 1])
                 except Exception as e:
@@ -1524,7 +2073,7 @@ class JwlBackupProcessor:
         if not full_text:
             return f"[Text not found for pid={identifier}]"
 
-        tokens = re.findall(r"\w+(?:[''.:-]\w+)*|[^\s\w\u200b]", full_text)
+        tokens = re.findall(r"\w+(?:['.:-]\w+)*|[^\s\w\u200b]", full_text)
         start_token = max(start_token, 0)
         end_token = min(end_token, len(tokens))
         return " ".join(tokens[start_token : end_token + 1])
@@ -1764,10 +2313,19 @@ class JwlBackupProcessor:
 
     def run_tests(self):
         print("\n=== Running Automated Tests ===\n")
-        import tempfile, shutil, builtins
+        import tempfile
+        import shutil
 
         test_dir = tempfile.mkdtemp(prefix="jwl_test_")
-        original_input = builtins.input
+
+        original_ask_confirm = self._ask_confirm
+
+        def ask_confirm_for_tests(message, default=False):
+            if "deduplicate highlights" in message.lower():
+                return True
+            return default
+
+        self._ask_confirm = ask_confirm_for_tests
 
         try:
             db1_path = path.join(test_dir, "db1.db")
@@ -1874,9 +2432,7 @@ class JwlBackupProcessor:
             # -------------------------------------------------------
             # Test 3: Note 3-way merge
             # -------------------------------------------------------
-            print("\nTest 3: Note 3-way Merge...")
-            builtins.input = lambda _: "m"
-
+            print("\nTest 3: Note (2 rows) keeps latest LastModified...")
             self._create_test_db(
                 db1_path,
                 {
@@ -1887,6 +2443,7 @@ class JwlBackupProcessor:
                             "Title": "Base Title",
                             "Content": "Base Content",
                             "LocationId": 10,
+                            "LastModified": "2024-01-01T00:00:00Z",
                         }
                     ],
                 },
@@ -1901,6 +2458,7 @@ class JwlBackupProcessor:
                             "Title": "User A Title",
                             "Content": "Base Content",
                             "LocationId": 10,
+                            "LastModified": "2024-01-02T00:00:00Z",
                         }
                     ],
                 },
@@ -1915,6 +2473,74 @@ class JwlBackupProcessor:
                             "Title": "Base Title",
                             "Content": "User B Content",
                             "LocationId": 10,
+                            "LastModified": "2024-01-03T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            res = conn.execute(
+                "SELECT Title, Content FROM Note WHERE Guid = 'note-123'"
+            ).fetchone()
+            conn.close()
+            assert res[0] == "User A Title", (
+                f"Expected latest title 'User A Title', got '{res[0]}'"
+            )
+            assert res[1] == "Base Content", (
+                f"Expected latest content 'Base Content', got '{res[1]}'"
+            )
+            print("  ✓ 2-row Note merge keeps most recent row by LastModified")
+
+            # -------------------------------------------------------
+            # Test 3b: Note (3+ rows) performs intelligent merge
+            # -------------------------------------------------------
+            print("\nTest 3b: Note (3+ rows) intelligent merge...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-merge-3",
+                            "Title": "Base Title",
+                            "Content": "Base Content",
+                            "LocationId": 10,
+                            "LastModified": "2024-02-01T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-merge-3",
+                            "Title": "User A Title",
+                            "Content": "Base Content",
+                            "LocationId": 10,
+                            "LastModified": "2024-02-02T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db3_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-merge-3",
+                            "Title": "Base Title",
+                            "Content": "User B Content",
+                            "LocationId": 10,
+                            "LastModified": "2024-02-03T00:00:00Z",
                         }
                     ],
                 },
@@ -1926,23 +2552,185 @@ class JwlBackupProcessor:
 
             conn = sqlite3.connect(self.merged_db_path)
             res = conn.execute(
-                "SELECT Title, Content FROM Note WHERE Guid = 'note-123'"
+                "SELECT Title, Content, LastModified FROM Note WHERE Guid = 'note-merge-3'"
             ).fetchone()
             conn.close()
-            assert res[0] == "User A Title", f"Expected 'User A Title', got '{res[0]}'"
-            assert res[1] == "User B Content", (
-                f"Expected 'User B Content', got '{res[1]}'"
+            assert res[0] == "User A Title", (
+                f"Expected merged title 'User A Title', got '{res[0]}'"
             )
-            print("  ✓ Note 3-way merge successful")
+            assert res[1] == "User B Content", (
+                f"Expected merged content 'User B Content', got '{res[1]}'"
+            )
+            assert res[2] == "2024-02-03T00:00:00Z", (
+                f"Expected latest timestamp to win, got '{res[2]}'"
+            )
+            print(
+                "  ✓ 3+ row Note merge intelligently merged title/content and kept latest timestamp"
+            )
 
-            builtins.input = original_input
+            # -------------------------------------------------------
+            # Test 3c: Identical notes with different Guid dedupe by payload
+            # -------------------------------------------------------
+            print("\nTest 3c: Note payload dedupe across different Guid...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-guid-a",
+                            "Title": "Same title",
+                            "Content": "Same content",
+                            "LocationId": 10,
+                            "UserMarkId": None,
+                            "LastModified": "2024-03-01T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-guid-b",
+                            "Title": "Same title",
+                            "Content": "Same content",
+                            "LocationId": 10,
+                            "UserMarkId": None,
+                            "LastModified": "2024-03-02T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            count = conn.execute("SELECT COUNT(*) FROM Note").fetchone()[0]
+            last_mod = conn.execute("SELECT LastModified FROM Note").fetchone()[0]
+            conn.close()
+            assert count == 1, (
+                f"Expected payload-equivalent notes to dedupe to 1 row, got {count}"
+            )
+            assert last_mod == "2024-03-02T00:00:00Z", (
+                f"Expected newer LastModified to be kept, got '{last_mod}'"
+            )
+            print(
+                "  ✓ Notes with different Guid but identical payload dedupe correctly"
+            )
+
+            # -------------------------------------------------------
+            # Test 3d: Payload dedupe removes older linked UserMark/BlockRange
+            # -------------------------------------------------------
+            print("\nTest 3d: Payload dedupe removes older linked highlight data...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "UserMark": [
+                        {
+                            "UserMarkId": 1001,
+                            "ColorIndex": 2,
+                            "LocationId": 10,
+                            "UserMarkGuid": "old-um",
+                        }
+                    ],
+                    "BlockRange": [
+                        {
+                            "BlockRangeId": 1,
+                            "BlockType": 1,
+                            "Identifier": 18,
+                            "StartToken": 0,
+                            "EndToken": 5,
+                            "UserMarkId": 1001,
+                        }
+                    ],
+                    "Note": [
+                        {
+                            "Guid": "note-old-guid",
+                            "Title": "boldness",
+                            "Content": "Same payload",
+                            "LocationId": 10,
+                            "UserMarkId": 1001,
+                            "LastModified": "2024-03-01T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "UserMark": [
+                        {
+                            "UserMarkId": 2002,
+                            "ColorIndex": 2,
+                            "LocationId": 10,
+                            "UserMarkGuid": "new-um",
+                        }
+                    ],
+                    "BlockRange": [
+                        {
+                            "BlockRangeId": 2,
+                            "BlockType": 1,
+                            "Identifier": 23,
+                            "StartToken": 0,
+                            "EndToken": 5,
+                            "UserMarkId": 2002,
+                        }
+                    ],
+                    "Note": [
+                        {
+                            "Guid": "note-new-guid",
+                            "Title": "boldness",
+                            "Content": "Same payload",
+                            "LocationId": 10,
+                            "UserMarkId": 2002,
+                            "LastModified": "2024-03-02T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            note_row = conn.execute(
+                "SELECT UserMarkId, LastModified FROM Note"
+            ).fetchone()
+            old_um_count = conn.execute(
+                "SELECT COUNT(*) FROM UserMark WHERE UserMarkId = 1001"
+            ).fetchone()[0]
+            old_br_count = conn.execute(
+                "SELECT COUNT(*) FROM BlockRange WHERE UserMarkId = 1001"
+            ).fetchone()[0]
+            conn.close()
+            assert note_row[0] == 2002, (
+                f"Expected note to point at newer UserMarkId 2002, got {note_row[0]}"
+            )
+            assert note_row[1] == "2024-03-02T00:00:00Z", (
+                f"Expected newer LastModified, got {note_row[1]}"
+            )
+            assert old_um_count == 0, (
+                f"Expected old linked UserMark to be removed, got {old_um_count}"
+            )
+            assert old_br_count == 0, (
+                f"Expected old linked BlockRange to be removed, got {old_br_count}"
+            )
+            print(
+                "  ✓ Older linked UserMark and BlockRange are removed on payload dedupe"
+            )
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
             # -------------------------------------------------------
             print("\nTest 4: UserMark Overlap (identical signature)...")
-            builtins.input = lambda _: "1"
-
             self._create_test_db(
                 db1_path,
                 {
@@ -2005,8 +2793,6 @@ class JwlBackupProcessor:
             assert um_count == 1, f"Expected 1 UserMark, got {um_count}"
             assert br_count == 1, f"Expected 1 BlockRange, got {br_count}"
             print("  ✓ UserMark identical signature merged (no duplicate BlockRange)")
-
-            builtins.input = original_input
 
             # -------------------------------------------------------
             # Test 5: Sequential PKs in merged output
@@ -2296,10 +3082,311 @@ class JwlBackupProcessor:
 
             self.ignored_keysymbols = set()
 
+            # -------------------------------------------------------
+            # Test 9: UserMark same rendered text should autoresolve
+            # -------------------------------------------------------
+            print("\nTest 9: UserMark identical rendered text autoresolves...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 20170800,
+                            "MepsLanguage": 0,
+                        }
+                    ]
+                },
+            )
+
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            self.color_preference = [4, 2, 1, 3, 5, 6]
+
+            sig_groups = {
+                (4, ((1, 1, 0, 5),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "incoming-red.db",
+                    }
+                ],
+                (2, ((1, 1, 1, 6),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "incoming-green.db",
+                    }
+                ],
+            }
+
+            original_get_text = self.get_highlighted_text
+
+            def fake_get_text(*_args, **_kwargs):
+                return "He showed great patience in putting up with the weaknesses of his followers"
+
+            self.get_highlighted_text = fake_get_text
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self.get_highlighted_text = original_get_text
+            conn.close()
+
+            assert chosen["color"] == 4, (
+                f"Expected red highlight from preference order, got {chosen}"
+            )
+            print(
+                "  ✓ Identical rendered highlight text now autoresolves using configured color priority"
+            )
+
+            # -------------------------------------------------------
+            # Test 10: Container highlight can be folded into chosen child variant
+            # -------------------------------------------------------
+            print("\nTest 10: Containment fold chooses target contained variant...")
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            sig_groups = {
+                (2, ((1, 1, 0, 12),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "parent-green.db",
+                    }
+                ],
+                (2, ((1, 1, 0, 3),)): [
+                    {
+                        "source": "current",
+                        "source_path": "child-green.db",
+                    }
+                ],
+                (4, ((1, 1, 4, 7),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "child-red.db",
+                    }
+                ],
+            }
+
+            def ask_select_containment(message, choices, default=None):
+                if message == "Container highlight detected — choose contained target:":
+                    for c in choices:
+                        if "red" in c["name"]:
+                            return c["value"]
+                return default
+
+            self._ask_select = ask_select_containment
+            original_get_text = self.get_highlighted_text
+            self.get_highlighted_text = lambda *_args, **_kwargs: (
+                "synthetic containment text"
+            )
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self.get_highlighted_text = original_get_text
+
+            assert chosen["color"] == 4, (
+                f"Expected red child highlight to be chosen, got {chosen}"
+            )
+            assert chosen["ranges"] == [(1, 1, 4, 7)], (
+                f"Expected fold target child range [(1,1,4,7)], got {chosen['ranges']}"
+            )
+            print(
+                "  ✓ Container highlight fold now allows choosing the contained target variant"
+            )
+            conn.close()
+
+            # -------------------------------------------------------
+            # Test 11: Containment fold should not trigger for only 2 options
+            # -------------------------------------------------------
+            print("\nTest 11: No containment fold prompt when only 2 options...")
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            sig_groups = {
+                (2, ((1, 1, 0, 12),)): [
+                    {"source": "incoming", "source_path": "parent-green.db"}
+                ],
+                (2, ((1, 1, 4, 7),)): [
+                    {"source": "incoming", "source_path": "child-green.db"}
+                ],
+            }
+
+            original_get_text = self.get_highlighted_text
+            self.get_highlighted_text = lambda *_args, **_kwargs: (
+                "synthetic 2-option text"
+            )
+
+            def ask_select_fail_if_containment(message, choices, default=None):
+                if message == "Container highlight detected — choose contained target:":
+                    raise AssertionError(
+                        "Containment prompt should not be shown for 2 options"
+                    )
+                return default
+
+            self._ask_select = ask_select_fail_if_containment
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self.get_highlighted_text = original_get_text
+
+            assert chosen["ranges"] in [[(1, 1, 0, 12)], [(1, 1, 4, 7)]], (
+                f"Expected a normal non-containment choice, got {chosen['ranges']}"
+            )
+            print("  ✓ 2-option conflicts no longer trigger containment fold flow")
+            conn.close()
+
+            # -------------------------------------------------------
+            # Test 12: Dedupe disabled skips UserMark conflict resolver
+            # -------------------------------------------------------
+            print(
+                "\nTest 12: Dedupe-disabled mode skips highlight conflict resolver..."
+            )
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 777,
+                            "MepsLanguage": 0,
+                        }
+                    ],
+                    "UserMark": [
+                        {
+                            "UserMarkId": 1,
+                            "ColorIndex": 2,
+                            "LocationId": 1,
+                            "UserMarkGuid": "dedupe-off-a",
+                        }
+                    ],
+                    "BlockRange": [
+                        {
+                            "BlockType": 1,
+                            "Identifier": 1,
+                            "StartToken": 0,
+                            "EndToken": 12,
+                            "UserMarkId": 1,
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 777,
+                            "MepsLanguage": 0,
+                        }
+                    ],
+                    "UserMark": [
+                        {
+                            "UserMarkId": 2,
+                            "ColorIndex": 2,
+                            "LocationId": 1,
+                            "UserMarkGuid": "dedupe-off-b",
+                        }
+                    ],
+                    "BlockRange": [
+                        {
+                            "BlockType": 1,
+                            "Identifier": 1,
+                            "StartToken": 4,
+                            "EndToken": 7,
+                            "UserMarkId": 2,
+                        }
+                    ],
+                },
+            )
+
+            original_ask_confirm_inner = self._ask_confirm
+            original_conflict_resolver = self._resolve_usermark_conflict
+
+            def ask_confirm_dedupe_off(message, default=False):
+                if "deduplicate highlights" in message.lower():
+                    return False
+                return default
+
+            self._ask_confirm = ask_confirm_dedupe_off
+            self._resolve_usermark_conflict = lambda *_args, **_kwargs: ().throw(
+                AssertionError(
+                    "_resolve_usermark_conflict must not run when dedupe is disabled"
+                )
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            try:
+                self.process_databases([db1_path, db2_path])
+            finally:
+                self._ask_confirm = original_ask_confirm_inner
+                self._resolve_usermark_conflict = original_conflict_resolver
+
+            conn = sqlite3.connect(self.merged_db_path)
+            um_count = conn.execute("SELECT COUNT(*) FROM UserMark").fetchone()[0]
+            conn.close()
+            assert um_count == 2, (
+                f"Expected 2 UserMarks with dedupe off, got {um_count}"
+            )
+            print("  ✓ Dedupe-off mode bypasses highlight conflict resolution")
+
+            # -------------------------------------------------------
+            # Test 13: Location.Title NULL is normalized to single space
+            # -------------------------------------------------------
+            print("\nTest 13: Normalize NULL Location.Title to single space...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 999,
+                            "MepsLanguage": 0,
+                            "Title": None,
+                        }
+                    ]
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [
+                        {
+                            "LocationId": 2,
+                            "KeySymbol": "w",
+                            "DocumentId": 1000,
+                            "MepsLanguage": 0,
+                            "Title": "Has Title",
+                        }
+                    ]
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            null_count = conn.execute(
+                "SELECT COUNT(*) FROM Location WHERE Title IS NULL"
+            ).fetchone()[0]
+            space_count = conn.execute(
+                "SELECT COUNT(*) FROM Location WHERE Title = ' '"
+            ).fetchone()[0]
+            conn.close()
+            assert null_count == 0, (
+                f"Expected no NULL Location.Title values, got {null_count}"
+            )
+            assert space_count >= 1, (
+                "Expected at least one normalized single-space title"
+            )
+            print("  ✓ NULL Location.Title values are normalized to single space")
+
             print("\n=== All Tests Passed! ===\n")
 
         finally:
-            builtins.input = original_input
+            self._ask_confirm = original_ask_confirm
 
             def secure_delete(p, is_dir=False):
                 import time
