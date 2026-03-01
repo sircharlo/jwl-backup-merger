@@ -107,6 +107,7 @@ class JwlBackupProcessor:
         self.fk_map = {}  # {table_lower: {col_lower: (ref_table_original, ref_col)}}
         self.table_name_map = {}  # {table_lower: table_original}
         self.note_bases = {}  # {guid: {'title': ..., 'content': ...}}
+        self.note_seen_counts = {}  # {guid: total note rows seen across all sources}
         self.files_to_include_in_archive = []
         self.start_time = 0
 
@@ -350,6 +351,7 @@ class JwlBackupProcessor:
         """Copy first source DB as the merge target and wipe all data tables."""
         self.start_time = time()
         self.note_bases = {}
+        self.note_seen_counts = {}
 
         copy2(database_files[0], self.merged_db_path)
         merged_conn = sqlite3.connect(self.merged_db_path)
@@ -562,7 +564,13 @@ class JwlBackupProcessor:
             return datetime.min
 
     def _merge_note_by_guid(self, table, row_dict, merged_cursor, pk_remap, identity_index):
-        """Merge Note rows by Guid, keeping the row with the latest LastModified."""
+        """Merge Note rows by Guid.
+
+        Rules:
+        - If exactly 2 rows share a Guid (existing + incoming), keep the newer LastModified row.
+        - If 3+ rows share a Guid, perform an intelligent merge for Title/Content while keeping
+          the newest LastModified timestamp.
+        """
         pk_cols = self.primary_keys.get(table, [])
         note_id_col = "NoteId" if "NoteId" in row_dict else (pk_cols[0] if pk_cols else None)
         old_note_id = row_dict.get(note_id_col) if note_id_col else None
@@ -571,10 +579,21 @@ class JwlBackupProcessor:
         if not guid:
             return self._insert_row(table, "Note", row_dict, merged_cursor)
 
-        merged_cursor.execute(f"SELECT _rowid_ AS __rowid__, * FROM [{table}] WHERE Guid = ?", (guid,))
+        self.note_seen_counts[guid] = self.note_seen_counts.get(guid, 0) + 1
+        total_seen_for_guid = self.note_seen_counts[guid]
+        self.note_bases.setdefault(
+            guid,
+            {
+                "title": row_dict.get("Title") or "",
+                "content": row_dict.get("Content") or "",
+            },
+        )
+
+        merged_cursor.execute(
+            f"SELECT _rowid_ AS __rowid__, * FROM [{table}] WHERE Guid = ?", (guid,)
+        )
         existing_rows = merged_cursor.fetchall()
 
-        # Build identity tuple for cache upkeep.
         id_cols = self.identity_keys.get("Note", ["Guid"])
         identity_tuple = tuple(row_dict.get(c) for c in id_cols)
 
@@ -595,14 +614,10 @@ class JwlBackupProcessor:
             identity_index.setdefault("Note", {})[identity_tuple] = True
             return new_rowid
 
-        # Pick the current winner by latest LastModified (ties: highest rowid).
-        def row_sort_key(row):
-            rdict = dict(zip([d[0] for d in merged_cursor.description][1:], row[1:]))
-            return (self._parse_last_modified(rdict.get("LastModified")), row[0])
-
-        # Need column names from SELECT _rowid_ AS __rowid__, * description
         cols = [d[0] for d in merged_cursor.description]
         existing_dicts = [dict(zip(cols, r)) for r in existing_rows]
+
+        # Anchor updates to the newest existing row.
         existing_best = max(
             existing_dicts,
             key=lambda r: (self._parse_last_modified(r.get("LastModified")), r.get("__rowid__", 0)),
@@ -612,30 +627,45 @@ class JwlBackupProcessor:
         if old_note_id is not None and existing_note_id is not None:
             pk_remap[table][old_note_id] = existing_note_id
 
-        incoming_raw_ts = str(row_dict.get("LastModified") or "")
-        current_raw_ts = str(existing_best.get("LastModified") or "")
-        incoming_ts = self._parse_last_modified(incoming_raw_ts)
-        current_ts = self._parse_last_modified(current_raw_ts)
-
-        incoming_is_newer = (
-            incoming_raw_ts > current_raw_ts
-            or (incoming_raw_ts == current_raw_ts and incoming_ts > current_ts)
+        candidates = existing_dicts + [dict(row_dict)]
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda r: (self._parse_last_modified(r.get("LastModified")), str(r.get("LastModified") or "")),
         )
 
-        if incoming_is_newer:
-            # Overwrite non-PK columns in the chosen existing row with incoming values.
+        # Exactly two rows: keep the most recent row directly.
+        if total_seen_for_guid <= 2 and len(candidates_sorted) == 2:
+            winner = candidates_sorted[-1]
             updatable_cols = [
-                c
-                for c in row_dict.keys()
-                if c not in pk_cols and c != note_id_col
+                c for c in row_dict.keys() if c not in pk_cols and c != note_id_col
             ]
             if updatable_cols:
                 set_clause = ", ".join(f"[{c}] = ?" for c in updatable_cols)
-                params = [row_dict.get(c) for c in updatable_cols] + [existing_best.get("__rowid__")]
+                params = [winner.get(c) for c in updatable_cols] + [existing_best.get("__rowid__")]
                 merged_cursor.execute(
                     f"UPDATE [{table}] SET {set_clause} WHERE rowid = ?",
                     params,
                 )
+        else:
+            # 3+ rows: intelligent content merge ordered by recency progression.
+            merged_title = candidates_sorted[0].get("Title") or ""
+            merged_content = candidates_sorted[0].get("Content") or ""
+            base_info = self.note_bases.get(guid, {})
+            base_title = base_info.get("title") or ""
+            base_content = base_info.get("content") or ""
+
+            for candidate in candidates_sorted[1:]:
+                cand_title = candidate.get("Title") or ""
+                cand_content = candidate.get("Content") or ""
+                merged_title = self.merge_text(base_title, merged_title, cand_title)
+                merged_content = self.merge_text(base_content, merged_content, cand_content)
+
+            latest = candidates_sorted[-1]
+            latest_ts = latest.get("LastModified")
+            merged_cursor.execute(
+                f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE rowid = ?",
+                (merged_title, merged_content, latest_ts, existing_best.get("__rowid__")),
+            )
 
         if self._is_autoincrement_table(table) and existing_note_id is not None:
             identity_index.setdefault("Note", {})[identity_tuple] = existing_note_id
@@ -2286,7 +2316,7 @@ class JwlBackupProcessor:
             # -------------------------------------------------------
             # Test 3: Note 3-way merge
             # -------------------------------------------------------
-            print("\nTest 3: Note latest LastModified wins by Guid...")
+            print("\nTest 3: Note (2 rows) keeps latest LastModified...")
             self._create_test_db(
                 db1_path,
                 {
@@ -2335,18 +2365,82 @@ class JwlBackupProcessor:
 
             if path.exists(self.merged_db_path):
                 remove(self.merged_db_path)
-            self.process_databases([db1_path, db2_path, db3_path])
+            self.process_databases([db1_path, db2_path])
 
             conn = sqlite3.connect(self.merged_db_path)
             res = conn.execute(
                 "SELECT Title, Content FROM Note WHERE Guid = 'note-123'"
             ).fetchone()
             conn.close()
-            assert res[0] == "Base Title", f"Expected latest title 'Base Title', got '{res[0]}'"
-            assert res[1] == "User B Content", (
-                f"Expected latest content 'User B Content', got '{res[1]}'"
+            assert res[0] == "User A Title", f"Expected latest title 'User A Title', got '{res[0]}'"
+            assert res[1] == "Base Content", (
+                f"Expected latest content 'Base Content', got '{res[1]}'"
             )
-            print("  ✓ Note merge now keeps most recent row by LastModified")
+            print("  ✓ 2-row Note merge keeps most recent row by LastModified")
+
+            # -------------------------------------------------------
+            # Test 3b: Note (3+ rows) performs intelligent merge
+            # -------------------------------------------------------
+            print("\nTest 3b: Note (3+ rows) intelligent merge...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-merge-3",
+                            "Title": "Base Title",
+                            "Content": "Base Content",
+                            "LocationId": 10,
+                            "LastModified": "2024-02-01T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db2_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-merge-3",
+                            "Title": "User A Title",
+                            "Content": "Base Content",
+                            "LocationId": 10,
+                            "LastModified": "2024-02-02T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+            self._create_test_db(
+                db3_path,
+                {
+                    "Location": [{"LocationId": 10, "Title": "Note Loc"}],
+                    "Note": [
+                        {
+                            "Guid": "note-merge-3",
+                            "Title": "Base Title",
+                            "Content": "User B Content",
+                            "LocationId": 10,
+                            "LastModified": "2024-02-03T00:00:00Z",
+                        }
+                    ],
+                },
+            )
+
+            if path.exists(self.merged_db_path):
+                remove(self.merged_db_path)
+            self.process_databases([db1_path, db2_path, db3_path])
+
+            conn = sqlite3.connect(self.merged_db_path)
+            res = conn.execute(
+                "SELECT Title, Content, LastModified FROM Note WHERE Guid = 'note-merge-3'"
+            ).fetchone()
+            conn.close()
+            assert res[0] == "User A Title", f"Expected merged title 'User A Title', got '{res[0]}'"
+            assert res[1] == "User B Content", f"Expected merged content 'User B Content', got '{res[1]}'"
+            assert res[2] == "2024-02-03T00:00:00Z", f"Expected latest timestamp to win, got '{res[2]}'"
+            print("  ✓ 3+ row Note merge intelligently merged title/content and kept latest timestamp")
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
