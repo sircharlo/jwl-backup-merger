@@ -25,6 +25,7 @@ Running the app:
 
 ### Arguments
 
+- `--test`: Run the built-in automated test suite.
 - `--folder FOLDER_PATH`: Folder containing JW Library backups to merge.
 - `--file FILE_PATH`: JW Library backup to add to the list of backups to merge. You can specify multiple `--file` arguments to merge multiple backups.
 - `--debug`: Enable verbose output and Excel file creation to help with debugging; also prevents deletion of temporary files.
@@ -34,3 +35,9 @@ Running the app:
     python jwl-backup-merger.py --folder /path/to/folder-with-jwl-backups
     python jwl-backup-merger.py --folder /path/to/folder-with-jwl-backups --file /path/to/additional-file1.jwlibrary
     python jwl-backup-merger.py --file /path/to/phone.jwlibrary --file /path/to/tablet.jwlibrary --file /path/to/computer.jwlibrary
+
+
+## Highlight conflict handling
+
+- For identical rendered highlight text conflicts, you can configure a preferred highlight color order before merge.
+- For container-vs-contained highlight conflicts, the tool prompts which contained highlight the container should fold into.
