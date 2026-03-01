@@ -11,8 +11,10 @@ from tqdm import tqdm
 import difflib
 import sqlite3
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 import re
+import sys
 from urllib.parse import urlparse
 import questionary
 
@@ -124,6 +126,8 @@ class JwlBackupProcessor:
         self.ignored_keysymbols = []
         self.autoresolve_config = {}
         self.usermark_sources = {}  # {merged_usermark_id: source_path}
+        self.text_prefetch_workers = 3
+        self.color_preference = [1, 2, 3, 4, 5, 6]
 
         # Tables processed in parent-before-child dependency order.
         # This is critical: every FK target must appear before the table that references it.
@@ -408,14 +412,16 @@ class JwlBackupProcessor:
 
         sorted_keys = sorted(list(all_keysymbols))
         if sorted_keys:
-            if questionary.confirm(
+            self._configure_color_preference()
+
+            if self._ask_confirm(
                 "Would you like to ignore certain publications for highlight merge?"
-            ).ask():
+            ):
                 self.ignored_keysymbols = (
-                    questionary.checkbox(
+                    self._ask_checkbox(
                         "Select publications to ignore for highlight merging:",
                         choices=sorted_keys,
-                    ).ask()
+                    )
                     or []
                 )
 
@@ -424,15 +430,15 @@ class JwlBackupProcessor:
             ]
             if (
                 remaining_keys
-                and questionary.confirm(
+                and self._ask_confirm(
                     "Should some publications autoresolve highlight issues by choosing preferred source?"
-                ).ask()
+                )
             ):
                 auto_keys = (
-                    questionary.checkbox(
+                    self._ask_checkbox(
                         "Select publications to autoresolve highlight issues:",
                         choices=remaining_keys,
-                    ).ask()
+                    )
                     or []
                 )
 
@@ -446,10 +452,10 @@ class JwlBackupProcessor:
                     preference = []
                     temp_choices = list(choices)
                     for i in range(len(database_files)):
-                        p = questionary.select(
+                        p = self._ask_select(
                             f"Select priority #{i + 1} source for {key}:",
                             choices=temp_choices,
-                        ).ask()
+                        )
                         preference.append(database_files[choices.index(p)])
                         temp_choices.remove(p)
                         if len(temp_choices) == 1:
@@ -526,6 +532,46 @@ class JwlBackupProcessor:
             merged_conn.commit()
 
         self._finalize_merge(merged_conn)
+
+    def _configure_color_preference(self):
+        """Prompt once for preferred highlight color order used in identical-text autoresolve."""
+        color_names = {
+            1: "yellow",
+            2: "green",
+            3: "blue",
+            4: "red",
+            5: "orange",
+            6: "purple",
+        }
+
+        if not self._ask_confirm(
+            "Set highlight color priority for identical-text auto-resolution?",
+            default=False,
+        ):
+            return
+
+        available = list(self.color_preference)
+        preference = []
+        for idx in range(len(available)):
+            choices = [
+                {
+                    "name": f"{color_names.get(c, f'color_{c}')} (#{c})",
+                    "value": c,
+                }
+                for c in available
+            ]
+            picked = self._ask_select(
+                f"Choose preferred color #{idx + 1}:",
+                choices=choices,
+                default=available[0],
+            )
+            if picked not in available:
+                picked = available[0]
+            preference.append(picked)
+            available.remove(picked)
+
+        if preference:
+            self.color_preference = preference
 
     # ------------------------------------------------------------------
     # Generic row merge
@@ -957,6 +1003,233 @@ class JwlBackupProcessor:
                 components.append(comp)
         return components
 
+    def _is_interactive_terminal(self):
+        return sys.stdin.isatty() and sys.stdout.isatty()
+
+    def _ask_confirm(self, message, default=False):
+        if not self._is_interactive_terminal():
+            return default
+        answer = questionary.confirm(message).ask()
+        return default if answer is None else answer
+
+    def _ask_checkbox(self, message, choices):
+        if not self._is_interactive_terminal():
+            return []
+        answer = questionary.checkbox(message, choices=choices).ask()
+        return answer or []
+
+    def _ask_select(self, message, choices, default=None):
+        if not self._is_interactive_terminal():
+            if isinstance(default, dict):
+                return default.get("value")
+            return default
+        answer = questionary.select(message, choices=choices).ask()
+        if answer is None:
+            if isinstance(default, dict):
+                return default.get("value")
+            return default
+        return answer
+
+    def _fetch_highlight_variant_text(self, loc_res, ranges):
+        if not loc_res:
+            return None
+        full_text = []
+        for r in ranges:
+            txt = self.get_highlighted_text(
+                loc_res[0],
+                r[1],
+                r[2],
+                r[3],
+                loc_res[1],
+                loc_res[2],
+                loc_res[3],
+                loc_res[4],
+            )
+            if txt:
+                full_text.append(txt)
+        return " [...] ".join(full_text) if full_text else None
+
+    def _prefetch_variant_texts(self, loc_res, sig_groups):
+        if not loc_res:
+            return {}
+
+        sig_items = list(sig_groups.items())
+        texts = {}
+        with ThreadPoolExecutor(max_workers=self.text_prefetch_workers) as executor:
+            future_map = {
+                executor.submit(self._fetch_highlight_variant_text, loc_res, sig[1]): sig
+                for sig, _ in sig_items
+            }
+            for future in as_completed(future_map):
+                sig = future_map[future]
+                try:
+                    texts[sig] = future.result()
+                except Exception:
+                    texts[sig] = None
+        return texts
+
+    def _range_contains(self, outer, inner):
+        """True if outer BlockRange fully contains inner BlockRange (same block/identifier)."""
+        return (
+            outer[0] == inner[0]
+            and outer[1] == inner[1]
+            and outer[2] <= inner[2]
+            and outer[3] >= inner[3]
+        )
+
+    def _ranges_contain_other_ranges(self, outer_ranges, inner_ranges):
+        """True if every inner range is fully covered by at least one outer range."""
+        if not outer_ranges or not inner_ranges:
+            return False
+        for inner in inner_ranges:
+            if not any(self._range_contains(outer, inner) for outer in outer_ranges):
+                return False
+        return True
+
+    def _option_token_bounds(self, option):
+        """Return (block_type, identifier, min_start, max_end) for an option, else None."""
+        ranges = option.get("ranges") or []
+        if not ranges:
+            return None
+
+        first_block_type, first_identifier = ranges[0][0], ranges[0][1]
+        starts = []
+        ends = []
+        for r in ranges:
+            if r[0] != first_block_type or r[1] != first_identifier:
+                return None
+            starts.append(r[2])
+            ends.append(r[3])
+
+        return (first_block_type, first_identifier, min(starts), max(ends))
+
+    def _find_containment_parent_option(self, options):
+        """
+        Return (parent_idx, contained_indices) when one option contains all others.
+
+        Containment logic is intentionally limited to 3+ options and requires
+        one option's start/end bounds to wrap every other option's bounds.
+        """
+        if len(options) < 3:
+            return (None, [])
+
+        bounds = [self._option_token_bounds(o) for o in options]
+
+        for p_idx, parent in enumerate(options):
+            parent_bounds = bounds[p_idx]
+            if parent_bounds is None:
+                continue
+
+            p_block, p_ident, p_start, p_end = parent_bounds
+            contained = []
+            for c_idx, child in enumerate(options):
+                if p_idx == c_idx:
+                    continue
+
+                child_bounds = bounds[c_idx]
+                if child_bounds is None:
+                    continue
+                c_block, c_ident, c_start, c_end = child_bounds
+
+                # User-requested trigger rule: parent start <= child start AND
+                # parent end >= child end for each other option.
+                wraps_child_bounds = (
+                    p_block == c_block
+                    and p_ident == c_ident
+                    and p_start <= c_start
+                    and p_end >= c_end
+                )
+                if wraps_child_bounds and self._ranges_contain_other_ranges(
+                    parent["ranges"], child["ranges"]
+                ):
+                    contained.append(c_idx)
+
+            if len(contained) == len(options) - 1:
+                return (p_idx, contained)
+
+        return (None, [])
+
+    def _pick_option_by_preference(self, option_subset):
+        """Deterministically pick one option by color preference, then current-source bias."""
+        ranked = sorted(
+            option_subset,
+            key=lambda o: (
+                self.color_preference.index(o["color"])
+                if o["color"] in self.color_preference
+                else len(self.color_preference),
+                0 if any(h.get("source") == "current" for h in o["highlights"]) else 1,
+            ),
+        )
+        return ranked[0]
+
+    def _resolve_containment_fold_choice(
+        self, loc_res, options, conflict_key, color_names
+    ):
+        """
+        If one option fully contains all others, ask which contained option it should fold into.
+        Returns chosen option or None when no containment pattern is found.
+        """
+        parent_idx, contained_indices = self._find_containment_parent_option(options)
+        if parent_idx is None:
+            return None
+
+        parent = options[parent_idx]
+        contained_opts = [options[i] for i in contained_indices]
+
+        print(
+            "  Detected container highlight pattern (one variant fully contains the others)."
+        )
+        print(
+            "  Choose which contained variant the container highlight should be folded into."
+        )
+
+        containment_key = (
+            "containment-fold",
+            conflict_key,
+            tuple(sorted((o["color"], tuple(o["ranges"])) for o in contained_opts)),
+            (parent["color"], tuple(parent["ranges"])),
+        )
+        cached = self.conflict_cache["UserMark"].get(containment_key)
+        if cached:
+            chosen = next(
+                (
+                    o
+                    for o in contained_opts
+                    if (o["color"], tuple(o["ranges"])) == cached
+                ),
+                None,
+            )
+            if chosen is not None:
+                print("  (Using previously resolved containment fold choice)")
+                return chosen
+
+        choices = []
+        for idx, opt in enumerate(contained_opts, 1):
+            cname = color_names.get(opt["color"], f"color_{opt['color']}")
+            choices.append(
+                {
+                    "name": f"Fold into Option {idx}: {cname} (instances: {len(opt['highlights'])})",
+                    "value": idx,
+                }
+            )
+
+        default_choice = self._pick_option_by_preference(contained_opts)
+        default_idx = contained_opts.index(default_choice) + 1
+        chosen_idx = self._ask_select(
+            "Container highlight detected — choose contained target:",
+            choices=choices,
+            default=default_idx,
+        )
+        if not isinstance(chosen_idx, int) or chosen_idx < 1 or chosen_idx > len(contained_opts):
+            chosen_idx = default_idx
+
+        chosen = contained_opts[chosen_idx - 1]
+        self.conflict_cache["UserMark"][containment_key] = (
+            chosen["color"],
+            tuple(chosen["ranges"]),
+        )
+        return chosen
+
     def _resolve_usermark_conflict(self, loc_id, sig_groups, merged_cursor):
         """Prompt the user to pick a highlight variant, with caching."""
         loc_info = self.get_location_info(merged_cursor, loc_id)
@@ -988,7 +1261,10 @@ class JwlBackupProcessor:
         if loc_res:
             print("  Fetching text context from JW.org...")
 
+        prefetched_text = self._prefetch_variant_texts(loc_res, sig_groups)
+
         options = []
+        normalized_option_text = {}
         for idx, (sig, group) in enumerate(sig_groups.items(), 1):
             color, ranges = sig
             sources = sorted({hl["source"] for hl in group})
@@ -997,27 +1273,9 @@ class JwlBackupProcessor:
             print(
                 f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
             )
-            text = None
-            if loc_res:
-                try:
-                    full_text = []
-                    for r in ranges:
-                        txt = self.get_highlighted_text(
-                            loc_res[0],
-                            r[1],
-                            r[2],
-                            r[3],
-                            loc_res[1],
-                            loc_res[2],
-                            loc_res[3],
-                            loc_res[4],
-                        )
-                        if txt:
-                            full_text.append(txt)
-                    if full_text:
-                        text = " [...] ".join(full_text)
-                except Exception:
-                    pass
+            text = prefetched_text.get(sig)
+            if text:
+                normalized_option_text[sig] = " ".join(text.split()).casefold()
             print(
                 f"    Text: {color_code}{text if text else '(Text unavailable)'}{RESET}"
             )
@@ -1027,8 +1285,39 @@ class JwlBackupProcessor:
 
         conflict_key = (loc_res, tuple(sorted(sig_groups.keys())))
 
+        # Containment-specific decision: one parent/container + contained variants.
+        containment_choice = self._resolve_containment_fold_choice(
+            loc_res, options, conflict_key, color_names
+        )
+        if containment_choice is not None:
+            self.conflict_cache["UserMark"][conflict_key] = (
+                containment_choice["color"],
+                tuple(containment_choice["ranges"]),
+            )
+            return containment_choice
+
         # --- Autoresolve logic ---
         keysymbol = loc_res[2] if loc_res else None
+
+        # Autoresolve if every option renders to the exact same text.
+        unique_texts = {
+            t for t in normalized_option_text.values() if t and t != "(text unavailable)"
+        }
+        if len(unique_texts) == 1 and len(normalized_option_text) == len(options):
+            chosen = self._pick_option_by_preference(options)
+            chosen_color_name = color_names.get(
+                chosen["color"], f"color_{chosen['color']}"
+            )
+            print(
+                "  (Autoresolved: all variants have identical highlight text; "
+                f"selected preferred color '{chosen_color_name}')"
+            )
+            self.conflict_cache["UserMark"][conflict_key] = (
+                chosen["color"],
+                tuple(chosen["ranges"]),
+            )
+            return chosen
+
         if keysymbol in self.autoresolve_config:
             preference = self.autoresolve_config[keysymbol]
             # preference is a list of database_files in order of priority.
@@ -1073,12 +1362,9 @@ class JwlBackupProcessor:
                 }
             )
 
-        choice_idx = questionary.select(
-            "Choose highlight variant:", choices=choices
-        ).ask()
-
-        if choice_idx is None:  # Handle Ctrl+C or similar
-            choice_idx = 1
+        choice_idx = self._ask_select(
+            "Choose highlight variant:", choices=choices, default=1
+        )
 
         chosen = options[choice_idx - 1]
         self.conflict_cache["UserMark"][conflict_key] = (
@@ -1175,11 +1461,9 @@ class JwlBackupProcessor:
             if "m" in options:
                 choices.append({"name": "Keep (m)erged", "value": "m"})
 
-            choice = questionary.select(
-                f"Conflict in {table_name}:", choices=choices
-            ).ask()
-            if not choice:
-                choice = "c"
+            choice = self._ask_select(
+                f"Conflict in {table_name}:", choices=choices, default="c"
+            )
             self.conflict_cache[table_name][conflict_key] = choice
 
         if choice == "i":
@@ -1251,16 +1535,15 @@ class JwlBackupProcessor:
                     current_row.get("Content") or "", row_dict.get("Content") or ""
                 )
                 print(f"Merged: {merged_content}")
-            choice = questionary.select(
+            choice = self._ask_select(
                 "Conflict in Note:",
                 choices=[
                     {"name": "Keep (c)urrent", "value": "c"},
                     {"name": "Keep (i)ncoming", "value": "i"},
                     {"name": "Keep (m)erged", "value": "m"},
                 ],
-            ).ask()
-            if not choice:
-                choice = "c"
+                default="c",
+            )
             self.conflict_cache["Note"][conflict_key] = choice
 
         final_t, final_c = current_row.get("Title"), current_row.get("Content")
@@ -1764,10 +2047,9 @@ class JwlBackupProcessor:
 
     def run_tests(self):
         print("\n=== Running Automated Tests ===\n")
-        import tempfile, shutil, builtins
+        import tempfile, shutil
 
         test_dir = tempfile.mkdtemp(prefix="jwl_test_")
-        original_input = builtins.input
 
         try:
             db1_path = path.join(test_dir, "db1.db")
@@ -1875,8 +2157,10 @@ class JwlBackupProcessor:
             # Test 3: Note 3-way merge
             # -------------------------------------------------------
             print("\nTest 3: Note 3-way Merge...")
-            builtins.input = lambda _: "m"
-
+            original_ask_select = self._ask_select
+            self._ask_select = lambda message, choices, default=None: (
+                "m" if message == "Conflict in Note:" else (default or 1)
+            )
             self._create_test_db(
                 db1_path,
                 {
@@ -1933,16 +2217,13 @@ class JwlBackupProcessor:
             assert res[1] == "User B Content", (
                 f"Expected 'User B Content', got '{res[1]}'"
             )
+            self._ask_select = original_ask_select
             print("  ✓ Note 3-way merge successful")
-
-            builtins.input = original_input
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
             # -------------------------------------------------------
             print("\nTest 4: UserMark Overlap (identical signature)...")
-            builtins.input = lambda _: "1"
-
             self._create_test_db(
                 db1_path,
                 {
@@ -2005,8 +2286,6 @@ class JwlBackupProcessor:
             assert um_count == 1, f"Expected 1 UserMark, got {um_count}"
             assert br_count == 1, f"Expected 1 BlockRange, got {br_count}"
             print("  ✓ UserMark identical signature merged (no duplicate BlockRange)")
-
-            builtins.input = original_input
 
             # -------------------------------------------------------
             # Test 5: Sequential PKs in merged output
@@ -2296,11 +2575,156 @@ class JwlBackupProcessor:
 
             self.ignored_keysymbols = set()
 
+            # -------------------------------------------------------
+            # Test 9: UserMark same rendered text should autoresolve
+            # -------------------------------------------------------
+            print("\nTest 9: UserMark identical rendered text autoresolves...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 20170800,
+                            "MepsLanguage": 0,
+                        }
+                    ]
+                },
+            )
+
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            self.color_preference = [4, 2, 1, 3, 5, 6]
+
+            sig_groups = {
+                (4, ((1, 1, 0, 5),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "incoming-red.db",
+                    }
+                ],
+                (2, ((1, 1, 1, 6),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "incoming-green.db",
+                    }
+                ],
+            }
+
+            original_get_text = self.get_highlighted_text
+
+            def fake_get_text(*_args, **_kwargs):
+                return "He showed great patience in putting up with the weaknesses of his followers"
+
+            self.get_highlighted_text = fake_get_text
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self.get_highlighted_text = original_get_text
+            conn.close()
+
+            assert chosen["color"] == 4, f"Expected red highlight from preference order, got {chosen}"
+            print(
+                "  ✓ Identical rendered highlight text now autoresolves using configured color priority"
+            )
+
+            # -------------------------------------------------------
+            # Test 10: Container highlight can be folded into chosen child variant
+            # -------------------------------------------------------
+            print("\nTest 10: Containment fold chooses target contained variant...")
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            sig_groups = {
+                (2, ((1, 1, 0, 12),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "parent-green.db",
+                    }
+                ],
+                (2, ((1, 1, 0, 3),)): [
+                    {
+                        "source": "current",
+                        "source_path": "child-green.db",
+                    }
+                ],
+                (4, ((1, 1, 4, 7),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "child-red.db",
+                    }
+                ],
+            }
+
+            original_ask_select = self._ask_select
+
+            def ask_select_containment(message, choices, default=None):
+                if message == "Container highlight detected — choose contained target:":
+                    for c in choices:
+                        if "red" in c["name"]:
+                            return c["value"]
+                return default
+
+            self._ask_select = ask_select_containment
+            original_get_text = self.get_highlighted_text
+            self.get_highlighted_text = (
+                lambda *_args, **_kwargs: "synthetic containment text"
+            )
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self.get_highlighted_text = original_get_text
+                self._ask_select = original_ask_select
+
+            assert chosen["color"] == 4, f"Expected red child highlight to be chosen, got {chosen}"
+            assert chosen["ranges"] == [(1, 1, 4, 7)], (
+                f"Expected fold target child range [(1,1,4,7)], got {chosen['ranges']}"
+            )
+            print("  ✓ Container highlight fold now allows choosing the contained target variant")
+            conn.close()
+
+            # -------------------------------------------------------
+            # Test 11: Containment fold should not trigger for only 2 options
+            # -------------------------------------------------------
+            print("\nTest 11: No containment fold prompt when only 2 options...")
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            sig_groups = {
+                (2, ((1, 1, 0, 12),)): [
+                    {"source": "incoming", "source_path": "parent-green.db"}
+                ],
+                (2, ((1, 1, 4, 7),)): [
+                    {"source": "incoming", "source_path": "child-green.db"}
+                ],
+            }
+
+            original_ask_select = self._ask_select
+            original_get_text = self.get_highlighted_text
+            self.get_highlighted_text = (
+                lambda *_args, **_kwargs: "synthetic 2-option text"
+            )
+
+            def ask_select_fail_if_containment(message, choices, default=None):
+                if message == "Container highlight detected — choose contained target:":
+                    raise AssertionError("Containment prompt should not be shown for 2 options")
+                return default
+
+            self._ask_select = ask_select_fail_if_containment
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self._ask_select = original_ask_select
+                self.get_highlighted_text = original_get_text
+
+            assert chosen["ranges"] in [[(1, 1, 0, 12)], [(1, 1, 4, 7)]], (
+                f"Expected a normal non-containment choice, got {chosen['ranges']}"
+            )
+            print("  ✓ 2-option conflicts no longer trigger containment fold flow")
+            conn.close()
+
             print("\n=== All Tests Passed! ===\n")
 
         finally:
-            builtins.input = original_input
-
             def secure_delete(p, is_dir=False):
                 import time
 
