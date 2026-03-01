@@ -282,7 +282,7 @@ class JwlBackupProcessor:
                 except sqlite3.Error:
                     index[table_name] = {}
                     continue
-                index[table_name] = {row: True for row in merged_cursor.fetchall()}
+                index[table_name] = dict.fromkeys(merged_cursor.fetchall(), True)
 
         return index
 
@@ -332,7 +332,7 @@ class JwlBackupProcessor:
         table_lower = table.lower()
         if table_lower not in self.fk_map:
             return
-        for col_name in list(row_dict.keys()):
+        for col_name in row_dict.keys():
             col_lower = col_name.lower()
             if col_lower in self.fk_map[table_lower]:
                 ref_table_orig, _ = self.fk_map[table_lower][col_lower]
@@ -418,7 +418,7 @@ class JwlBackupProcessor:
             default=False,
         )
 
-        sorted_keys = sorted(list(all_keysymbols))
+        sorted_keys = sorted(all_keysymbols)
         if self.deduplicate_highlights and sorted_keys:
             self._configure_color_preference()
 
@@ -436,11 +436,8 @@ class JwlBackupProcessor:
             remaining_keys = [
                 k for k in sorted_keys if k not in self.ignored_keysymbols
             ]
-            if (
-                remaining_keys
-                and self._ask_confirm(
-                    "Should some publications autoresolve highlight issues by choosing preferred source?"
-                )
+            if remaining_keys and self._ask_confirm(
+                "Should some publications autoresolve highlight issues by choosing preferred source?"
             ):
                 auto_keys = (
                     self._ask_checkbox(
@@ -512,7 +509,6 @@ class JwlBackupProcessor:
                             source_cursor,
                             merged_cursor,
                             pk_remap,
-                            identity_index,
                             usermark_skip_source_pks,
                             file_path,
                         )
@@ -579,7 +575,9 @@ class JwlBackupProcessor:
         except sqlite3.Error:
             pass
 
-    def _merge_note_by_guid(self, table, row_dict, merged_cursor, pk_remap, identity_index):
+    def _merge_note_by_guid(
+        self, table, row_dict, merged_cursor, pk_remap, identity_index
+    ):
         """Merge Note rows by Guid.
 
         Rules:
@@ -588,7 +586,9 @@ class JwlBackupProcessor:
           the newest LastModified timestamp.
         """
         pk_cols = self.primary_keys.get(table, [])
-        note_id_col = "NoteId" if "NoteId" in row_dict else (pk_cols[0] if pk_cols else None)
+        note_id_col = (
+            "NoteId" if "NoteId" in row_dict else (pk_cols[0] if pk_cols else None)
+        )
         old_note_id = row_dict.get(note_id_col) if note_id_col else None
         guid = row_dict.get("Guid")
 
@@ -612,9 +612,6 @@ class JwlBackupProcessor:
             cols_payload = [d[0] for d in merged_cursor.description]
             existing_dups = [dict(zip(cols_payload, r)) for r in payload_dups]
 
-            incoming_raw_ts = str(row_dict.get("LastModified") or "")
-            incoming_ts = self._parse_last_modified(incoming_raw_ts)
-
             def _cand_key(c):
                 raw = str(c.get("LastModified") or "")
                 return (self._parse_last_modified(raw), raw)
@@ -633,38 +630,44 @@ class JwlBackupProcessor:
                 pk_remap[table][old_note_id] = keep_note_id
 
             # Update kept row with winner values (newer note data/usermark/guid/etc).
-            updatable_cols = [c for c in row_dict.keys() if c not in pk_cols and c != note_id_col]
+            updatable_cols = [
+                c for c in row_dict.keys() if c not in pk_cols and c != note_id_col
+            ]
             if updatable_cols:
                 set_clause = ", ".join(f"[{c}] = ?" for c in updatable_cols)
-                params = [winner.get(c) for c in updatable_cols] + [keep_row.get("__rowid__")]
+                params = [winner.get(c) for c in updatable_cols] + [
+                    keep_row.get("__rowid__")
+                ]
                 merged_cursor.execute(
                     f"UPDATE [{table}] SET {set_clause} WHERE rowid = ?",
                     params,
                 )
 
-            kept_usermark = winner.get("UserMarkId")
+            # kept_usermark = winner.get("UserMarkId")
             # Remove all older duplicate notes and linked old highlights.
-            for dup in existing_dups:
-                if dup.get("__rowid__") == keep_row.get("__rowid__"):
-                    # If keep row had an old different usermark, remove it too.
-                    old_um = dup.get("UserMarkId")
-                    if old_um and old_um != kept_usermark:
-                        self._delete_usermark_and_blockranges(merged_cursor, old_um)
-                    continue
+            # for dup in existing_dups:
+            # if dup.get("__rowid__") == keep_row.get("__rowid__"):
+            # If keep row had an old different usermark, remove it too.
+            # old_um = dup.get("UserMarkId")
+            # if old_um and old_um != kept_usermark:
+            #    self._delete_usermark_and_blockranges(merged_cursor, old_um)
+            # continue
 
-                old_um = dup.get("UserMarkId")
-                merged_cursor.execute(
-                    f"DELETE FROM [{table}] WHERE rowid = ?",
-                    (dup.get("__rowid__"),),
-                )
-                self._delete_usermark_and_blockranges(merged_cursor, old_um)
+            # old_um = dup.get("UserMarkId")
+            # merged_cursor.execute(
+            #     f"DELETE FROM [{table}] WHERE rowid = ?",
+            #     (dup.get("__rowid__"),),
+            # )
+            # self._delete_usermark_and_blockranges(merged_cursor, old_um)
 
             winner_guid = winner.get("Guid")
             if winner_guid:
                 id_cols = self.identity_keys.get("Note", ["Guid"])
                 winner_identity = tuple(winner.get(c) for c in id_cols)
                 if self._is_autoincrement_table(table) and keep_note_id is not None:
-                    identity_index.setdefault("Note", {})[winner_identity] = keep_note_id
+                    identity_index.setdefault("Note", {})[winner_identity] = (
+                        keep_note_id
+                    )
                 else:
                     identity_index.setdefault("Note", {})[winner_identity] = True
 
@@ -695,7 +698,9 @@ class JwlBackupProcessor:
             autoincrement = self._is_autoincrement_table(table)
             if autoincrement and note_id_col in row_dict:
                 insert_dict = {k: v for k, v in row_dict.items() if k != note_id_col}
-                new_note_id = self._insert_row(table, "Note", insert_dict, merged_cursor)
+                new_note_id = self._insert_row(
+                    table, "Note", insert_dict, merged_cursor
+                )
                 if old_note_id is not None and new_note_id is not None:
                     pk_remap[table][old_note_id] = new_note_id
                 if new_note_id is not None:
@@ -714,7 +719,10 @@ class JwlBackupProcessor:
         # Anchor updates to the newest existing row.
         existing_best = max(
             existing_dicts,
-            key=lambda r: (self._parse_last_modified(r.get("LastModified")), r.get("__rowid__", 0)),
+            key=lambda r: (
+                self._parse_last_modified(r.get("LastModified")),
+                r.get("__rowid__", 0),
+            ),
         )
 
         existing_note_id = existing_best.get(note_id_col) if note_id_col else None
@@ -724,7 +732,10 @@ class JwlBackupProcessor:
         candidates = existing_dicts + [dict(row_dict)]
         candidates_sorted = sorted(
             candidates,
-            key=lambda r: (self._parse_last_modified(r.get("LastModified")), str(r.get("LastModified") or "")),
+            key=lambda r: (
+                self._parse_last_modified(r.get("LastModified")),
+                str(r.get("LastModified") or ""),
+            ),
         )
 
         # Exactly two rows: keep the most recent row directly.
@@ -735,7 +746,9 @@ class JwlBackupProcessor:
             ]
             if updatable_cols:
                 set_clause = ", ".join(f"[{c}] = ?" for c in updatable_cols)
-                params = [winner.get(c) for c in updatable_cols] + [existing_best.get("__rowid__")]
+                params = [winner.get(c) for c in updatable_cols] + [
+                    existing_best.get("__rowid__")
+                ]
                 merged_cursor.execute(
                     f"UPDATE [{table}] SET {set_clause} WHERE rowid = ?",
                     params,
@@ -752,13 +765,20 @@ class JwlBackupProcessor:
                 cand_title = candidate.get("Title") or ""
                 cand_content = candidate.get("Content") or ""
                 merged_title = self.merge_text(base_title, merged_title, cand_title)
-                merged_content = self.merge_text(base_content, merged_content, cand_content)
+                merged_content = self.merge_text(
+                    base_content, merged_content, cand_content
+                )
 
             latest = candidates_sorted[-1]
             latest_ts = latest.get("LastModified")
             merged_cursor.execute(
                 f"UPDATE [{table}] SET Title = ?, Content = ?, LastModified = ? WHERE rowid = ?",
-                (merged_title, merged_content, latest_ts, existing_best.get("__rowid__")),
+                (
+                    merged_title,
+                    merged_content,
+                    latest_ts,
+                    existing_best.get("__rowid__"),
+                ),
             )
 
         if self._is_autoincrement_table(table) and existing_note_id is not None:
@@ -949,7 +969,6 @@ class JwlBackupProcessor:
         source_cursor,
         merged_cursor,
         pk_remap,
-        identity_index,
         usermark_skip_source_pks,
         file_path,
     ):
@@ -1053,9 +1072,7 @@ class JwlBackupProcessor:
                     merged_cursor,
                     source_cursor,
                     pk_remap,
-                    identity_index,
                     usermark_skip_source_pks,
-                    file_path,
                 )
 
     def _apply_usermark_choice(
@@ -1067,9 +1084,7 @@ class JwlBackupProcessor:
         merged_cursor,
         source_cursor,
         pk_remap,
-        identity_index,
         usermark_skip_source_pks,
-        file_path,
     ):
         """
         Write the winning highlight into the merged DB and record all PK remappings.
@@ -1160,12 +1175,12 @@ class JwlBackupProcessor:
                     (lead_merged_pk, hl["usermark_id"]),
                 )
                 # Add more UPDATE statements here if future schema adds FK refs to UserMark
-                merged_cursor.execute(
-                    "DELETE FROM BlockRange WHERE UserMarkId = ?", (hl["usermark_id"],)
-                )
-                merged_cursor.execute(
-                    "DELETE FROM UserMark WHERE UserMarkId = ?", (hl["usermark_id"],)
-                )
+                # merged_cursor.execute(
+                #     "DELETE FROM BlockRange WHERE UserMarkId = ?", (hl["usermark_id"],)
+                # )
+                # merged_cursor.execute(
+                #     "DELETE FROM UserMark WHERE UserMarkId = ?", (hl["usermark_id"],)
+                # )
 
         # Map ALL incoming highlights in this component to lead_merged_pk
         for hl in comp:
@@ -1302,7 +1317,9 @@ class JwlBackupProcessor:
         texts = {}
         with ThreadPoolExecutor(max_workers=self.text_prefetch_workers) as executor:
             future_map = {
-                executor.submit(self._fetch_highlight_variant_text, loc_res, sig[1]): sig
+                executor.submit(
+                    self._fetch_highlight_variant_text, loc_res, sig[1]
+                ): sig
                 for sig, _ in sig_items
             }
             for future in as_completed(future_map):
@@ -1407,9 +1424,7 @@ class JwlBackupProcessor:
         )
         return ranked[0]
 
-    def _resolve_containment_fold_choice(
-        self, loc_res, options, conflict_key, color_names
-    ):
+    def _resolve_containment_fold_choice(self, options, conflict_key, color_names):
         """
         If one option fully contains all others, ask which contained option it should fold into.
         Returns chosen option or None when no containment pattern is found.
@@ -1465,7 +1480,11 @@ class JwlBackupProcessor:
             choices=choices,
             default=default_idx,
         )
-        if not isinstance(chosen_idx, int) or chosen_idx < 1 or chosen_idx > len(contained_opts):
+        if (
+            not isinstance(chosen_idx, int)
+            or chosen_idx < 1
+            or chosen_idx > len(contained_opts)
+        ):
             chosen_idx = default_idx
 
         chosen = contained_opts[chosen_idx - 1]
@@ -1532,7 +1551,7 @@ class JwlBackupProcessor:
 
         # Containment-specific decision: one parent/container + contained variants.
         containment_choice = self._resolve_containment_fold_choice(
-            loc_res, options, conflict_key, color_names
+            options, conflict_key, color_names
         )
         if containment_choice is not None:
             self.conflict_cache["UserMark"][conflict_key] = (
@@ -1546,7 +1565,9 @@ class JwlBackupProcessor:
 
         # Autoresolve if every option renders to the exact same text.
         unique_texts = {
-            t for t in normalized_option_text.values() if t and t != "(text unavailable)"
+            t
+            for t in normalized_option_text.values()
+            if t and t != "(text unavailable)"
         }
         if len(unique_texts) == 1 and len(normalized_option_text) == len(options):
             chosen = self._pick_option_by_preference(options)
@@ -2022,7 +2043,7 @@ class JwlBackupProcessor:
                                 parser.feed(content)
                                 text = " ".join(parser.text.split())
                                 tokens = re.findall(
-                                    r"\w+(?:[''.:-]\w+)*|[^\s\w\u200b]", text
+                                    r"\w+(?:['.:-]\w+)*|[^\s\w\u200b]", text
                                 )
                                 return " ".join(tokens[start_token : end_token + 1])
                 except Exception as e:
@@ -2052,7 +2073,7 @@ class JwlBackupProcessor:
         if not full_text:
             return f"[Text not found for pid={identifier}]"
 
-        tokens = re.findall(r"\w+(?:[''.:-]\w+)*|[^\s\w\u200b]", full_text)
+        tokens = re.findall(r"\w+(?:['.:-]\w+)*|[^\s\w\u200b]", full_text)
         start_token = max(start_token, 0)
         end_token = min(end_token, len(tokens))
         return " ".join(tokens[start_token : end_token + 1])
@@ -2292,7 +2313,8 @@ class JwlBackupProcessor:
 
     def run_tests(self):
         print("\n=== Running Automated Tests ===\n")
-        import tempfile, shutil
+        import tempfile
+        import shutil
 
         test_dir = tempfile.mkdtemp(prefix="jwl_test_")
 
@@ -2466,7 +2488,9 @@ class JwlBackupProcessor:
                 "SELECT Title, Content FROM Note WHERE Guid = 'note-123'"
             ).fetchone()
             conn.close()
-            assert res[0] == "User A Title", f"Expected latest title 'User A Title', got '{res[0]}'"
+            assert res[0] == "User A Title", (
+                f"Expected latest title 'User A Title', got '{res[0]}'"
+            )
             assert res[1] == "Base Content", (
                 f"Expected latest content 'Base Content', got '{res[1]}'"
             )
@@ -2531,10 +2555,18 @@ class JwlBackupProcessor:
                 "SELECT Title, Content, LastModified FROM Note WHERE Guid = 'note-merge-3'"
             ).fetchone()
             conn.close()
-            assert res[0] == "User A Title", f"Expected merged title 'User A Title', got '{res[0]}'"
-            assert res[1] == "User B Content", f"Expected merged content 'User B Content', got '{res[1]}'"
-            assert res[2] == "2024-02-03T00:00:00Z", f"Expected latest timestamp to win, got '{res[2]}'"
-            print("  ✓ 3+ row Note merge intelligently merged title/content and kept latest timestamp")
+            assert res[0] == "User A Title", (
+                f"Expected merged title 'User A Title', got '{res[0]}'"
+            )
+            assert res[1] == "User B Content", (
+                f"Expected merged content 'User B Content', got '{res[1]}'"
+            )
+            assert res[2] == "2024-02-03T00:00:00Z", (
+                f"Expected latest timestamp to win, got '{res[2]}'"
+            )
+            print(
+                "  ✓ 3+ row Note merge intelligently merged title/content and kept latest timestamp"
+            )
 
             # -------------------------------------------------------
             # Test 3c: Identical notes with different Guid dedupe by payload
@@ -2581,11 +2613,15 @@ class JwlBackupProcessor:
             count = conn.execute("SELECT COUNT(*) FROM Note").fetchone()[0]
             last_mod = conn.execute("SELECT LastModified FROM Note").fetchone()[0]
             conn.close()
-            assert count == 1, f"Expected payload-equivalent notes to dedupe to 1 row, got {count}"
+            assert count == 1, (
+                f"Expected payload-equivalent notes to dedupe to 1 row, got {count}"
+            )
             assert last_mod == "2024-03-02T00:00:00Z", (
                 f"Expected newer LastModified to be kept, got '{last_mod}'"
             )
-            print("  ✓ Notes with different Guid but identical payload dedupe correctly")
+            print(
+                "  ✓ Notes with different Guid but identical payload dedupe correctly"
+            )
 
             # -------------------------------------------------------
             # Test 3d: Payload dedupe removes older linked UserMark/BlockRange
@@ -2596,10 +2632,22 @@ class JwlBackupProcessor:
                 {
                     "Location": [{"LocationId": 10, "Title": "Note Loc"}],
                     "UserMark": [
-                        {"UserMarkId": 1001, "ColorIndex": 2, "LocationId": 10, "UserMarkGuid": "old-um"}
+                        {
+                            "UserMarkId": 1001,
+                            "ColorIndex": 2,
+                            "LocationId": 10,
+                            "UserMarkGuid": "old-um",
+                        }
                     ],
                     "BlockRange": [
-                        {"BlockRangeId": 1, "BlockType": 1, "Identifier": 18, "StartToken": 0, "EndToken": 5, "UserMarkId": 1001}
+                        {
+                            "BlockRangeId": 1,
+                            "BlockType": 1,
+                            "Identifier": 18,
+                            "StartToken": 0,
+                            "EndToken": 5,
+                            "UserMarkId": 1001,
+                        }
                     ],
                     "Note": [
                         {
@@ -2618,10 +2666,22 @@ class JwlBackupProcessor:
                 {
                     "Location": [{"LocationId": 10, "Title": "Note Loc"}],
                     "UserMark": [
-                        {"UserMarkId": 2002, "ColorIndex": 2, "LocationId": 10, "UserMarkGuid": "new-um"}
+                        {
+                            "UserMarkId": 2002,
+                            "ColorIndex": 2,
+                            "LocationId": 10,
+                            "UserMarkGuid": "new-um",
+                        }
                     ],
                     "BlockRange": [
-                        {"BlockRangeId": 2, "BlockType": 1, "Identifier": 23, "StartToken": 0, "EndToken": 5, "UserMarkId": 2002}
+                        {
+                            "BlockRangeId": 2,
+                            "BlockType": 1,
+                            "Identifier": 23,
+                            "StartToken": 0,
+                            "EndToken": 5,
+                            "UserMarkId": 2002,
+                        }
                     ],
                     "Note": [
                         {
@@ -2641,15 +2701,31 @@ class JwlBackupProcessor:
             self.process_databases([db1_path, db2_path])
 
             conn = sqlite3.connect(self.merged_db_path)
-            note_row = conn.execute("SELECT UserMarkId, LastModified FROM Note").fetchone()
-            old_um_count = conn.execute("SELECT COUNT(*) FROM UserMark WHERE UserMarkId = 1001").fetchone()[0]
-            old_br_count = conn.execute("SELECT COUNT(*) FROM BlockRange WHERE UserMarkId = 1001").fetchone()[0]
+            note_row = conn.execute(
+                "SELECT UserMarkId, LastModified FROM Note"
+            ).fetchone()
+            old_um_count = conn.execute(
+                "SELECT COUNT(*) FROM UserMark WHERE UserMarkId = 1001"
+            ).fetchone()[0]
+            old_br_count = conn.execute(
+                "SELECT COUNT(*) FROM BlockRange WHERE UserMarkId = 1001"
+            ).fetchone()[0]
             conn.close()
-            assert note_row[0] == 2002, f"Expected note to point at newer UserMarkId 2002, got {note_row[0]}"
-            assert note_row[1] == "2024-03-02T00:00:00Z", f"Expected newer LastModified, got {note_row[1]}"
-            assert old_um_count == 0, f"Expected old linked UserMark to be removed, got {old_um_count}"
-            assert old_br_count == 0, f"Expected old linked BlockRange to be removed, got {old_br_count}"
-            print("  ✓ Older linked UserMark and BlockRange are removed on payload dedupe")
+            assert note_row[0] == 2002, (
+                f"Expected note to point at newer UserMarkId 2002, got {note_row[0]}"
+            )
+            assert note_row[1] == "2024-03-02T00:00:00Z", (
+                f"Expected newer LastModified, got {note_row[1]}"
+            )
+            assert old_um_count == 0, (
+                f"Expected old linked UserMark to be removed, got {old_um_count}"
+            )
+            assert old_br_count == 0, (
+                f"Expected old linked BlockRange to be removed, got {old_br_count}"
+            )
+            print(
+                "  ✓ Older linked UserMark and BlockRange are removed on payload dedupe"
+            )
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
@@ -3055,7 +3131,9 @@ class JwlBackupProcessor:
                 self.get_highlighted_text = original_get_text
             conn.close()
 
-            assert chosen["color"] == 4, f"Expected red highlight from preference order, got {chosen}"
+            assert chosen["color"] == 4, (
+                f"Expected red highlight from preference order, got {chosen}"
+            )
             print(
                 "  ✓ Identical rendered highlight text now autoresolves using configured color priority"
             )
@@ -3087,8 +3165,6 @@ class JwlBackupProcessor:
                 ],
             }
 
-            original_ask_select = self._ask_select
-
             def ask_select_containment(message, choices, default=None):
                 if message == "Container highlight detected — choose contained target:":
                     for c in choices:
@@ -3098,19 +3174,23 @@ class JwlBackupProcessor:
 
             self._ask_select = ask_select_containment
             original_get_text = self.get_highlighted_text
-            self.get_highlighted_text = (
-                lambda *_args, **_kwargs: "synthetic containment text"
+            self.get_highlighted_text = lambda *_args, **_kwargs: (
+                "synthetic containment text"
             )
             try:
                 chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
             finally:
                 self.get_highlighted_text = original_get_text
-    
-            assert chosen["color"] == 4, f"Expected red child highlight to be chosen, got {chosen}"
+
+            assert chosen["color"] == 4, (
+                f"Expected red child highlight to be chosen, got {chosen}"
+            )
             assert chosen["ranges"] == [(1, 1, 4, 7)], (
                 f"Expected fold target child range [(1,1,4,7)], got {chosen['ranges']}"
             )
-            print("  ✓ Container highlight fold now allows choosing the contained target variant")
+            print(
+                "  ✓ Container highlight fold now allows choosing the contained target variant"
+            )
             conn.close()
 
             # -------------------------------------------------------
@@ -3128,22 +3208,23 @@ class JwlBackupProcessor:
                 ],
             }
 
-            original_ask_select = self._ask_select
             original_get_text = self.get_highlighted_text
-            self.get_highlighted_text = (
-                lambda *_args, **_kwargs: "synthetic 2-option text"
+            self.get_highlighted_text = lambda *_args, **_kwargs: (
+                "synthetic 2-option text"
             )
 
             def ask_select_fail_if_containment(message, choices, default=None):
                 if message == "Container highlight detected — choose contained target:":
-                    raise AssertionError("Containment prompt should not be shown for 2 options")
+                    raise AssertionError(
+                        "Containment prompt should not be shown for 2 options"
+                    )
                 return default
 
             self._ask_select = ask_select_fail_if_containment
             try:
                 chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
             finally:
-                    self.get_highlighted_text = original_get_text
+                self.get_highlighted_text = original_get_text
 
             assert chosen["ranges"] in [[(1, 1, 0, 12)], [(1, 1, 4, 7)]], (
                 f"Expected a normal non-containment choice, got {chosen['ranges']}"
@@ -3154,18 +3235,36 @@ class JwlBackupProcessor:
             # -------------------------------------------------------
             # Test 12: Dedupe disabled skips UserMark conflict resolver
             # -------------------------------------------------------
-            print("\nTest 12: Dedupe-disabled mode skips highlight conflict resolver...")
+            print(
+                "\nTest 12: Dedupe-disabled mode skips highlight conflict resolver..."
+            )
             self._create_test_db(
                 db1_path,
                 {
                     "Location": [
-                        {"LocationId": 1, "KeySymbol": "w", "DocumentId": 777, "MepsLanguage": 0}
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 777,
+                            "MepsLanguage": 0,
+                        }
                     ],
                     "UserMark": [
-                        {"UserMarkId": 1, "ColorIndex": 2, "LocationId": 1, "UserMarkGuid": "dedupe-off-a"}
+                        {
+                            "UserMarkId": 1,
+                            "ColorIndex": 2,
+                            "LocationId": 1,
+                            "UserMarkGuid": "dedupe-off-a",
+                        }
                     ],
                     "BlockRange": [
-                        {"BlockType": 1, "Identifier": 1, "StartToken": 0, "EndToken": 12, "UserMarkId": 1}
+                        {
+                            "BlockType": 1,
+                            "Identifier": 1,
+                            "StartToken": 0,
+                            "EndToken": 12,
+                            "UserMarkId": 1,
+                        }
                     ],
                 },
             )
@@ -3173,13 +3272,29 @@ class JwlBackupProcessor:
                 db2_path,
                 {
                     "Location": [
-                        {"LocationId": 1, "KeySymbol": "w", "DocumentId": 777, "MepsLanguage": 0}
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 777,
+                            "MepsLanguage": 0,
+                        }
                     ],
                     "UserMark": [
-                        {"UserMarkId": 2, "ColorIndex": 2, "LocationId": 1, "UserMarkGuid": "dedupe-off-b"}
+                        {
+                            "UserMarkId": 2,
+                            "ColorIndex": 2,
+                            "LocationId": 1,
+                            "UserMarkGuid": "dedupe-off-b",
+                        }
                     ],
                     "BlockRange": [
-                        {"BlockType": 1, "Identifier": 1, "StartToken": 4, "EndToken": 7, "UserMarkId": 2}
+                        {
+                            "BlockType": 1,
+                            "Identifier": 1,
+                            "StartToken": 4,
+                            "EndToken": 7,
+                            "UserMarkId": 2,
+                        }
                     ],
                 },
             )
@@ -3193,9 +3308,9 @@ class JwlBackupProcessor:
                 return default
 
             self._ask_confirm = ask_confirm_dedupe_off
-            self._resolve_usermark_conflict = (
-                lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                    AssertionError("_resolve_usermark_conflict must not run when dedupe is disabled")
+            self._resolve_usermark_conflict = lambda *_args, **_kwargs: ().throw(
+                AssertionError(
+                    "_resolve_usermark_conflict must not run when dedupe is disabled"
                 )
             )
 
@@ -3210,7 +3325,9 @@ class JwlBackupProcessor:
             conn = sqlite3.connect(self.merged_db_path)
             um_count = conn.execute("SELECT COUNT(*) FROM UserMark").fetchone()[0]
             conn.close()
-            assert um_count == 2, f"Expected 2 UserMarks with dedupe off, got {um_count}"
+            assert um_count == 2, (
+                f"Expected 2 UserMarks with dedupe off, got {um_count}"
+            )
             print("  ✓ Dedupe-off mode bypasses highlight conflict resolution")
 
             # -------------------------------------------------------
@@ -3221,7 +3338,13 @@ class JwlBackupProcessor:
                 db1_path,
                 {
                     "Location": [
-                        {"LocationId": 1, "KeySymbol": "w", "DocumentId": 999, "MepsLanguage": 0, "Title": None}
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 999,
+                            "MepsLanguage": 0,
+                            "Title": None,
+                        }
                     ]
                 },
             )
@@ -3229,7 +3352,13 @@ class JwlBackupProcessor:
                 db2_path,
                 {
                     "Location": [
-                        {"LocationId": 2, "KeySymbol": "w", "DocumentId": 1000, "MepsLanguage": 0, "Title": "Has Title"}
+                        {
+                            "LocationId": 2,
+                            "KeySymbol": "w",
+                            "DocumentId": 1000,
+                            "MepsLanguage": 0,
+                            "Title": "Has Title",
+                        }
                     ]
                 },
             )
@@ -3246,8 +3375,12 @@ class JwlBackupProcessor:
                 "SELECT COUNT(*) FROM Location WHERE Title = ' '"
             ).fetchone()[0]
             conn.close()
-            assert null_count == 0, f"Expected no NULL Location.Title values, got {null_count}"
-            assert space_count >= 1, "Expected at least one normalized single-space title"
+            assert null_count == 0, (
+                f"Expected no NULL Location.Title values, got {null_count}"
+            )
+            assert space_count >= 1, (
+                "Expected at least one normalized single-space title"
+            )
             print("  ✓ NULL Location.Title values are normalized to single space")
 
             print("\n=== All Tests Passed! ===\n")
