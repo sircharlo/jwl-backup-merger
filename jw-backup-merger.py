@@ -550,6 +550,100 @@ class JwlBackupProcessor:
 
         self._finalize_merge(merged_conn)
 
+    def _parse_last_modified(self, raw_value):
+        if not raw_value:
+            return datetime.min
+        txt = str(raw_value).strip()
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(txt)
+        except ValueError:
+            return datetime.min
+
+    def _merge_note_by_guid(self, table, row_dict, merged_cursor, pk_remap, identity_index):
+        """Merge Note rows by Guid, keeping the row with the latest LastModified."""
+        pk_cols = self.primary_keys.get(table, [])
+        note_id_col = "NoteId" if "NoteId" in row_dict else (pk_cols[0] if pk_cols else None)
+        old_note_id = row_dict.get(note_id_col) if note_id_col else None
+        guid = row_dict.get("Guid")
+
+        if not guid:
+            return self._insert_row(table, "Note", row_dict, merged_cursor)
+
+        merged_cursor.execute(f"SELECT _rowid_ AS __rowid__, * FROM [{table}] WHERE Guid = ?", (guid,))
+        existing_rows = merged_cursor.fetchall()
+
+        # Build identity tuple for cache upkeep.
+        id_cols = self.identity_keys.get("Note", ["Guid"])
+        identity_tuple = tuple(row_dict.get(c) for c in id_cols)
+
+        if not existing_rows:
+            autoincrement = self._is_autoincrement_table(table)
+            if autoincrement and note_id_col in row_dict:
+                insert_dict = {k: v for k, v in row_dict.items() if k != note_id_col}
+                new_note_id = self._insert_row(table, "Note", insert_dict, merged_cursor)
+                if old_note_id is not None and new_note_id is not None:
+                    pk_remap[table][old_note_id] = new_note_id
+                if new_note_id is not None:
+                    identity_index.setdefault("Note", {})[identity_tuple] = new_note_id
+                return new_note_id
+
+            new_rowid = self._insert_row(table, "Note", row_dict, merged_cursor)
+            if old_note_id is not None and note_id_col:
+                pk_remap[table][old_note_id] = row_dict.get(note_id_col)
+            identity_index.setdefault("Note", {})[identity_tuple] = True
+            return new_rowid
+
+        # Pick the current winner by latest LastModified (ties: highest rowid).
+        def row_sort_key(row):
+            rdict = dict(zip([d[0] for d in merged_cursor.description][1:], row[1:]))
+            return (self._parse_last_modified(rdict.get("LastModified")), row[0])
+
+        # Need column names from SELECT _rowid_ AS __rowid__, * description
+        cols = [d[0] for d in merged_cursor.description]
+        existing_dicts = [dict(zip(cols, r)) for r in existing_rows]
+        existing_best = max(
+            existing_dicts,
+            key=lambda r: (self._parse_last_modified(r.get("LastModified")), r.get("__rowid__", 0)),
+        )
+
+        existing_note_id = existing_best.get(note_id_col) if note_id_col else None
+        if old_note_id is not None and existing_note_id is not None:
+            pk_remap[table][old_note_id] = existing_note_id
+
+        incoming_raw_ts = str(row_dict.get("LastModified") or "")
+        current_raw_ts = str(existing_best.get("LastModified") or "")
+        incoming_ts = self._parse_last_modified(incoming_raw_ts)
+        current_ts = self._parse_last_modified(current_raw_ts)
+
+        incoming_is_newer = (
+            incoming_raw_ts > current_raw_ts
+            or (incoming_raw_ts == current_raw_ts and incoming_ts > current_ts)
+        )
+
+        if incoming_is_newer:
+            # Overwrite non-PK columns in the chosen existing row with incoming values.
+            updatable_cols = [
+                c
+                for c in row_dict.keys()
+                if c not in pk_cols and c != note_id_col
+            ]
+            if updatable_cols:
+                set_clause = ", ".join(f"[{c}] = ?" for c in updatable_cols)
+                params = [row_dict.get(c) for c in updatable_cols] + [existing_best.get("__rowid__")]
+                merged_cursor.execute(
+                    f"UPDATE [{table}] SET {set_clause} WHERE rowid = ?",
+                    params,
+                )
+
+        if self._is_autoincrement_table(table) and existing_note_id is not None:
+            identity_index.setdefault("Note", {})[identity_tuple] = existing_note_id
+        else:
+            identity_index.setdefault("Note", {})[identity_tuple] = True
+
+        return existing_note_id
+
     def _configure_color_preference(self):
         """Prompt once for preferred highlight color order used in identical-text autoresolve."""
         color_names = {
@@ -618,6 +712,12 @@ class JwlBackupProcessor:
 
         # 1. Remap all FK columns (mutates row_dict in place)
         self._remap_fks(table, row_dict, pk_remap)
+
+        # Notes are merged strictly by Guid + LastModified recency.
+        if table_name == "Note":
+            return self._merge_note_by_guid(
+                table, row_dict, merged_cursor, pk_remap, identity_index
+            )
 
         # 2. Identity tuple - built AFTER FK remap so FK-based identity cols are correct
         id_cols = self.identity_keys.get(table_name, [])
@@ -2186,11 +2286,7 @@ class JwlBackupProcessor:
             # -------------------------------------------------------
             # Test 3: Note 3-way merge
             # -------------------------------------------------------
-            print("\nTest 3: Note 3-way Merge...")
-            original_ask_select = self._ask_select
-            self._ask_select = lambda message, choices, default=None: (
-                "m" if message == "Conflict in Note:" else (default or 1)
-            )
+            print("\nTest 3: Note latest LastModified wins by Guid...")
             self._create_test_db(
                 db1_path,
                 {
@@ -2201,6 +2297,7 @@ class JwlBackupProcessor:
                             "Title": "Base Title",
                             "Content": "Base Content",
                             "LocationId": 10,
+                            "LastModified": "2024-01-01T00:00:00Z",
                         }
                     ],
                 },
@@ -2215,6 +2312,7 @@ class JwlBackupProcessor:
                             "Title": "User A Title",
                             "Content": "Base Content",
                             "LocationId": 10,
+                            "LastModified": "2024-01-02T00:00:00Z",
                         }
                     ],
                 },
@@ -2229,6 +2327,7 @@ class JwlBackupProcessor:
                             "Title": "Base Title",
                             "Content": "User B Content",
                             "LocationId": 10,
+                            "LastModified": "2024-01-03T00:00:00Z",
                         }
                     ],
                 },
@@ -2243,12 +2342,11 @@ class JwlBackupProcessor:
                 "SELECT Title, Content FROM Note WHERE Guid = 'note-123'"
             ).fetchone()
             conn.close()
-            assert res[0] == "User A Title", f"Expected 'User A Title', got '{res[0]}'"
+            assert res[0] == "Base Title", f"Expected latest title 'Base Title', got '{res[0]}'"
             assert res[1] == "User B Content", (
-                f"Expected 'User B Content', got '{res[1]}'"
+                f"Expected latest content 'User B Content', got '{res[1]}'"
             )
-            self._ask_select = original_ask_select
-            print("  ✓ Note 3-way merge successful")
+            print("  ✓ Note merge now keeps most recent row by LastModified")
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
@@ -2704,8 +2802,7 @@ class JwlBackupProcessor:
                 chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
             finally:
                 self.get_highlighted_text = original_get_text
-                self._ask_select = original_ask_select
-
+    
             assert chosen["color"] == 4, f"Expected red child highlight to be chosen, got {chosen}"
             assert chosen["ranges"] == [(1, 1, 4, 7)], (
                 f"Expected fold target child range [(1,1,4,7)], got {chosen['ranges']}"
@@ -2743,8 +2840,7 @@ class JwlBackupProcessor:
             try:
                 chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
             finally:
-                self._ask_select = original_ask_select
-                self.get_highlighted_text = original_get_text
+                    self.get_highlighted_text = original_get_text
 
             assert chosen["ranges"] in [[(1, 1, 0, 12)], [(1, 1, 4, 7)]], (
                 f"Expected a normal non-containment choice, got {chosen['ranges']}"
