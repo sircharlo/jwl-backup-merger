@@ -11,8 +11,10 @@ from tqdm import tqdm
 import difflib
 import sqlite3
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 import re
+import sys
 from urllib.parse import urlparse
 import questionary
 
@@ -124,6 +126,7 @@ class JwlBackupProcessor:
         self.ignored_keysymbols = []
         self.autoresolve_config = {}
         self.usermark_sources = {}  # {merged_usermark_id: source_path}
+        self.text_prefetch_workers = 3
 
         # Tables processed in parent-before-child dependency order.
         # This is critical: every FK target must appear before the table that references it.
@@ -408,14 +411,14 @@ class JwlBackupProcessor:
 
         sorted_keys = sorted(list(all_keysymbols))
         if sorted_keys:
-            if questionary.confirm(
+            if self._ask_confirm(
                 "Would you like to ignore certain publications for highlight merge?"
-            ).ask():
+            ):
                 self.ignored_keysymbols = (
-                    questionary.checkbox(
+                    self._ask_checkbox(
                         "Select publications to ignore for highlight merging:",
                         choices=sorted_keys,
-                    ).ask()
+                    )
                     or []
                 )
 
@@ -424,15 +427,15 @@ class JwlBackupProcessor:
             ]
             if (
                 remaining_keys
-                and questionary.confirm(
+                and self._ask_confirm(
                     "Should some publications autoresolve highlight issues by choosing preferred source?"
-                ).ask()
+                )
             ):
                 auto_keys = (
-                    questionary.checkbox(
+                    self._ask_checkbox(
                         "Select publications to autoresolve highlight issues:",
                         choices=remaining_keys,
-                    ).ask()
+                    )
                     or []
                 )
 
@@ -446,10 +449,10 @@ class JwlBackupProcessor:
                     preference = []
                     temp_choices = list(choices)
                     for i in range(len(database_files)):
-                        p = questionary.select(
+                        p = self._ask_select(
                             f"Select priority #{i + 1} source for {key}:",
                             choices=temp_choices,
-                        ).ask()
+                        )
                         preference.append(database_files[choices.index(p)])
                         temp_choices.remove(p)
                         if len(temp_choices) == 1:
@@ -957,6 +960,71 @@ class JwlBackupProcessor:
                 components.append(comp)
         return components
 
+    def _is_interactive_terminal(self):
+        return sys.stdin.isatty() and sys.stdout.isatty()
+
+    def _ask_confirm(self, message, default=False):
+        if not self._is_interactive_terminal():
+            return default
+        answer = questionary.confirm(message).ask()
+        return default if answer is None else answer
+
+    def _ask_checkbox(self, message, choices):
+        if not self._is_interactive_terminal():
+            return []
+        answer = questionary.checkbox(message, choices=choices).ask()
+        return answer or []
+
+    def _ask_select(self, message, choices, default=None):
+        if not self._is_interactive_terminal():
+            if isinstance(default, dict):
+                return default.get("value")
+            return default
+        answer = questionary.select(message, choices=choices).ask()
+        if answer is None:
+            if isinstance(default, dict):
+                return default.get("value")
+            return default
+        return answer
+
+    def _fetch_highlight_variant_text(self, loc_res, ranges):
+        if not loc_res:
+            return None
+        full_text = []
+        for r in ranges:
+            txt = self.get_highlighted_text(
+                loc_res[0],
+                r[1],
+                r[2],
+                r[3],
+                loc_res[1],
+                loc_res[2],
+                loc_res[3],
+                loc_res[4],
+            )
+            if txt:
+                full_text.append(txt)
+        return " [...] ".join(full_text) if full_text else None
+
+    def _prefetch_variant_texts(self, loc_res, sig_groups):
+        if not loc_res:
+            return {}
+
+        sig_items = list(sig_groups.items())
+        texts = {}
+        with ThreadPoolExecutor(max_workers=self.text_prefetch_workers) as executor:
+            future_map = {
+                executor.submit(self._fetch_highlight_variant_text, loc_res, sig[1]): sig
+                for sig, _ in sig_items
+            }
+            for future in as_completed(future_map):
+                sig = future_map[future]
+                try:
+                    texts[sig] = future.result()
+                except Exception:
+                    texts[sig] = None
+        return texts
+
     def _resolve_usermark_conflict(self, loc_id, sig_groups, merged_cursor):
         """Prompt the user to pick a highlight variant, with caching."""
         loc_info = self.get_location_info(merged_cursor, loc_id)
@@ -988,7 +1056,10 @@ class JwlBackupProcessor:
         if loc_res:
             print("  Fetching text context from JW.org...")
 
+        prefetched_text = self._prefetch_variant_texts(loc_res, sig_groups)
+
         options = []
+        normalized_option_text = {}
         for idx, (sig, group) in enumerate(sig_groups.items(), 1):
             color, ranges = sig
             sources = sorted({hl["source"] for hl in group})
@@ -997,27 +1068,9 @@ class JwlBackupProcessor:
             print(
                 f"\n  Option {idx}: {color_code}{color_name}{RESET} ({len(group)} instance(s): {', '.join(sources)})"
             )
-            text = None
-            if loc_res:
-                try:
-                    full_text = []
-                    for r in ranges:
-                        txt = self.get_highlighted_text(
-                            loc_res[0],
-                            r[1],
-                            r[2],
-                            r[3],
-                            loc_res[1],
-                            loc_res[2],
-                            loc_res[3],
-                            loc_res[4],
-                        )
-                        if txt:
-                            full_text.append(txt)
-                    if full_text:
-                        text = " [...] ".join(full_text)
-                except Exception:
-                    pass
+            text = prefetched_text.get(sig)
+            if text:
+                normalized_option_text[sig] = " ".join(text.split()).casefold()
             print(
                 f"    Text: {color_code}{text if text else '(Text unavailable)'}{RESET}"
             )
@@ -1029,6 +1082,27 @@ class JwlBackupProcessor:
 
         # --- Autoresolve logic ---
         keysymbol = loc_res[2] if loc_res else None
+
+        # Autoresolve if every option renders to the exact same text.
+        unique_texts = {
+            t for t in normalized_option_text.values() if t and t != "(text unavailable)"
+        }
+        if len(unique_texts) == 1 and len(normalized_option_text) == len(options):
+            print("  (Autoresolved: all variants have identical highlight text)")
+            chosen = next(
+                (
+                    o
+                    for o in options
+                    if any(h.get("source") == "current" for h in o["highlights"])
+                ),
+                options[0],
+            )
+            self.conflict_cache["UserMark"][conflict_key] = (
+                chosen["color"],
+                tuple(chosen["ranges"]),
+            )
+            return chosen
+
         if keysymbol in self.autoresolve_config:
             preference = self.autoresolve_config[keysymbol]
             # preference is a list of database_files in order of priority.
@@ -1073,12 +1147,9 @@ class JwlBackupProcessor:
                 }
             )
 
-        choice_idx = questionary.select(
-            "Choose highlight variant:", choices=choices
-        ).ask()
-
-        if choice_idx is None:  # Handle Ctrl+C or similar
-            choice_idx = 1
+        choice_idx = self._ask_select(
+            "Choose highlight variant:", choices=choices, default=1
+        )
 
         chosen = options[choice_idx - 1]
         self.conflict_cache["UserMark"][conflict_key] = (
@@ -1175,11 +1246,9 @@ class JwlBackupProcessor:
             if "m" in options:
                 choices.append({"name": "Keep (m)erged", "value": "m"})
 
-            choice = questionary.select(
-                f"Conflict in {table_name}:", choices=choices
-            ).ask()
-            if not choice:
-                choice = "c"
+            choice = self._ask_select(
+                f"Conflict in {table_name}:", choices=choices, default="c"
+            )
             self.conflict_cache[table_name][conflict_key] = choice
 
         if choice == "i":
@@ -1251,16 +1320,15 @@ class JwlBackupProcessor:
                     current_row.get("Content") or "", row_dict.get("Content") or ""
                 )
                 print(f"Merged: {merged_content}")
-            choice = questionary.select(
+            choice = self._ask_select(
                 "Conflict in Note:",
                 choices=[
                     {"name": "Keep (c)urrent", "value": "c"},
                     {"name": "Keep (i)ncoming", "value": "i"},
                     {"name": "Keep (m)erged", "value": "m"},
                 ],
-            ).ask()
-            if not choice:
-                choice = "c"
+                default="c",
+            )
             self.conflict_cache["Note"][conflict_key] = choice
 
         final_t, final_c = current_row.get("Title"), current_row.get("Content")
@@ -1764,10 +1832,9 @@ class JwlBackupProcessor:
 
     def run_tests(self):
         print("\n=== Running Automated Tests ===\n")
-        import tempfile, shutil, builtins
+        import tempfile, shutil
 
         test_dir = tempfile.mkdtemp(prefix="jwl_test_")
-        original_input = builtins.input
 
         try:
             db1_path = path.join(test_dir, "db1.db")
@@ -1875,8 +1942,10 @@ class JwlBackupProcessor:
             # Test 3: Note 3-way merge
             # -------------------------------------------------------
             print("\nTest 3: Note 3-way Merge...")
-            builtins.input = lambda _: "m"
-
+            original_ask_select = self._ask_select
+            self._ask_select = lambda message, choices, default=None: (
+                "m" if message == "Conflict in Note:" else (default or 1)
+            )
             self._create_test_db(
                 db1_path,
                 {
@@ -1933,16 +2002,13 @@ class JwlBackupProcessor:
             assert res[1] == "User B Content", (
                 f"Expected 'User B Content', got '{res[1]}'"
             )
+            self._ask_select = original_ask_select
             print("  ✓ Note 3-way merge successful")
-
-            builtins.input = original_input
 
             # -------------------------------------------------------
             # Test 4: UserMark identical signature merge
             # -------------------------------------------------------
             print("\nTest 4: UserMark Overlap (identical signature)...")
-            builtins.input = lambda _: "1"
-
             self._create_test_db(
                 db1_path,
                 {
@@ -2005,8 +2071,6 @@ class JwlBackupProcessor:
             assert um_count == 1, f"Expected 1 UserMark, got {um_count}"
             assert br_count == 1, f"Expected 1 BlockRange, got {br_count}"
             print("  ✓ UserMark identical signature merged (no duplicate BlockRange)")
-
-            builtins.input = original_input
 
             # -------------------------------------------------------
             # Test 5: Sequential PKs in merged output
@@ -2296,11 +2360,62 @@ class JwlBackupProcessor:
 
             self.ignored_keysymbols = set()
 
+            # -------------------------------------------------------
+            # Test 9: UserMark same rendered text should autoresolve
+            # -------------------------------------------------------
+            print("\nTest 9: UserMark identical rendered text autoresolves...")
+            self._create_test_db(
+                db1_path,
+                {
+                    "Location": [
+                        {
+                            "LocationId": 1,
+                            "KeySymbol": "w",
+                            "DocumentId": 20170800,
+                            "MepsLanguage": 0,
+                        }
+                    ]
+                },
+            )
+
+            conn = sqlite3.connect(db1_path)
+            cur = conn.cursor()
+            sig_groups = {
+                (2, ((1, 1, 0, 5),)): [
+                    {
+                        "source": "current",
+                        "source_path": "current.db",
+                    }
+                ],
+                (2, ((1, 1, 1, 6),)): [
+                    {
+                        "source": "incoming",
+                        "source_path": "incoming.db",
+                    }
+                ],
+            }
+
+            original_get_text = self.get_highlighted_text
+
+            def fake_get_text(*_args, **_kwargs):
+                return "He showed great patience in putting up with the weaknesses of his followers"
+
+            self.get_highlighted_text = fake_get_text
+            try:
+                chosen = self._resolve_usermark_conflict(1, sig_groups, cur)
+            finally:
+                self.get_highlighted_text = original_get_text
+            conn.close()
+
+            assert chosen["color"] == 2, f"Expected green highlight, got {chosen}"
+            assert any(
+                h.get("source") == "current" for h in chosen["highlights"]
+            ), "Expected current highlight to win when rendered text is identical"
+            print("  ✓ Identical rendered highlight text now autoresolves without prompting")
+
             print("\n=== All Tests Passed! ===\n")
 
         finally:
-            builtins.input = original_input
-
             def secure_delete(p, is_dir=False):
                 import time
 
